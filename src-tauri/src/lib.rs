@@ -1,0 +1,497 @@
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::process::Stdio;
+use std::sync::mpsc;
+use std::thread;
+use tauri::{Emitter, Manager};
+use keyring::Entry;
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SelectorSettings {
+    add_button: String,
+    edit_button: String,
+    cancel_edit_button: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UiSettings {
+    base_url: String,
+    login_url: String,
+    dashboard_url: String,
+    username: String,
+    python_path: String,
+    headless: bool,
+    dry_run: bool,
+    selectors: SelectorSettings,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RunPayload {
+    incoming_csv: String,
+    existing_csv: String,
+    update_mode: String,
+    settings: UiSettings,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct RunRecord {
+    timestamp: String,
+    lines: Vec<String>,
+    export_csv: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ExportPayload {
+    settings: UiSettings,
+    save_path: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct HelpResult {
+    ok: bool,
+    lines: Vec<String>,
+    value: Option<String>,
+}
+
+fn app_data_file(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| err.to_string())?;
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    Ok(dir.join(name))
+}
+
+fn read_export_csv(script_path: &Path) -> Option<String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = script_path.parent() {
+        candidates.push(parent.join("data"));
+        if let Some(parent2) = parent.parent() {
+            candidates.push(parent2.join("data"));
+        }
+    }
+
+    for dir in candidates {
+        let path = dir.join("export_static.csv");
+        if let Ok(csv) = fs::read_to_string(&path) {
+            return Some(csv);
+        }
+    }
+    None
+}
+
+fn resolve_script_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(current) = std::env::current_dir() {
+        candidates.push(current.join("backend").join("src").join("opnsense_dhcp_ui.py"));
+        candidates.push(current.join("backend").join("opnsense_dhcp_ui.py"));
+        candidates.push(current.join("src").join("opnsense_dhcp_ui.py"));
+        candidates.push(current.join("..").join("backend").join("src").join("opnsense_dhcp_ui.py"));
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("backend").join("src").join("opnsense_dhcp_ui.py"));
+        candidates.push(resource_dir.join("backend").join("opnsense_dhcp_ui.py"));
+        candidates.push(resource_dir.join("opnsense_dhcp_ui.py"));
+    }
+
+    for path in candidates {
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    Err("Could not locate backend/src/opnsense_dhcp_ui.py. Place the backend folder next to the app or run from the repo root.".to_string())
+}
+
+fn resolve_backend_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let script = resolve_script_path(app)?;
+    script
+        .parent()
+        .and_then(|dir| dir.parent())
+        .map(|dir| dir.to_path_buf())
+        .ok_or_else(|| "Could not resolve backend directory".to_string())
+}
+
+fn capture_output(command: &mut Command) -> HelpResult {
+    let mut lines: Vec<String> = Vec::new();
+    let output = command.output();
+    match output {
+        Ok(result) => {
+            if !result.stdout.is_empty() {
+                lines.push("--- stdout ---".to_string());
+                lines.extend(String::from_utf8_lossy(&result.stdout).lines().map(|l| l.to_string()));
+            }
+            if !result.stderr.is_empty() {
+                lines.push("--- stderr ---".to_string());
+                lines.extend(String::from_utf8_lossy(&result.stderr).lines().map(|l| l.to_string()));
+            }
+            HelpResult {
+                ok: result.status.success(),
+                lines,
+                value: None,
+            }
+        }
+        Err(err) => HelpResult {
+            ok: false,
+            lines: vec![format!("Failed to run: {}", err)],
+            value: None,
+        },
+    }
+}
+
+fn try_python_path(path: &Path) -> bool {
+    path.exists()
+}
+
+#[tauri::command]
+fn find_python(app: tauri::AppHandle) -> Result<HelpResult, String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(current) = std::env::current_dir() {
+        candidates.push(current.join(".venv").join("Scripts").join("python.exe"));
+        candidates.push(current.join(".venv").join("bin").join("python"));
+        candidates.push(current.join("backend").join(".venv").join("Scripts").join("python.exe"));
+        candidates.push(current.join("backend").join(".venv").join("bin").join("python"));
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join(".venv").join("Scripts").join("python.exe"));
+        candidates.push(resource_dir.join(".venv").join("bin").join("python"));
+        candidates.push(resource_dir.join("backend").join(".venv").join("Scripts").join("python.exe"));
+        candidates.push(resource_dir.join("backend").join(".venv").join("bin").join("python"));
+    }
+
+    for candidate in candidates {
+        if try_python_path(&candidate) {
+            return Ok(HelpResult {
+                ok: true,
+                lines: vec![format!("Found Python at {}", candidate.display())],
+                value: Some(candidate.to_string_lossy().to_string()),
+            });
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    if cfg!(windows) {
+        let mut cmd = Command::new("where");
+        cmd.arg("python");
+        let result = capture_output(&mut cmd);
+        let first_line = result.lines.iter().skip_while(|l| l.starts_with("---")).next().cloned();
+        lines.extend(result.lines);
+        if result.ok {
+            if let Some(first) = first_line {
+                return Ok(HelpResult {
+                    ok: true,
+                    lines,
+                    value: Some(first.to_string()),
+                });
+            }
+        }
+    } else {
+        let mut cmd = Command::new("which");
+        cmd.arg("python3");
+        let result = capture_output(&mut cmd);
+        let first_line = result.lines.iter().skip_while(|l| l.starts_with("---")).next().cloned();
+        lines.extend(result.lines);
+        if result.ok {
+            if let Some(first) = first_line {
+                return Ok(HelpResult {
+                    ok: true,
+                    lines,
+                    value: Some(first.to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(HelpResult {
+        ok: false,
+        lines: vec!["Python not found. Install Python 3.11+ and try again.".to_string()],
+        value: None,
+    })
+}
+
+#[tauri::command]
+fn install_backend_deps(app: tauri::AppHandle, python_path: String) -> Result<HelpResult, String> {
+    let backend_dir = resolve_backend_dir(&app)?;
+    let requirements = backend_dir.join("requirements.txt");
+    let mut cmd = Command::new(python_path);
+    cmd.arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("-r")
+        .arg(requirements);
+    Ok(capture_output(&mut cmd))
+}
+
+#[tauri::command]
+fn install_playwright_browsers(python_path: String) -> Result<HelpResult, String> {
+    let mut cmd = Command::new(python_path);
+    cmd.arg("-m").arg("playwright").arg("install");
+    Ok(capture_output(&mut cmd))
+}
+
+fn credential_entry() -> Result<Entry, String> {
+    Entry::new("tfk-manager", "opnsense").map_err(|err| err.to_string())
+}
+
+fn emit_line(app: &tauri::AppHandle, line: &str) {
+    let _ = app.emit("run-log", line.to_string());
+}
+
+fn run_with_live_logs(
+    app: &tauri::AppHandle,
+    mut command: Command,
+    lines: &mut Vec<String>,
+) -> Result<std::process::ExitStatus, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
+
+    let stdout = child.stdout.take().ok_or_else(|| "Missing stdout".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "Missing stderr".to_string())?;
+
+    let (tx, rx) = mpsc::channel::<(String, String)>();
+    let tx_out = tx.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().flatten() {
+            let _ = tx_out.send(("stdout".to_string(), line));
+        }
+    });
+    let tx_err = tx.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().flatten() {
+            let _ = tx_err.send(("stderr".to_string(), line));
+        }
+    });
+    drop(tx);
+
+    let mut saw_stdout = false;
+    let mut saw_stderr = false;
+    for (stream, line) in rx {
+        if stream == "stdout" && !saw_stdout {
+            saw_stdout = true;
+            lines.push("--- stdout ---".to_string());
+            emit_line(app, "--- stdout ---");
+        }
+        if stream == "stderr" && !saw_stderr {
+            saw_stderr = true;
+            lines.push("--- stderr ---".to_string());
+            emit_line(app, "--- stderr ---");
+        }
+        lines.push(line.clone());
+        emit_line(app, &line);
+    }
+
+    child.wait().map_err(|err| err.to_string())
+}
+
+fn get_password() -> Result<Option<String>, String> {
+    let entry = credential_entry()?;
+    match entry.get_password() {
+        Ok(password) => Ok(Some(password)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+#[tauri::command]
+fn save_password(password: String) -> Result<(), String> {
+    if password.trim().is_empty() {
+        return Err("Password is empty".to_string());
+    }
+    let entry = credential_entry()?;
+    entry.set_password(&password).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn has_password() -> Result<bool, String> {
+    Ok(get_password()?.is_some())
+}
+
+#[tauri::command]
+fn load_settings(app: tauri::AppHandle) -> Result<Option<UiSettings>, String> {
+    let path = app_data_file(&app, "settings.json")?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let parsed = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+    Ok(Some(parsed))
+}
+
+#[tauri::command]
+fn save_settings(app: tauri::AppHandle, settings: UiSettings) -> Result<(), String> {
+    let path = app_data_file(&app, "settings.json")?;
+    let raw = serde_json::to_string_pretty(&settings).map_err(|err| err.to_string())?;
+    fs::write(path, raw).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn load_history(app: tauri::AppHandle) -> Result<Vec<RunRecord>, String> {
+    let path = app_data_file(&app, "history.json")?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let parsed = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+    Ok(parsed)
+}
+
+#[tauri::command]
+fn run_dhcp(app: tauri::AppHandle, payload: RunPayload) -> Result<RunRecord, String> {
+    let incoming_lines = payload.incoming_csv.lines().count().saturating_sub(1);
+    let existing_lines = payload.existing_csv.lines().count().saturating_sub(1);
+    let script_path = resolve_script_path(&app)?;
+
+    let password = get_password().unwrap_or(None);
+
+    let config_path = app_data_file(&app, "last_run_settings.json")?;
+    let config_raw = serde_json::to_string_pretty(&payload.settings).map_err(|err| err.to_string())?;
+    fs::write(&config_path, config_raw).map_err(|err| err.to_string())?;
+
+    let incoming_path = app_data_file(&app, "incoming.csv")?;
+    fs::write(&incoming_path, &payload.incoming_csv).map_err(|err| err.to_string())?;
+
+    let mut lines = vec![
+        format!("Run started"),
+        format!("Incoming rows: {}", incoming_lines),
+        format!("Existing rows: {}", existing_lines),
+        format!("Update mode: {}", payload.update_mode),
+        format!("Headless: {}", payload.settings.headless),
+        format!("Dry run: {}", payload.settings.dry_run),
+    ];
+    for line in &lines {
+        emit_line(&app, line);
+    }
+
+    if password.is_none() {
+        lines.push("No stored password found; login prompt may appear.".to_string());
+    }
+
+    let mut command = Command::new(&payload.settings.python_path);
+    command
+        .arg(&script_path)
+        .env("TFK_SETTINGS_JSON", &config_path)
+        .env("TFK_INCOMING_CSV", &incoming_path)
+        .env("TFK_UPDATE_MODE", &payload.update_mode)
+        .env("TFK_AUTO_CONFIRM", "1");
+    if !payload.settings.username.trim().is_empty() {
+        command.env("TFK_USERNAME", &payload.settings.username);
+    }
+    if let Some(password) = password {
+        command.env("TFK_PASSWORD", password);
+    }
+
+    let status = run_with_live_logs(&app, command, &mut lines)?;
+    if !status.success() {
+        let message = format!("Process exited with code {}", status);
+        lines.push(message.clone());
+        emit_line(&app, &message);
+    }
+
+    let record = RunRecord {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        lines,
+        export_csv: None,
+    };
+    let mut history = load_history(app.clone()).unwrap_or_default();
+    history.insert(0, record.clone());
+    let history_path = app_data_file(&app, "history.json")?;
+    let history_raw = serde_json::to_string_pretty(&history).map_err(|err| err.to_string())?;
+    fs::write(history_path, history_raw).map_err(|err| err.to_string())?;
+
+    Ok(record)
+}
+
+#[tauri::command]
+fn export_static(app: tauri::AppHandle, payload: ExportPayload) -> Result<RunRecord, String> {
+    let settings = payload.settings;
+    let config_path = app_data_file(&app, "last_run_settings.json")?;
+    let config_raw = serde_json::to_string_pretty(&settings).map_err(|err| err.to_string())?;
+    fs::write(&config_path, config_raw).map_err(|err| err.to_string())?;
+    let script_path = resolve_script_path(&app)?;
+    let password = get_password().unwrap_or(None);
+
+    let mut lines = vec![
+        "Export started".to_string(),
+        format!("Headless: {}", settings.headless),
+        format!("Dry run: {}", settings.dry_run),
+    ];
+    for line in &lines {
+        emit_line(&app, line);
+    }
+
+    if password.is_none() {
+        lines.push("No stored password found; login prompt may appear.".to_string());
+    }
+
+    let mut command = Command::new(&settings.python_path);
+    command
+        .arg(&script_path)
+        .env("TFK_SETTINGS_JSON", &config_path)
+        .env("TFK_MODE", "export");
+    if !settings.username.trim().is_empty() {
+        command.env("TFK_USERNAME", &settings.username);
+    }
+    if let Some(password) = password {
+        command.env("TFK_PASSWORD", password);
+    }
+
+    let status = run_with_live_logs(&app, command, &mut lines)?;
+    if !status.success() {
+        let message = format!("Process exited with code {}", status);
+        lines.push(message.clone());
+        emit_line(&app, &message);
+    }
+
+    let export_csv = read_export_csv(&script_path);
+    if let (Some(path), Some(csv)) = (payload.save_path.as_ref(), export_csv.as_ref()) {
+        match fs::write(path, csv) {
+            Ok(()) => lines.push(format!("Saved export to {}", path)),
+            Err(err) => lines.push(format!("Failed to save export: {}", err)),
+        }
+    }
+
+    let record = RunRecord {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        lines,
+        export_csv,
+    };
+    let mut history = load_history(app.clone()).unwrap_or_default();
+    history.insert(0, record.clone());
+    let history_path = app_data_file(&app, "history.json")?;
+    let history_raw = serde_json::to_string_pretty(&history).map_err(|err| err.to_string())?;
+    fs::write(history_path, history_raw).map_err(|err| err.to_string())?;
+
+    Ok(record)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            run_dhcp,
+            export_static,
+            load_settings,
+            save_settings,
+            load_history,
+            save_password,
+            has_password,
+            find_python,
+            install_backend_deps,
+            install_playwright_browsers
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
