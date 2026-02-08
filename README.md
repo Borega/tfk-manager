@@ -28,6 +28,10 @@ A desktop UI for validating, diffing, and applying OPNsense static DHCP CSV chan
 ## Run (Desktop)
 - npm run tauri dev
 
+## Releases
+Compiled binaries are available on the GitHub releases page:
+- https://github.com/Borega/tfk-manager/releases
+
 ## Notes
 - CSV format expects semicolon separators.
 - Backend script path is resolved automatically from the app; keep the `backend` folder next to the app.
