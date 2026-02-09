@@ -377,26 +377,21 @@ fn load_history(app: tauri::AppHandle) -> Result<Vec<RunRecord>, String> {
     Ok(parsed)
 }
 
-#[tauri::command]
-fn run_dhcp(
-    app: tauri::AppHandle,
-    state: tauri::State<ProcessState>,
-    payload: RunPayload,
-) -> Result<RunRecord, String> {
+fn run_dhcp_sync(app: &tauri::AppHandle, payload: RunPayload) -> Result<RunRecord, String> {
     let incoming_lines = payload.incoming_csv.lines().count().saturating_sub(1);
     let existing_lines = payload.existing_csv.lines().count().saturating_sub(1);
-    let script_path = resolve_script_path(&app)?;
+    let script_path = resolve_script_path(app)?;
 
     let password = get_password().unwrap_or(None);
 
-    let config_path = app_data_file(&app, "last_run_settings.json")?;
+    let config_path = app_data_file(app, "last_run_settings.json")?;
     let config_raw = serde_json::to_string_pretty(&payload.settings).map_err(|err| err.to_string())?;
     fs::write(&config_path, config_raw).map_err(|err| err.to_string())?;
 
-    let incoming_path = app_data_file(&app, "incoming.csv")?;
+    let incoming_path = app_data_file(app, "incoming.csv")?;
     fs::write(&incoming_path, &payload.incoming_csv).map_err(|err| err.to_string())?;
 
-    let delete_path = app_data_file(&app, "delete.csv")?;
+    let delete_path = app_data_file(app, "delete.csv")?;
     fs::write(&delete_path, &payload.delete_csv).map_err(|err| err.to_string())?;
 
     let mut lines = vec![
@@ -408,14 +403,14 @@ fn run_dhcp(
         format!("Dry run: {}", payload.settings.dry_run),
     ];
     for line in &lines {
-        emit_line(&app, line);
+        emit_line(app, line);
     }
 
     if password.is_none() {
         lines.push("No stored password found; login prompt may appear.".to_string());
     }
 
-    let data_dir = ensure_backend_data_dir(&app)?;
+    let data_dir = ensure_backend_data_dir(app)?;
     let mut command = Command::new(&payload.settings.python_path);
     command
         .arg(&script_path)
@@ -432,11 +427,12 @@ fn run_dhcp(
         command.env("TFK_PASSWORD", password);
     }
 
-    let status = run_with_live_logs(&app, &state, command, &mut lines)?;
+    let state = app.state::<ProcessState>();
+    let status = run_with_live_logs(app, &state, command, &mut lines)?;
     if !status.success() {
         let message = format!("Process exited with code {}", status);
         lines.push(message.clone());
-        emit_line(&app, &message);
+        emit_line(app, &message);
     }
 
     let record = RunRecord {
@@ -446,7 +442,7 @@ fn run_dhcp(
     };
     let mut history = load_history(app.clone()).unwrap_or_default();
     history.insert(0, record.clone());
-    let history_path = app_data_file(&app, "history.json")?;
+    let history_path = app_data_file(app, "history.json")?;
     let history_raw = serde_json::to_string_pretty(&history).map_err(|err| err.to_string())?;
     fs::write(history_path, history_raw).map_err(|err| err.to_string())?;
 
@@ -454,17 +450,20 @@ fn run_dhcp(
 }
 
 #[tauri::command]
-fn export_static(
-    app: tauri::AppHandle,
-    state: tauri::State<ProcessState>,
-    payload: ExportPayload,
-) -> Result<RunRecord, String> {
+async fn run_dhcp(app: tauri::AppHandle, payload: RunPayload) -> Result<RunRecord, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || run_dhcp_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn export_static_sync(app: &tauri::AppHandle, payload: ExportPayload) -> Result<RunRecord, String> {
     let settings = payload.settings;
-    let config_path = app_data_file(&app, "last_run_settings.json")?;
+    let config_path = app_data_file(app, "last_run_settings.json")?;
     let config_raw = serde_json::to_string_pretty(&settings).map_err(|err| err.to_string())?;
     fs::write(&config_path, config_raw).map_err(|err| err.to_string())?;
-    let script_path = resolve_script_path(&app)?;
-    let data_dir = ensure_backend_data_dir(&app)?;
+    let script_path = resolve_script_path(app)?;
+    let data_dir = ensure_backend_data_dir(app)?;
     let password = get_password().unwrap_or(None);
 
     let mut lines = vec![
@@ -473,7 +472,7 @@ fn export_static(
         format!("Dry run: {}", settings.dry_run),
     ];
     for line in &lines {
-        emit_line(&app, line);
+        emit_line(app, line);
     }
 
     if password.is_none() {
@@ -493,11 +492,12 @@ fn export_static(
         command.env("TFK_PASSWORD", password);
     }
 
-    let status = run_with_live_logs(&app, &state, command, &mut lines)?;
+    let state = app.state::<ProcessState>();
+    let status = run_with_live_logs(app, &state, command, &mut lines)?;
     if !status.success() {
         let message = format!("Process exited with code {}", status);
         lines.push(message.clone());
-        emit_line(&app, &message);
+        emit_line(app, &message);
     }
 
     let export_csv = read_export_csv(&data_dir);
@@ -515,11 +515,19 @@ fn export_static(
     };
     let mut history = load_history(app.clone()).unwrap_or_default();
     history.insert(0, record.clone());
-    let history_path = app_data_file(&app, "history.json")?;
+    let history_path = app_data_file(app, "history.json")?;
     let history_raw = serde_json::to_string_pretty(&history).map_err(|err| err.to_string())?;
     fs::write(history_path, history_raw).map_err(|err| err.to_string())?;
 
     Ok(record)
+}
+
+#[tauri::command]
+async fn export_static(app: tauri::AppHandle, payload: ExportPayload) -> Result<RunRecord, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || export_static_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
