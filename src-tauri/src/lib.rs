@@ -5,9 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::thread;
 use tauri::{Emitter, Manager};
 use keyring::Entry;
+
+#[derive(Default)]
+struct ProcessState {
+    child: Mutex<Option<std::process::Child>>,
+}
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -35,14 +41,17 @@ struct UiSettings {
 struct RunPayload {
     incoming_csv: String,
     existing_csv: String,
+    delete_csv: String,
     update_mode: String,
     settings: UiSettings,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct RunRecord {
     timestamp: String,
     lines: Vec<String>,
+    #[serde(alias = "export_csv")]
     export_csv: Option<String>,
 }
 
@@ -249,6 +258,7 @@ fn emit_line(app: &tauri::AppHandle, line: &str) {
 
 fn run_with_live_logs(
     app: &tauri::AppHandle,
+    state: &tauri::State<ProcessState>,
     mut command: Command,
     lines: &mut Vec<String>,
 ) -> Result<std::process::ExitStatus, String> {
@@ -257,6 +267,11 @@ fn run_with_live_logs(
 
     let stdout = child.stdout.take().ok_or_else(|| "Missing stdout".to_string())?;
     let stderr = child.stderr.take().ok_or_else(|| "Missing stderr".to_string())?;
+
+    {
+        let mut guard = state.child.lock().map_err(|_| "Process lock poisoned".to_string())?;
+        *guard = Some(child);
+    }
 
     let (tx, rx) = mpsc::channel::<(String, String)>();
     let tx_out = tx.clone();
@@ -290,7 +305,12 @@ fn run_with_live_logs(
         emit_line(app, &line);
     }
 
-    child.wait().map_err(|err| err.to_string())
+    let mut guard = state.child.lock().map_err(|_| "Process lock poisoned".to_string())?;
+    if let Some(mut child) = guard.take() {
+        child.wait().map_err(|err| err.to_string())
+    } else {
+        Err("Process handle missing".to_string())
+    }
 }
 
 fn get_password() -> Result<Option<String>, String> {
@@ -347,7 +367,11 @@ fn load_history(app: tauri::AppHandle) -> Result<Vec<RunRecord>, String> {
 }
 
 #[tauri::command]
-fn run_dhcp(app: tauri::AppHandle, payload: RunPayload) -> Result<RunRecord, String> {
+fn run_dhcp(
+    app: tauri::AppHandle,
+    state: tauri::State<ProcessState>,
+    payload: RunPayload,
+) -> Result<RunRecord, String> {
     let incoming_lines = payload.incoming_csv.lines().count().saturating_sub(1);
     let existing_lines = payload.existing_csv.lines().count().saturating_sub(1);
     let script_path = resolve_script_path(&app)?;
@@ -360,6 +384,9 @@ fn run_dhcp(app: tauri::AppHandle, payload: RunPayload) -> Result<RunRecord, Str
 
     let incoming_path = app_data_file(&app, "incoming.csv")?;
     fs::write(&incoming_path, &payload.incoming_csv).map_err(|err| err.to_string())?;
+
+    let delete_path = app_data_file(&app, "delete.csv")?;
+    fs::write(&delete_path, &payload.delete_csv).map_err(|err| err.to_string())?;
 
     let mut lines = vec![
         format!("Run started"),
@@ -382,6 +409,7 @@ fn run_dhcp(app: tauri::AppHandle, payload: RunPayload) -> Result<RunRecord, Str
         .arg(&script_path)
         .env("TFK_SETTINGS_JSON", &config_path)
         .env("TFK_INCOMING_CSV", &incoming_path)
+        .env("TFK_DELETE_CSV", &delete_path)
         .env("TFK_UPDATE_MODE", &payload.update_mode)
         .env("TFK_AUTO_CONFIRM", "1");
     if !payload.settings.username.trim().is_empty() {
@@ -391,7 +419,7 @@ fn run_dhcp(app: tauri::AppHandle, payload: RunPayload) -> Result<RunRecord, Str
         command.env("TFK_PASSWORD", password);
     }
 
-    let status = run_with_live_logs(&app, command, &mut lines)?;
+    let status = run_with_live_logs(&app, &state, command, &mut lines)?;
     if !status.success() {
         let message = format!("Process exited with code {}", status);
         lines.push(message.clone());
@@ -413,7 +441,11 @@ fn run_dhcp(app: tauri::AppHandle, payload: RunPayload) -> Result<RunRecord, Str
 }
 
 #[tauri::command]
-fn export_static(app: tauri::AppHandle, payload: ExportPayload) -> Result<RunRecord, String> {
+fn export_static(
+    app: tauri::AppHandle,
+    state: tauri::State<ProcessState>,
+    payload: ExportPayload,
+) -> Result<RunRecord, String> {
     let settings = payload.settings;
     let config_path = app_data_file(&app, "last_run_settings.json")?;
     let config_raw = serde_json::to_string_pretty(&settings).map_err(|err| err.to_string())?;
@@ -446,7 +478,7 @@ fn export_static(app: tauri::AppHandle, payload: ExportPayload) -> Result<RunRec
         command.env("TFK_PASSWORD", password);
     }
 
-    let status = run_with_live_logs(&app, command, &mut lines)?;
+    let status = run_with_live_logs(&app, &state, command, &mut lines)?;
     if !status.success() {
         let message = format!("Process exited with code {}", status);
         lines.push(message.clone());
@@ -475,14 +507,27 @@ fn export_static(app: tauri::AppHandle, payload: ExportPayload) -> Result<RunRec
     Ok(record)
 }
 
+#[tauri::command]
+fn cancel_run(app: tauri::AppHandle, state: tauri::State<ProcessState>) -> Result<(), String> {
+    let mut guard = state.child.lock().map_err(|_| "Process lock poisoned".to_string())?;
+    if let Some(child) = guard.as_mut() {
+        let _ = child.kill();
+        emit_line(&app, "Cancel requested.");
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(ProcessState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             run_dhcp,
             export_static,
+            cancel_run,
             load_settings,
             save_settings,
             load_history,

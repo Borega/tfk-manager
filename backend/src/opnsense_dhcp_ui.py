@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright._impl._errors import TargetClosedError
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -19,6 +20,7 @@ CSV_PATH = DATA_DIR / "daten_template.csv"
 LOG_PATH = DATA_DIR / "run_log.csv"
 TEMP_CSV_PATH = DATA_DIR / "to_add.csv"
 EXPORT_CSV_PATH = DATA_DIR / "export_static.csv"
+DELETE_CSV_PATH = DATA_DIR / "to_delete.csv"
 DEBUG = True
 HEADLESS = False
 DRY_RUN = True  # Set False to submit entries
@@ -39,7 +41,7 @@ SELECTORS: Dict[str, str] = {
     "password_input": "#passwordfld",
     "login_button": ".btn",
     "dashboard_link": "#Lobby > a:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1)",
-    "add_button": "#staticdhcpleases_opt3 > div > div > div:nth-child(1) > button",
+    "add_button": "button.btnAddLease[data-iface='lan']",
     "mac_input": "#input-mac",
     "ip_input": "#input-ip",
     "hostname_input": "#input-hostname",
@@ -47,9 +49,10 @@ SELECTORS: Dict[str, str] = {
     # Optional:
     "search_input": "input[placeholder='Search']",
     "apply_button": "button:has-text('Apply')",
-    "static_leases_table": "#statifdhcpleases-if-lease-table-opt3",
+    "static_leases_table": "#statifdhcpleases-if-lease-table-lan",
     "edit_button": "button.btnEditLease",
     "cancel_edit_button": "button.btnCancelEditLease",
+    "delete_button": "button.btnDelLease",
 }
 
 
@@ -76,6 +79,7 @@ def load_settings_from_json() -> None:
         "add_button": selectors.get("add_button", SELECTORS["add_button"]),
         "edit_button": selectors.get("edit_button", SELECTORS["edit_button"]),
         "cancel_edit_button": selectors.get("cancel_edit_button", SELECTORS["cancel_edit_button"]),
+        "delete_button": selectors.get("delete_button", SELECTORS["delete_button"]),
     })
 
 
@@ -87,6 +91,16 @@ def load_csv_path_from_env() -> None:
     if path.exists():
         global CSV_PATH
         CSV_PATH = path
+
+
+def load_delete_csv_path_from_env() -> None:
+    delete_path = os.environ.get("TFK_DELETE_CSV")
+    if not delete_path:
+        return
+    path = Path(delete_path)
+    if path.exists():
+        global DELETE_CSV_PATH
+        DELETE_CSV_PATH = path
 
 
 def load_credentials_from_env() -> None:
@@ -241,16 +255,36 @@ def wait_for_edit_dialog_closed(page) -> None:
 def wait_for_add_button(page) -> None:
     add_selector = SELECTORS["add_button"]
     deadline = time.monotonic() + (TIMEOUT_MS * 6 / 1000)
+    last_log = 0.0
     while time.monotonic() < deadline:
         try:
             if page.locator(add_selector).first.is_visible():
                 if DEBUG:
                     print("DEBUG: add_button is visible")
                 return
-        except PlaywrightTimeoutError:
+        except (PlaywrightTimeoutError, TargetClosedError):
             pass
+        if DEBUG:
+            now = time.monotonic()
+            if now - last_log >= 5:
+                elapsed = int(now - (deadline - (TIMEOUT_MS * 6 / 1000)))
+                print(f"DEBUG: waiting for add_button... {elapsed}s")
+                last_log = now
         time.sleep(1)
     raise PlaywrightTimeoutError(f"Add button not visible after {TIMEOUT_MS * 6}ms")
+
+
+def open_dashboard_ready(page, username: str, password: str) -> None:
+    login(page, username, password)
+    open_dashboard(page)
+    try:
+        wait_for_add_button(page)
+    except PlaywrightTimeoutError:
+        if DEBUG:
+            print("DEBUG: add_button not found on dashboard, navigating to DHCP_STATIC_URL")
+        page.goto(DHCP_STATIC_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+        open_dashboard(page)
+        wait_for_add_button(page)
 
 
 def find_frame_with_selector(page, selector: str):
@@ -378,6 +412,55 @@ def find_conflict(existing: List[DhcpRow], row: DhcpRow) -> Optional[DhcpRow]:
     return None
 
 
+def wait_for_delete_gone(page, row: DhcpRow) -> bool:
+    table_selector = SELECTORS.get("static_leases_table")
+    delete_selector = SELECTORS.get("delete_button")
+    if not table_selector or not delete_selector:
+        return False
+
+    table = page.locator(table_selector)
+    deadline = time.monotonic() + (TIMEOUT_MS / 1000)
+    while time.monotonic() < deadline:
+        try:
+            locator = table.locator(f"{delete_selector}[data-mac='{row.mac}']")
+            if locator.count() == 0:
+                locator = table.locator(f"{delete_selector}[data-ip='{row.ip}']")
+            if locator.count() == 0:
+                locator = table.locator(f"{delete_selector}[data-hostname='{row.hostname}']")
+            if locator.count() == 0 or not locator.first.is_visible():
+                return True
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(500)
+    return False
+
+
+def delete_mapping(page, row: DhcpRow) -> bool:
+    table_selector = SELECTORS.get("static_leases_table")
+    delete_selector = SELECTORS.get("delete_button")
+    if not table_selector or not delete_selector:
+        return False
+
+    table = page.locator(table_selector)
+    table.wait_for(timeout=5000)
+    delete_button = table.locator(f"{delete_selector}[data-mac='{row.mac}']").first
+    if delete_button.count() == 0:
+        delete_button = table.locator(f"{delete_selector}[data-ip='{row.ip}']").first
+    if delete_button.count() == 0:
+        delete_button = table.locator(f"{delete_selector}[data-hostname='{row.hostname}']").first
+    if delete_button.count() == 0:
+        return False
+
+    if DRY_RUN:
+        print(f"DRY RUN: would delete {row.hostname} {row.mac} {row.ip}")
+        return True
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    delete_button.click()
+    page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+    return wait_for_delete_gone(page, row)
+
+
 def update_mapping(page, row: DhcpRow) -> bool:
     table_selector = SELECTORS.get("static_leases_table")
     edit_selector = SELECTORS.get("edit_button")
@@ -460,6 +543,7 @@ def confirm_changes(summary: str) -> bool:
 def main() -> int:
     load_settings_from_json()
     load_csv_path_from_env()
+    load_delete_csv_path_from_env()
     load_credentials_from_env()
     if os.environ.get("TFK_MODE", "").lower() == "export":
         if not USERNAME or not PASSWORD:
@@ -476,19 +560,34 @@ def main() -> int:
                 "--start-maximized",
             ])
             context = browser.new_context(ignore_https_errors=True, viewport=None)
-            page = context.new_page()
-            page.bring_to_front()
-            page.set_default_timeout(TIMEOUT_MS)
-            page.set_default_navigation_timeout(TIMEOUT_MS)
 
-            login(page, username, password)
-            open_dashboard(page)
-            wait_for_add_button(page)
-            existing_entries = get_existing_entries(page)
-            export_static_leases(existing_entries)
+            existing_entries: List[DhcpRow] = []
+            last_error: Optional[Exception] = None
+            for _ in range(2):
+                page = context.new_page()
+                page.bring_to_front()
+                page.set_default_timeout(TIMEOUT_MS)
+                page.set_default_navigation_timeout(TIMEOUT_MS)
+                try:
+                    open_dashboard_ready(page, username, password)
+                    existing_entries = get_existing_entries(page)
+                    export_static_leases(existing_entries)
+                    last_error = None
+                    break
+                except (PlaywrightTimeoutError, TargetClosedError) as exc:
+                    last_error = exc
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                    continue
 
             context.close()
             browser.close()
+
+            if last_error is not None:
+                print(f"ERROR: export failed: {last_error}")
+                return 1
 
         print(f"Exported {len(existing_entries)} entries to {EXPORT_CSV_PATH}")
         return 0
@@ -545,6 +644,10 @@ def main() -> int:
         existing_entries = get_existing_entries(page)
         export_static_leases(existing_entries)
 
+        delete_rows: List[DhcpRow] = []
+        if DELETE_CSV_PATH.exists():
+            delete_rows = validate_rows(read_csv(DELETE_CSV_PATH))
+
         unique_rows: List[DhcpRow] = []
         seen_macs: set[str] = set()
         seen_ips: set[str] = set()
@@ -594,6 +697,22 @@ def main() -> int:
                 print(f"ERROR: update timeout for {row.hostname}: {exc}")
                 log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;update timeout")
                 continue
+
+        for row in delete_rows:
+            print(f"DEBUG: Deleting {row.hostname} {row.mac} {row.ip}") if DEBUG else None
+            try:
+                if delete_mapping(page, row):
+                    log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;deleted")
+                else:
+                    log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;delete selector missing")
+            except PlaywrightTimeoutError as exc:
+                print(f"ERROR: delete timeout for {row.hostname}: {exc}")
+                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;delete timeout")
+                continue
+            except Exception as exc:
+                print(f"ERROR: delete failed for {row.hostname}: {exc}")
+                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;{exc}")
+                continue
             except Exception as exc:
                 print(f"ERROR: update failed for {row.hostname}: {exc}")
                 log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;{exc}")
@@ -629,6 +748,8 @@ def main() -> int:
 
     if TEMP_CSV_PATH.exists():
         TEMP_CSV_PATH.unlink()
+    if DELETE_CSV_PATH.exists():
+        DELETE_CSV_PATH.unlink()
 
     print("Done.")
     return 0

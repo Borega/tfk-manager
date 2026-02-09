@@ -32,6 +32,13 @@ A desktop UI for validating, diffing, and applying OPNsense static DHCP CSV chan
 Compiled binaries are available on the GitHub releases page:
 - https://github.com/Borega/tfk-manager/releases
 
+## Updates
+- The app checks GitHub releases on startup and prompts to install when a new version is available.
+- Update packages are signed; configure signing secrets for the release workflow:
+	- `TAURI_SIGNING_PRIVATE_KEY`
+	- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+- The updater expects `latest.json` in the GitHub release assets.
+
 ## Notes
 - CSV format expects semicolon separators.
 - Backend script path is resolved automatically from the app; keep the `backend` folder next to the app.

@@ -31,5 +31,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Borega/tfk-manager/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU5RkU1MTE4NTVFMTBCNTMKUldSVEMrRlZHRkgrV1NPOFVKUU55aU5BWDdSM3U3V3gxYlhrVXo3U0xFODY3K2dJcVNmcVMwelAK",
+      "dialog": false
+    }
   }
 }
