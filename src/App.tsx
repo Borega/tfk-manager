@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/api/process";
+import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 type ClientRow = {
