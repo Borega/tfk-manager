@@ -15,7 +15,9 @@ from playwright._impl._errors import TargetClosedError
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
+ENV_DATA_DIR = os.environ.get("TFK_DATA_DIR")
+DATA_DIR = Path(ENV_DATA_DIR) if ENV_DATA_DIR else (BASE_DIR / "data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 CSV_PATH = DATA_DIR / "daten_template.csv"
 LOG_PATH = DATA_DIR / "run_log.csv"
 TEMP_CSV_PATH = DATA_DIR / "to_add.csv"

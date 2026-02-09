@@ -69,31 +69,29 @@ struct HelpResult {
     value: Option<String>,
 }
 
-fn app_data_file(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
+fn app_data_dir_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|err| err.to_string())?;
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    Ok(dir)
+}
+
+fn app_data_file(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
+    let dir = app_data_dir_path(app)?;
     Ok(dir.join(name))
 }
 
-fn read_export_csv(script_path: &Path) -> Option<String> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(parent) = script_path.parent() {
-        candidates.push(parent.join("data"));
-        if let Some(parent2) = parent.parent() {
-            candidates.push(parent2.join("data"));
-        }
-    }
+fn ensure_backend_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app_data_dir_path(app)?.join("backend-data");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    Ok(dir)
+}
 
-    for dir in candidates {
-        let path = dir.join("export_static.csv");
-        if let Ok(csv) = fs::read_to_string(&path) {
-            return Some(csv);
-        }
-    }
-    None
+fn read_export_csv(data_dir: &Path) -> Option<String> {
+    let path = data_dir.join("export_static.csv");
+    fs::read_to_string(&path).ok()
 }
 
 fn resolve_script_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -110,6 +108,19 @@ fn resolve_script_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         candidates.push(resource_dir.join("backend").join("src").join("opnsense_dhcp_ui.py"));
         candidates.push(resource_dir.join("backend").join("opnsense_dhcp_ui.py"));
         candidates.push(resource_dir.join("opnsense_dhcp_ui.py"));
+        candidates.push(
+            resource_dir
+                .join("resources")
+                .join("backend")
+                .join("src")
+                .join("opnsense_dhcp_ui.py"),
+        );
+        candidates.push(
+            resource_dir
+                .join("resources")
+                .join("backend")
+                .join("opnsense_dhcp_ui.py"),
+        );
     }
 
     for path in candidates {
@@ -404,6 +415,7 @@ fn run_dhcp(
         lines.push("No stored password found; login prompt may appear.".to_string());
     }
 
+    let data_dir = ensure_backend_data_dir(&app)?;
     let mut command = Command::new(&payload.settings.python_path);
     command
         .arg(&script_path)
@@ -411,6 +423,7 @@ fn run_dhcp(
         .env("TFK_INCOMING_CSV", &incoming_path)
         .env("TFK_DELETE_CSV", &delete_path)
         .env("TFK_UPDATE_MODE", &payload.update_mode)
+        .env("TFK_DATA_DIR", &data_dir)
         .env("TFK_AUTO_CONFIRM", "1");
     if !payload.settings.username.trim().is_empty() {
         command.env("TFK_USERNAME", &payload.settings.username);
@@ -451,6 +464,7 @@ fn export_static(
     let config_raw = serde_json::to_string_pretty(&settings).map_err(|err| err.to_string())?;
     fs::write(&config_path, config_raw).map_err(|err| err.to_string())?;
     let script_path = resolve_script_path(&app)?;
+    let data_dir = ensure_backend_data_dir(&app)?;
     let password = get_password().unwrap_or(None);
 
     let mut lines = vec![
@@ -470,7 +484,8 @@ fn export_static(
     command
         .arg(&script_path)
         .env("TFK_SETTINGS_JSON", &config_path)
-        .env("TFK_MODE", "export");
+        .env("TFK_MODE", "export")
+        .env("TFK_DATA_DIR", &data_dir);
     if !settings.username.trim().is_empty() {
         command.env("TFK_USERNAME", &settings.username);
     }
@@ -485,7 +500,7 @@ fn export_static(
         emit_line(&app, &message);
     }
 
-    let export_csv = read_export_csv(&script_path);
+    let export_csv = read_export_csv(&data_dir);
     if let (Some(path), Some(csv)) = (payload.save_path.as_ref(), export_csv.as_ref()) {
         match fs::write(path, csv) {
             Ok(()) => lines.push(format!("Saved export to {}", path)),
