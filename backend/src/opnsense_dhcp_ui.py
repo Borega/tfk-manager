@@ -68,20 +68,28 @@ def load_settings_from_json() -> None:
     except (OSError, json.JSONDecodeError):
         return
 
+    def get_setting(payload: dict, snake: str, camel: str):
+        if snake in payload:
+            return payload.get(snake)
+        return payload.get(camel)
+
     global BASE_URL, LOGIN_URL, DHCP_STATIC_URL, HEADLESS, DRY_RUN, USERNAME
-    BASE_URL = data.get("base_url", BASE_URL)
-    LOGIN_URL = data.get("login_url", LOGIN_URL)
-    DHCP_STATIC_URL = data.get("dashboard_url", DHCP_STATIC_URL)
-    HEADLESS = data.get("headless", HEADLESS)
-    DRY_RUN = data.get("dry_run", DRY_RUN)
-    USERNAME = data.get("username", USERNAME)
+    BASE_URL = get_setting(data, "base_url", "baseUrl") or BASE_URL
+    LOGIN_URL = get_setting(data, "login_url", "loginUrl") or LOGIN_URL
+    DHCP_STATIC_URL = get_setting(data, "dashboard_url", "dashboardUrl") or DHCP_STATIC_URL
+    HEADLESS = get_setting(data, "headless", "headless") if "headless" in data else HEADLESS
+    DRY_RUN = get_setting(data, "dry_run", "dryRun") if ("dry_run" in data or "dryRun" in data) else DRY_RUN
+    USERNAME = get_setting(data, "username", "username") or USERNAME
 
     selectors = data.get("selectors") or {}
     SELECTORS.update({
-        "add_button": selectors.get("add_button", SELECTORS["add_button"]),
-        "edit_button": selectors.get("edit_button", SELECTORS["edit_button"]),
-        "cancel_edit_button": selectors.get("cancel_edit_button", SELECTORS["cancel_edit_button"]),
-        "delete_button": selectors.get("delete_button", SELECTORS["delete_button"]),
+        "add_button": selectors.get("add_button", selectors.get("addButton", SELECTORS["add_button"])),
+        "edit_button": selectors.get("edit_button", selectors.get("editButton", SELECTORS["edit_button"])),
+        "cancel_edit_button": selectors.get(
+            "cancel_edit_button",
+            selectors.get("cancelEditButton", SELECTORS["cancel_edit_button"]),
+        ),
+        "delete_button": selectors.get("delete_button", selectors.get("deleteButton", SELECTORS["delete_button"])),
     })
 
 

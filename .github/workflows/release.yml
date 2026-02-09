@@ -42,6 +42,7 @@ jobs:
 
       - name: Build and release
         uses: tauri-apps/tauri-action@action-v0.6.1
+        id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -54,3 +55,26 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
+
+      - name: Verify updater assets
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const releaseId = process.env.RELEASE_ID;
+            if (!releaseId) {
+              core.setFailed("Missing releaseId from tauri-action output.");
+              return;
+            }
+            const { data: assets } = await github.rest.repos.listReleaseAssets({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(releaseId),
+              per_page: 100,
+            });
+            const names = assets.map((asset) => asset.name);
+            if (!names.includes("latest.json")) {
+              core.setFailed(`latest.json is missing from release assets. Found: ${names.join(", ")}`);
+            }

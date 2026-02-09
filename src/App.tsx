@@ -291,6 +291,7 @@ function App() {
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [exactCollapsed, setExactCollapsed] = useState(true);
 
   const incoming = useMemo(() => parseCsv(incomingCsv), [incomingCsv]);
   const existing = useMemo(() => parseCsv(existingCsv), [existingCsv]);
@@ -346,6 +347,7 @@ function App() {
     setExcludedConflictKeys(new Set());
     setSelectedDeleteKeys(new Set());
     setAcknowledgeIgnored(false);
+    setExactCollapsed(true);
   }, [incomingCsv, existingCsv]);
 
   useEffect(() => {
@@ -1321,12 +1323,23 @@ function App() {
                   </ul>
                 </div>
                 <div className="preview-section">
-                  <h4>Exact Matches</h4>
-                  <ul>
-                    {diff.exact.map((row) => (
-                      <li key={`exact-${row.mac}`}>{row.name} · {row.mac} · {row.ip}</li>
-                    ))}
-                  </ul>
+                  <div className="preview-header">
+                    <h4>Exact Matches</h4>
+                    <button
+                      className="mini-action"
+                      type="button"
+                      onClick={() => setExactCollapsed((prev) => !prev)}
+                    >
+                      {exactCollapsed ? `Show (${diff.exact.length})` : `Hide (${diff.exact.length})`}
+                    </button>
+                  </div>
+                  {!exactCollapsed && (
+                    <ul>
+                      {diff.exact.map((row) => (
+                        <li key={`exact-${row.mac}`}>{row.name} · {row.mac} · {row.ip}</li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
               </div>
             </div>
