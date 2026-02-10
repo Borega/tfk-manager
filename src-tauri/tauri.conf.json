@@ -24,6 +24,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "resources": [
       "resources/backend"
     ],
@@ -40,7 +41,7 @@
       "endpoints": [
         "https://github.com/Borega/tfk-manager/releases/latest/download/latest.json"
       ],
-      "pubkey": "RWSMsL5Gv8Qd+v7evfeYAbXYUoYwbfgAyd/lT6n1nDJ8XwCURo/P2Kks",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk5RDhDQUIwRkRCNTk5QzYKUldUR21iWDlzTXJZbVk3aCtUZ3NGa3dBLzhzcStrRjdOblZDOWJkY2tSbFpuSVVYNGJkR1hHcVgK",
       "dialog": false
     }
   }
