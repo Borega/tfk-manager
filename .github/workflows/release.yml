@@ -56,18 +56,6 @@ jobs:
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
 
-      # 🆕 Added step: Upload latest.json
-      - name: Upload latest.json
-        if: ${{ steps.tauri.outputs.releaseId != '' }}
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.tauri.outputs.releaseId }}/assets?name=latest.json
-          asset_path: src-tauri/target/release/bundle/updater/latest.json
-          asset_name: latest.json
-          asset_content_type: application/json
-
       - name: Verify updater assets
         uses: actions/github-script@v7
         env:
@@ -89,6 +77,4 @@ jobs:
             const names = assets.map((asset) => asset.name);
             if (!names.includes("latest.json")) {
               core.setFailed(`latest.json is missing from release assets. Found: ${names.join(", ")}`);
-            } else {
-              console.log("✅ latest.json found in release assets");
             }
