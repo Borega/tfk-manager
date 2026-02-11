@@ -8,7 +8,7 @@ import time
 from tkinter import simpledialog
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright._impl._errors import TargetClosedError
@@ -23,10 +23,12 @@ LOG_PATH = DATA_DIR / "run_log.csv"
 TEMP_CSV_PATH = DATA_DIR / "to_add.csv"
 EXPORT_CSV_PATH = DATA_DIR / "export_static.csv"
 DELETE_CSV_PATH = DATA_DIR / "to_delete.csv"
-DEBUG = True
+DEBUG = False
 HEADLESS = False
 DRY_RUN = True  # Set False to submit entries
 TIMEOUT_MS = 120000
+ADD_BUTTON_TIMEOUT_MS = 10000
+EDIT_DIALOG_TIMEOUT_MS = 15000
 UPDATE_MODE_DEFAULT = "skip"  # "skip" or "update"
 PROMPT_UPDATE_MODE = True
 SLOW_MO_MS = 0
@@ -73,13 +75,19 @@ def load_settings_from_json() -> None:
             return payload.get(snake)
         return payload.get(camel)
 
-    global BASE_URL, LOGIN_URL, DHCP_STATIC_URL, HEADLESS, DRY_RUN, USERNAME
+    global BASE_URL, LOGIN_URL, DHCP_STATIC_URL, HEADLESS, DRY_RUN, USERNAME, DEBUG
     BASE_URL = get_setting(data, "base_url", "baseUrl") or BASE_URL
     LOGIN_URL = get_setting(data, "login_url", "loginUrl") or LOGIN_URL
     DHCP_STATIC_URL = get_setting(data, "dashboard_url", "dashboardUrl") or DHCP_STATIC_URL
     HEADLESS = get_setting(data, "headless", "headless") if "headless" in data else HEADLESS
     DRY_RUN = get_setting(data, "dry_run", "dryRun") if ("dry_run" in data or "dryRun" in data) else DRY_RUN
     USERNAME = get_setting(data, "username", "username") or USERNAME
+    debug_setting = get_setting(data, "debug", "debug")
+    if debug_setting is not None:
+        if isinstance(debug_setting, str):
+            DEBUG = debug_setting.strip().lower() in {"1", "true", "yes", "y"}
+        else:
+            DEBUG = bool(debug_setting)
 
     selectors = data.get("selectors") or {}
     SELECTORS.update({
@@ -114,13 +122,16 @@ def load_delete_csv_path_from_env() -> None:
 
 
 def load_credentials_from_env() -> None:
-    global USERNAME, PASSWORD
+    global USERNAME, PASSWORD, DEBUG
     env_user = os.environ.get("TFK_USERNAME")
     env_pass = os.environ.get("TFK_PASSWORD")
+    env_debug = os.environ.get("TFK_DEBUG")
     if env_user:
         USERNAME = env_user
     if env_pass:
         PASSWORD = env_pass
+    if env_debug is not None:
+        DEBUG = env_debug.strip().lower() in {"1", "true", "yes", "y"}
 
 MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$")
 IP_RE = re.compile(
@@ -203,8 +214,11 @@ def find_existing_by_mac(page, mac: str) -> bool:
         locator = page.locator(search_selector)
         locator.wait_for(timeout=1000)
         locator.fill(mac)
-        page.wait_for_timeout(500)
-        return page.locator(f"text={mac}").first.is_visible()
+        try:
+            page.locator(f"text={mac}").first.wait_for(state="visible", timeout=1500)
+            return True
+        except PlaywrightTimeoutError:
+            return False
     except PlaywrightTimeoutError:
         if DEBUG:
             print("DEBUG: search input not found, skipping existing check")
@@ -245,7 +259,10 @@ def login(page, username: str, password: str) -> None:
 
 def open_dashboard(page) -> None:
     page.locator(SELECTORS["dashboard_link"]).click()
-    page.wait_for_timeout(500)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass
 
 
 def wait_for_edit_dialog_closed(page) -> None:
@@ -262,26 +279,36 @@ def wait_for_edit_dialog_closed(page) -> None:
             pass
 
 
+def wait_for_add_dialog_closed(target) -> None:
+    hostname_selector = SELECTORS.get("hostname_input")
+    if not hostname_selector:
+        return
+    try:
+        if DEBUG:
+            print("DEBUG: waiting for add dialog to close (hostname hidden)")
+        target.locator(hostname_selector).wait_for(state="hidden", timeout=TIMEOUT_MS)
+        if DEBUG:
+            print("DEBUG: add dialog closed")
+    except PlaywrightTimeoutError:
+        if DEBUG:
+            print("DEBUG: add dialog did not close within timeout")
+        pass
+
+
 def wait_for_add_button(page) -> None:
     add_selector = SELECTORS["add_button"]
-    deadline = time.monotonic() + (TIMEOUT_MS * 6 / 1000)
-    last_log = 0.0
-    while time.monotonic() < deadline:
-        try:
-            if page.locator(add_selector).first.is_visible():
-                if DEBUG:
-                    print("DEBUG: add_button is visible")
-                return
-        except (PlaywrightTimeoutError, TargetClosedError):
-            pass
-        if DEBUG:
-            now = time.monotonic()
-            if now - last_log >= 5:
-                elapsed = int(now - (deadline - (TIMEOUT_MS * 6 / 1000)))
-                print(f"DEBUG: waiting for add_button... {elapsed}s")
-                last_log = now
-        time.sleep(1)
-    raise PlaywrightTimeoutError(f"Add button not visible after {TIMEOUT_MS * 6}ms")
+    try:
+        if page.locator(add_selector).first.is_visible():
+            if DEBUG:
+                print("DEBUG: add_button already visible")
+            return
+    except (PlaywrightTimeoutError, TargetClosedError):
+        pass
+    if DEBUG:
+        print("DEBUG: waiting for add_button to become visible")
+    page.locator(add_selector).first.wait_for(state="visible", timeout=ADD_BUTTON_TIMEOUT_MS)
+    if DEBUG:
+        print("DEBUG: add_button is visible")
 
 
 def open_dashboard_ready(page, username: str, password: str) -> None:
@@ -313,6 +340,8 @@ def add_mapping(page, row: DhcpRow) -> None:
     add_selector = SELECTORS["add_button"]
     add_locator = page.locator(add_selector)
     if not add_locator.is_visible():
+        if DEBUG:
+            print("DEBUG: add_button not visible, reopening dashboard")
         open_dashboard(page)
         wait_for_add_button(page)
     if DEBUG:
@@ -343,7 +372,19 @@ def add_mapping(page, row: DhcpRow) -> None:
     if DEBUG:
         print("DEBUG: add_button clicked, waiting for hostname input")
 
-    target.locator(SELECTORS["hostname_input"]).wait_for(state="visible", timeout=TIMEOUT_MS)
+    hostname_locator = target.locator(SELECTORS["hostname_input"])
+    for attempt in range(2):
+        try:
+            hostname_locator.wait_for(state="visible", timeout=3000)
+            break
+        except PlaywrightTimeoutError:
+            if DEBUG:
+                print("DEBUG: hostname input not visible, retrying add click")
+            if target != page:
+                target.locator(add_selector).click(force=True)
+            else:
+                add_locator.click(force=True)
+    hostname_locator.wait_for(state="visible", timeout=TIMEOUT_MS)
     target.locator(SELECTORS["mac_input"]).wait_for(state="visible", timeout=TIMEOUT_MS)
     target.locator(SELECTORS["ip_input"]).wait_for(state="visible", timeout=TIMEOUT_MS)
     safe_fill(target, SELECTORS["mac_input"], row.mac)
@@ -354,17 +395,61 @@ def add_mapping(page, row: DhcpRow) -> None:
         print(f"DRY RUN: would save {row.hostname}")
         return
 
-    page.locator(SELECTORS["save_button"]).click()
-    page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+    save_selector = SELECTORS["save_button"]
+    if DEBUG:
+        print("DEBUG: waiting for save button visible")
+    target.locator(save_selector).wait_for(state="visible", timeout=TIMEOUT_MS)
+    if DEBUG:
+        print("DEBUG: clicking save button")
+    target.locator(save_selector).click()
+    wait_for_add_dialog_closed(target)
+    if DEBUG:
+        print("DEBUG: waiting for add button to return")
+    try:
+        wait_for_add_button(page)
+    except PlaywrightTimeoutError:
+        if DEBUG:
+            print("DEBUG: add_button not visible after save")
+    if DEBUG:
+        print("DEBUG: save flow complete")
 
 
 def apply_changes(page) -> None:
     apply_selector = SELECTORS.get("apply_button")
     if not apply_selector:
         return
+    locator = page.locator(apply_selector).first
     try:
-        page.locator(apply_selector).click()
-        page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+        if not locator.is_visible():
+            if DEBUG:
+                print("DEBUG: apply button not visible, skipping")
+            return
+        if DEBUG:
+            print("DEBUG: clicking apply button")
+        locator.click()
+        try:
+            locator.wait_for(state="hidden", timeout=30000)
+            if DEBUG:
+                print("DEBUG: apply button hidden")
+            return
+        except PlaywrightTimeoutError:
+            if DEBUG:
+                print("DEBUG: apply button still visible, checking disabled")
+        try:
+            page.wait_for_function(
+                "el => el.disabled === true || el.getAttribute('aria-disabled') === 'true'",
+                locator,
+                timeout=10000,
+            )
+            if DEBUG:
+                print("DEBUG: apply button disabled")
+        except PlaywrightTimeoutError:
+            if DEBUG:
+                print("DEBUG: apply did not complete before timeout")
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
     except PlaywrightTimeoutError:
         pass
 
@@ -380,6 +465,7 @@ def get_existing_entries(page) -> List[DhcpRow]:
     table_selector = SELECTORS.get("static_leases_table")
     if not table_selector:
         return []
+    start_time = time.monotonic()
     try:
         table = page.locator(table_selector)
         table.wait_for(timeout=5000)
@@ -392,6 +478,25 @@ def get_existing_entries(page) -> List[DhcpRow]:
         return []
 
     existing: List[DhcpRow] = []
+    if edit_selector:
+        try:
+            raw_entries = table.locator(edit_selector).evaluate_all(
+                "els => els.map(el => ({hostname: el.getAttribute('data-hostname') || '', mac: el.getAttribute('data-mac') || '', ip: el.getAttribute('data-ip') || ''}))"
+            )
+            for entry in raw_entries:
+                hostname = entry.get("hostname", "")
+                mac = entry.get("mac", "")
+                ip = entry.get("ip", "")
+                if hostname and mac and ip:
+                    existing.append(DhcpRow(hostname=hostname, mac=mac, ip=ip))
+            if existing:
+                if DEBUG:
+                    elapsed = time.monotonic() - start_time
+                    print(f"DEBUG: existing entries loaded ({len(existing)}) in {elapsed:.1f}s")
+                return existing
+        except PlaywrightTimeoutError:
+            pass
+
     for i in range(count):
         row = buttons.nth(i)
         try:
@@ -412,6 +517,9 @@ def get_existing_entries(page) -> List[DhcpRow]:
         hostname = (cells[0].strip() if cells else "")
         if mac_match and ip_match and hostname:
             existing.append(DhcpRow(hostname=hostname, mac=mac_match.group(0), ip=ip_match.group(0)))
+    if DEBUG:
+        elapsed = time.monotonic() - start_time
+        print(f"DEBUG: existing entries loaded ({len(existing)}) in {elapsed:.1f}s")
     return existing
 
 
@@ -467,40 +575,112 @@ def delete_mapping(page, row: DhcpRow) -> bool:
 
     page.once("dialog", lambda dialog: dialog.accept())
     delete_button.click()
-    page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+    if DEBUG:
+        print("DEBUG: waiting for delete to disappear")
     return wait_for_delete_gone(page, row)
 
 
-def update_mapping(page, row: DhcpRow) -> bool:
+def update_mapping(page, incoming: DhcpRow, existing: DhcpRow) -> bool:
     table_selector = SELECTORS.get("static_leases_table")
     edit_selector = SELECTORS.get("edit_button")
     if not table_selector or not edit_selector:
         return False
 
-    table = page.locator(table_selector)
-    table.wait_for(timeout=5000)
-    edit_button = table.locator(f"{edit_selector}[data-mac='{row.mac}']").first
+    try:
+        page.locator(table_selector).wait_for(timeout=5000)
+    except PlaywrightTimeoutError:
+        if DEBUG:
+            print("DEBUG: static leases table not found for update lookup")
+
+    edit_button = page.locator(f"{edit_selector}[data-mac='{existing.mac}']").first
     if edit_button.count() == 0:
-        edit_button = table.locator(f"{edit_selector}[data-ip='{row.ip}']").first
+        edit_button = page.locator(f"{edit_selector}[data-ip='{existing.ip}']").first
     if edit_button.count() == 0:
-        edit_button = table.locator(f"{edit_selector}[data-hostname='{row.hostname}']").first
+        edit_button = page.locator(f"{edit_selector}[data-hostname='{existing.hostname}']").first
     if edit_button.count() == 0:
+        buttons = page.locator(edit_selector)
+        count = buttons.count()
+        for idx in range(count):
+            candidate = buttons.nth(idx)
+            try:
+                data_mac = candidate.get_attribute("data-mac") or ""
+                data_ip = candidate.get_attribute("data-ip") or ""
+                data_host = candidate.get_attribute("data-hostname") or ""
+            except PlaywrightTimeoutError:
+                continue
+            if existing.mac == data_mac or existing.ip == data_ip or existing.hostname == data_host:
+                edit_button = candidate
+                break
+
+    if edit_button.count() == 0:
+        if DEBUG:
+            print(
+                "DEBUG: edit button not found for "
+                f"{existing.hostname} {existing.mac} {existing.ip}"
+            )
         return False
 
-    edit_button.click()
-    page.locator(SELECTORS["hostname_input"]).wait_for(state="visible", timeout=TIMEOUT_MS)
-    safe_fill(page, SELECTORS["mac_input"], row.mac)
-    safe_fill(page, SELECTORS["ip_input"], row.ip)
-    safe_fill(page, SELECTORS["hostname_input"], row.hostname)
+    target = page
+    last_error: Optional[Exception] = None
+    for attempt in range(2):
+        edit_frame = find_frame_with_selector(page, edit_selector)
+        target = edit_frame if edit_frame and edit_frame != page.main_frame else page
+        if DEBUG and edit_frame and edit_frame != page.main_frame:
+            print(f"DEBUG: edit button found in iframe: {edit_frame.url}")
+
+        try:
+            if target == page:
+                edit_button.click()
+            else:
+                target.locator(edit_selector).click(trial=True)
+                target.locator(edit_selector).click(force=True)
+
+            if DEBUG:
+                print("DEBUG: waiting for edit dialog inputs")
+            target.locator(SELECTORS["hostname_input"]).wait_for(
+                state="visible",
+                timeout=EDIT_DIALOG_TIMEOUT_MS,
+            )
+            target.locator(SELECTORS["mac_input"]).wait_for(
+                state="visible",
+                timeout=EDIT_DIALOG_TIMEOUT_MS,
+            )
+            target.locator(SELECTORS["ip_input"]).wait_for(
+                state="visible",
+                timeout=EDIT_DIALOG_TIMEOUT_MS,
+            )
+            safe_fill(target, SELECTORS["mac_input"], incoming.mac)
+            safe_fill(target, SELECTORS["ip_input"], incoming.ip)
+            safe_fill(target, SELECTORS["hostname_input"], incoming.hostname)
+            last_error = None
+            break
+        except PlaywrightTimeoutError as exc:
+            last_error = exc
+            if DEBUG:
+                print("DEBUG: edit dialog inputs not visible, retrying")
+            continue
+
+    if last_error is not None:
+        if DEBUG:
+            print(f"DEBUG: edit dialog never appeared: {last_error}")
+        return False
 
     if DRY_RUN:
-        page.locator(SELECTORS["cancel_edit_button"]).click()
-        wait_for_edit_dialog_closed(page)
+        target.locator(SELECTORS["cancel_edit_button"]).click()
+        wait_for_edit_dialog_closed(target)
         return True
 
-    page.locator(SELECTORS["save_button"]).click()
-    page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-    wait_for_edit_dialog_closed(page)
+    target.locator(SELECTORS["save_button"]).click()
+    if DEBUG:
+        print("DEBUG: waiting for edit dialog to close after save")
+    wait_for_edit_dialog_closed(target)
+    if DEBUG:
+        print("DEBUG: waiting for add button after edit")
+    try:
+        wait_for_add_button(page)
+    except PlaywrightTimeoutError:
+        if DEBUG:
+            print("DEBUG: add_button not visible after edit")
     return True
 
 
@@ -522,7 +702,7 @@ def export_static_leases(rows: List[DhcpRow]) -> None:
             writer.writerow([row.hostname, row.mac, row.ip])
 
 
-def summarize_changes(to_add: List[DhcpRow], to_update: List[DhcpRow]) -> str:
+def summarize_changes(to_add: List[DhcpRow], to_update: List[Tuple[DhcpRow, DhcpRow]]) -> str:
     lines = []
     if to_add:
         lines.append("Add:")
@@ -530,8 +710,11 @@ def summarize_changes(to_add: List[DhcpRow], to_update: List[DhcpRow]) -> str:
             lines.append(f"  + {row.hostname} {row.mac} {row.ip}")
     if to_update:
         lines.append("Update:")
-        for row in to_update:
-            lines.append(f"  ~ {row.hostname} {row.mac} {row.ip}")
+        for incoming, existing in to_update:
+            lines.append(
+                f"  ~ {existing.hostname} {existing.mac} {existing.ip} "
+                f"-> {incoming.hostname} {incoming.mac} {incoming.ip}"
+            )
     if not lines:
         lines.append("No changes detected.")
     return "\n".join(lines)
@@ -673,7 +856,7 @@ def main() -> int:
             unique_rows.append(row)
 
         rows_to_add: List[DhcpRow] = []
-        rows_to_update: List[DhcpRow] = []
+        rows_to_update: List[Tuple[DhcpRow, DhcpRow]] = []
         for row in unique_rows:
             conflict = find_conflict(existing_entries, row)
             if conflict:
@@ -681,7 +864,7 @@ def main() -> int:
                     log_lines.append(f"{row.hostname};{row.mac};{row.ip};skipped;exact match")
                     continue
                 if update_mode == "update":
-                    rows_to_update.append(row)
+                    rows_to_update.append((row, conflict))
                 else:
                     log_lines.append(f"{row.hostname};{row.mac};{row.ip};skipped;conflict exists")
                 continue
@@ -695,18 +878,6 @@ def main() -> int:
             append_log(log_lines)
             print("Canceled by user.")
             return 0
-
-        for row in rows_to_update:
-            print(f"DEBUG: Updating {row.hostname} {row.mac} {row.ip}") if DEBUG else None
-            try:
-                if update_mapping(page, row):
-                    log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;updated")
-                else:
-                    log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;update selector missing")
-            except PlaywrightTimeoutError as exc:
-                print(f"ERROR: update timeout for {row.hostname}: {exc}")
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;update timeout")
-                continue
 
         for row in delete_rows:
             print(f"DEBUG: Deleting {row.hostname} {row.mac} {row.ip}") if DEBUG else None
@@ -723,9 +894,40 @@ def main() -> int:
                 print(f"ERROR: delete failed for {row.hostname}: {exc}")
                 log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;{exc}")
                 continue
+
+        for incoming_row, existing_row in rows_to_update:
+            if DEBUG:
+                print(
+                    "DEBUG: Updating "
+                    f"{existing_row.hostname} {existing_row.mac} {existing_row.ip} "
+                    f"-> {incoming_row.hostname} {incoming_row.mac} {incoming_row.ip}"
+                )
+            try:
+                if update_mapping(page, incoming_row, existing_row):
+                    log_lines.append(
+                        f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};ok;updated"
+                    )
+                else:
+                    if DEBUG:
+                        print(
+                            "DEBUG: update target missing; falling back to add "
+                            f"{incoming_row.hostname} {incoming_row.mac} {incoming_row.ip}"
+                        )
+                    add_mapping(page, incoming_row)
+                    log_lines.append(
+                        f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};ok;added-after-missing"
+                    )
+            except PlaywrightTimeoutError as exc:
+                print(f"ERROR: update timeout for {incoming_row.hostname}: {exc}")
+                log_lines.append(
+                    f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};fail;update timeout"
+                )
+                continue
             except Exception as exc:
-                print(f"ERROR: update failed for {row.hostname}: {exc}")
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;{exc}")
+                print(f"ERROR: update/add failed for {incoming_row.hostname}: {exc}")
+                log_lines.append(
+                    f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};fail;{exc}"
+                )
                 continue
 
         for row in rows_to_add:
