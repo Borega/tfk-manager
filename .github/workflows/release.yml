@@ -41,8 +41,9 @@ jobs:
         run: npm ci
 
       - name: Set app version
-        run: |
-          node -e "const fs=require('fs'); const version=`0.0.${process.env.GITHUB_RUN_NUMBER}`; const tauriPath='src-tauri/tauri.conf.json'; const tauri=JSON.parse(fs.readFileSync(tauriPath,'utf8')); tauri.version=version; fs.writeFileSync(tauriPath, JSON.stringify(tauri,null,2)); const pkgPath='package.json'; if (fs.existsSync(pkgPath)) { const pkg=JSON.parse(fs.readFileSync(pkgPath,'utf8')); pkg.version=version; fs.writeFileSync(pkgPath, JSON.stringify(pkg,null,2)); } console.log(`Set version ${version}`);"
+        env:
+          VERSION: 0.0.${{ github.run_number }}
+        run: node scripts/set-version.mjs
 
       - name: Build and release
         uses: tauri-apps/tauri-action@action-v0.6.1
