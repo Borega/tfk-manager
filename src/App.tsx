@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
 import "./App.css";
 
 type ClientRow = {
@@ -307,6 +308,7 @@ function App() {
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [exactCollapsed, setExactCollapsed] = useState(true);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   const incoming = useMemo(() => parseCsv(incomingCsv), [incomingCsv]);
   const existing = useMemo(() => parseCsv(existingCsv), [existingCsv]);
@@ -492,6 +494,10 @@ function App() {
   useEffect(() => {
     if (import.meta.env.DEV) return;
     checkForUpdates({ silent: true }).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => setAppVersion(null));
   }, []);
 
   useEffect(() => {
@@ -936,6 +942,8 @@ function App() {
           <p className="subhead">Validate, diff, and apply CSV changes with a modern, audit-first workflow.</p>
         </div>
         <div className="status-card">
+          <span>Version</span>
+          <strong>{appVersion ? `v${appVersion}` : "v-"}</strong>
           <span>Update Mode</span>
           <strong>{updateMode === "update" ? "Update Conflicts" : "Skip Conflicts"}</strong>
         </div>
