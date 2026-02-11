@@ -20,6 +20,7 @@ type SettingsState = {
   pythonPath: string;
   headless: boolean;
   dryRun: boolean;
+  debug: boolean;
   selectors: {
     addButton: string;
     editButton: string;
@@ -40,6 +41,17 @@ type IgnoredRow = {
   name?: string;
   mac?: string;
   ip?: string;
+};
+
+type SecondaryConflict = {
+  row: ClientRow;
+  field: "mac" | "ip";
+};
+
+type ConflictDeletePrompt = {
+  incoming: ClientRow;
+  existing: ClientRow;
+  conflict: SecondaryConflict;
 };
 
 type RunPayload = {
@@ -66,6 +78,7 @@ const DEFAULT_SETTINGS: SettingsState = {
   pythonPath: "python",
   headless: true,
   dryRun: false,
+  debug: false,
   selectors: {
     addButton: "button.btnAddLease[data-iface='lan']",
     editButton: "button.btnEditLease",
@@ -280,6 +293,8 @@ function App() {
   const [excludedAddKeys, setExcludedAddKeys] = useState<Set<string>>(new Set());
   const [excludedConflictKeys, setExcludedConflictKeys] = useState<Set<string>>(new Set());
   const [selectedDeleteKeys, setSelectedDeleteKeys] = useState<Set<string>>(new Set());
+    const [forcedDeleteRows, setForcedDeleteRows] = useState<Record<string, ClientRow>>({});
+    const [deletePrompt, setDeletePrompt] = useState<ConflictDeletePrompt | null>(null);
   const [autoExporting, setAutoExporting] = useState(false);
   const [lastAutoExportKey, setLastAutoExportKey] = useState<string | null>(null);
   const [autoExportPrompt, setAutoExportPrompt] = useState(false);
@@ -375,6 +390,17 @@ function App() {
   const showRunOverlay = (isRunning || autoExporting) && !autoExportPrompt;
   const runOverlayTitle = activeProcess === "run" ? "Running changes" : "Exporting static list";
   const showUpdateOverlay = showUpdatePrompt || updateInstalling;
+  const forcedDeleteKeys = useMemo(() => new Set(Object.keys(forcedDeleteRows)), [forcedDeleteRows]);
+  const displayDeletes = useMemo(() => {
+    const map = new Map<string, ClientRow>();
+    diff.deletes.forEach((row) => map.set(rowKey(row), row));
+    Object.values(forcedDeleteRows).forEach((row) => map.set(rowKey(row), row));
+    return Array.from(map.values());
+  }, [diff.deletes, forcedDeleteRows]);
+  const deletableDeletes = useMemo(
+    () => displayDeletes.filter((row) => !forcedDeleteKeys.has(rowKey(row))),
+    [displayDeletes, forcedDeleteKeys],
+  );
 
   const canRun =
     incoming.rows.length > 0 &&
@@ -389,7 +415,7 @@ function App() {
     diff.conflicts.length > 0 &&
     diff.conflicts.every(({ incoming }) => !excludedConflictKeys.has(rowKey(incoming)));
   const allDeletesChecked =
-    diff.deletes.length > 0 && diff.deletes.every((row) => selectedDeleteKeys.has(rowKey(row)));
+    deletableDeletes.length > 0 && deletableDeletes.every((row) => selectedDeleteKeys.has(rowKey(row)));
 
   const runBlockers = [
     incoming.rows.length === 0 ? "Incoming CSV is empty" : null,
@@ -400,6 +426,33 @@ function App() {
     !hasPassword ? "Save a password in Settings" : null,
     !confirmChanges ? "Confirm the changes to enable running" : null,
   ].filter(Boolean) as string[];
+  const existingByMac = useMemo(() => {
+    const map = new Map<string, ClientRow>();
+    existing.rows.forEach((row) => map.set(row.mac.toLowerCase(), row));
+    return map;
+  }, [existing.rows]);
+
+  const existingByIp = useMemo(() => {
+    const map = new Map<string, ClientRow>();
+    existing.rows.forEach((row) => map.set(row.ip, row));
+    return map;
+  }, [existing.rows]);
+
+  function findSecondaryConflict(incoming: ClientRow, existingRow: ClientRow): SecondaryConflict | null {
+    if (incoming.mac !== existingRow.mac) {
+      const match = existingByMac.get(incoming.mac.toLowerCase());
+      if (match && rowKey(match) !== rowKey(existingRow)) {
+        return { row: match, field: "mac" };
+      }
+    }
+    if (incoming.ip !== existingRow.ip) {
+      const match = existingByIp.get(incoming.ip);
+      if (match && rowKey(match) !== rowKey(existingRow)) {
+        return { row: match, field: "ip" };
+      }
+    }
+    return null;
+  }
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -540,7 +593,7 @@ function App() {
         return true;
       });
       const filteredIncomingCsv = buildIncomingCsv(filteredRows);
-      const deleteRows = diff.deletes.filter((row) => selectedDeleteKeys.has(rowKey(row)));
+      const deleteRows = displayDeletes.filter((row) => selectedDeleteKeys.has(rowKey(row)));
       const deleteCsv = buildDeleteCsv(deleteRows);
       if (existingCsv.trim().length === 0) {
         const exportResult = await invoke<RunRecord>("export_static", { payload: { settings } });
@@ -713,12 +766,68 @@ function App() {
   }
 
   function toggleAllDeletes() {
-    if (diff.deletes.length === 0) return;
+    if (deletableDeletes.length === 0) return;
     if (allDeletesChecked) {
-      setSelectedDeleteKeys(new Set());
+      setSelectedDeleteKeys((prev) => {
+        const next = new Set(prev);
+        deletableDeletes.forEach((row) => next.delete(rowKey(row)));
+        return next;
+      });
       return;
     }
-    setSelectedDeleteKeys(new Set(diff.deletes.map(rowKey)));
+    setSelectedDeleteKeys((prev) => {
+      const next = new Set(prev);
+      deletableDeletes.forEach((row) => next.add(rowKey(row)));
+      return next;
+    });
+  }
+
+  function handleConflictToggle(incoming: ClientRow, existingRow: ClientRow) {
+    const key = rowKey(incoming);
+    const currentlyChecked = !excludedConflictKeys.has(key);
+    if (currentlyChecked) {
+      setExcludedConflictKeys((prev) => {
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
+      return;
+    }
+
+    const secondary = findSecondaryConflict(incoming, existingRow);
+    if (secondary) {
+      setDeletePrompt({ incoming, existing: existingRow, conflict: secondary });
+      return;
+    }
+
+    setExcludedConflictKeys((prev) => {
+      const next = new Set(prev);
+      next.delete(key);
+      return next;
+    });
+  }
+
+  function confirmDeleteConflict() {
+    if (!deletePrompt) return;
+    const { incoming, conflict } = deletePrompt;
+    const incomingKey = rowKey(incoming);
+    const conflictKey = rowKey(conflict.row);
+    setExcludedConflictKeys((prev) => {
+      const next = new Set(prev);
+      next.delete(incomingKey);
+      return next;
+    });
+    setForcedDeleteRows((prev) => ({ ...prev, [conflictKey]: conflict.row }));
+    setSelectedDeleteKeys((prev) => {
+      const next = new Set(prev);
+      next.add(conflictKey);
+      return next;
+    });
+    setDeletePrompt(null);
+  }
+
+  function cancelDeleteConflict() {
+    setDeletePrompt(null);
   }
 
   return (
@@ -746,6 +855,28 @@ function App() {
                 </button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+      {deletePrompt && (
+        <div className="overlay" aria-live="polite" aria-busy="true">
+          <div className="overlay-card">
+            <div className="overlay-title">Delete conflicting lease?</div>
+            <div className="overlay-subtitle">
+              The update for {deletePrompt.incoming.name} will reuse the same {deletePrompt.conflict.field.toUpperCase()}.
+              Delete the existing lease first?
+            </div>
+            <div className="overlay-actions">
+              <button className="primary" type="button" onClick={confirmDeleteConflict}>
+                Delete and continue
+              </button>
+              <button className="secondary" type="button" onClick={cancelDeleteConflict}>
+                Cancel
+              </button>
+            </div>
+            <div className="overlay-subtitle">
+              Existing: {deletePrompt.conflict.row.name} · {deletePrompt.conflict.row.mac} · {deletePrompt.conflict.row.ip}
+            </div>
           </div>
         </div>
       )}
@@ -964,6 +1095,21 @@ function App() {
                     setSettings((prev) => ({ ...prev, dashboardUrl: value }));
                   }}
                 />
+              </div>
+              <div className="field">
+                <label htmlFor="debug-toggle">Debug logging</label>
+                <label className="toggle-pill">
+                  <input
+                    id="debug-toggle"
+                    type="checkbox"
+                    checked={settings.debug}
+                    onChange={(e) => {
+                      const checked = e.currentTarget.checked;
+                      setSettings((prev) => ({ ...prev, debug: checked }));
+                    }}
+                  />
+                  Enable verbose backend logs
+                </label>
               </div>
               <div className="field">
                 <label htmlFor="add-selector">Add button selector</label>
@@ -1241,13 +1387,7 @@ function App() {
                             type="checkbox"
                             checked={!excludedConflictKeys.has(rowKey(incoming))}
                             onChange={() => {
-                              const key = rowKey(incoming);
-                              setExcludedConflictKeys((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(key)) next.delete(key);
-                                else next.add(key);
-                                return next;
-                              });
+                              handleConflictToggle(incoming, existing);
                             }}
                           />
                           <span>Apply change</span>
@@ -1300,12 +1440,15 @@ function App() {
                     </button>
                   </div>
                   <ul>
-                    {diff.deletes.map((row) => (
+                    {displayDeletes.map((row) => {
+                      const forced = forcedDeleteKeys.has(rowKey(row));
+                      return (
                       <li key={`del-${row.mac}`}>
                         <label className="select-row">
                           <input
                             type="checkbox"
                             checked={selectedDeleteKeys.has(rowKey(row))}
+                            disabled={forced}
                             onChange={() => {
                               const key = rowKey(row);
                               setSelectedDeleteKeys((prev) => {
@@ -1317,9 +1460,11 @@ function App() {
                             }}
                           />
                           <span>{row.name} · {row.mac} · {row.ip}</span>
+                          {forced && <span className="pill">Required</span>}
                         </label>
                       </li>
-                    ))}
+                      );
+                    })}
                   </ul>
                 </div>
                 <div className="preview-section">

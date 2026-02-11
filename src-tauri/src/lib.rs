@@ -33,6 +33,8 @@ struct UiSettings {
     python_path: String,
     headless: bool,
     dry_run: bool,
+    #[serde(default)]
+    debug: bool,
     selectors: SelectorSettings,
 }
 
@@ -401,6 +403,7 @@ fn run_dhcp_sync(app: &tauri::AppHandle, payload: RunPayload) -> Result<RunRecor
         format!("Update mode: {}", payload.update_mode),
         format!("Headless: {}", payload.settings.headless),
         format!("Dry run: {}", payload.settings.dry_run),
+        format!("Debug: {}", payload.settings.debug),
     ];
     for line in &lines {
         emit_line(app, line);
@@ -413,13 +416,18 @@ fn run_dhcp_sync(app: &tauri::AppHandle, payload: RunPayload) -> Result<RunRecor
     let data_dir = ensure_backend_data_dir(app)?;
     let mut command = Command::new(&payload.settings.python_path);
     command
+        .arg("-u")
         .arg(&script_path)
         .env("TFK_SETTINGS_JSON", &config_path)
         .env("TFK_INCOMING_CSV", &incoming_path)
         .env("TFK_DELETE_CSV", &delete_path)
         .env("TFK_UPDATE_MODE", &payload.update_mode)
         .env("TFK_DATA_DIR", &data_dir)
-        .env("TFK_AUTO_CONFIRM", "1");
+        .env("TFK_AUTO_CONFIRM", "1")
+        .env("PYTHONUNBUFFERED", "1");
+    if payload.settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
     if !payload.settings.username.trim().is_empty() {
         command.env("TFK_USERNAME", &payload.settings.username);
     }
@@ -470,6 +478,7 @@ fn export_static_sync(app: &tauri::AppHandle, payload: ExportPayload) -> Result<
         "Export started".to_string(),
         format!("Headless: {}", settings.headless),
         format!("Dry run: {}", settings.dry_run),
+        format!("Debug: {}", settings.debug),
     ];
     for line in &lines {
         emit_line(app, line);
@@ -481,10 +490,15 @@ fn export_static_sync(app: &tauri::AppHandle, payload: ExportPayload) -> Result<
 
     let mut command = Command::new(&settings.python_path);
     command
+        .arg("-u")
         .arg(&script_path)
         .env("TFK_SETTINGS_JSON", &config_path)
         .env("TFK_MODE", "export")
-        .env("TFK_DATA_DIR", &data_dir);
+        .env("TFK_DATA_DIR", &data_dir)
+        .env("PYTHONUNBUFFERED", "1");
+    if settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
     if !settings.username.trim().is_empty() {
         command.env("TFK_USERNAME", &settings.username);
     }

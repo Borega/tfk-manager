@@ -597,6 +597,16 @@ textarea::-webkit-resizer {
   font-size: 0.85rem;
 }
 
+.pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(247, 195, 122, 0.15);
+  color: #f7c37a;
+  font-size: 0.7rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
 .select-row input[type="checkbox"] {
   accent-color: #f7c37a;
 }
