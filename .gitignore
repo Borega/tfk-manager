@@ -39,3 +39,30 @@ backend/data/*.csv
 
 # App data (local settings/history)
 src-tauri/data/
+
+# Local API tooling/scripts (not part of app runtime)
+backend/src/fetch*.py
+backend/src/test*.py
+
+# Generated lease/API output files
+backend/src/static_lease_output.json
+backend/src/static_leases_output.json
+backend/src/dynamic_leases_output.json
+
+# Runtime backend CSV artifacts
+backend/data/run_log.csv
+backend/data/export_static.csv
+backend/data/to_add.csv
+backend/data/to_delete.csv
+
+src-tauri/resources/backend/data/run_log.csv
+src-tauri/resources/backend/data/export_static.csv
+src-tauri/resources/backend/data/to_add.csv
+src-tauri/resources/backend/data/to_delete.csv
+
+# Local endpoint notes
+backend/API_ENDPOINTS.md
+
+# Recommended Python artifacts
+backend/src/__pycache__/
+backend/src/*.py[cod]

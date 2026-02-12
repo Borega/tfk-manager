@@ -30,6 +30,12 @@ struct UiSettings {
     login_url: String,
     dashboard_url: String,
     username: String,
+    #[serde(default)]
+    api_username: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    api_secret: String,
     python_path: String,
     headless: bool,
     dry_run: bool,
@@ -69,6 +75,14 @@ struct HelpResult {
     ok: bool,
     lines: Vec<String>,
     value: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ApiBootstrapResult {
+    ok: bool,
+    lines: Vec<String>,
+    settings: UiSettings,
 }
 
 fn app_data_dir_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -431,6 +445,15 @@ fn run_dhcp_sync(app: &tauri::AppHandle, payload: RunPayload) -> Result<RunRecor
     if !payload.settings.username.trim().is_empty() {
         command.env("TFK_USERNAME", &payload.settings.username);
     }
+    if !payload.settings.api_username.trim().is_empty() {
+        command.env("TFK_API_USERNAME", &payload.settings.api_username);
+    }
+    if !payload.settings.api_key.trim().is_empty() {
+        command.env("TFK_API_KEY", &payload.settings.api_key);
+    }
+    if !payload.settings.api_secret.trim().is_empty() {
+        command.env("TFK_API_SECRET", &payload.settings.api_secret);
+    }
     if let Some(password) = password {
         command.env("TFK_PASSWORD", password);
     }
@@ -502,6 +525,15 @@ fn export_static_sync(app: &tauri::AppHandle, payload: ExportPayload) -> Result<
     if !settings.username.trim().is_empty() {
         command.env("TFK_USERNAME", &settings.username);
     }
+    if !settings.api_username.trim().is_empty() {
+        command.env("TFK_API_USERNAME", &settings.api_username);
+    }
+    if !settings.api_key.trim().is_empty() {
+        command.env("TFK_API_KEY", &settings.api_key);
+    }
+    if !settings.api_secret.trim().is_empty() {
+        command.env("TFK_API_SECRET", &settings.api_secret);
+    }
     if let Some(password) = password {
         command.env("TFK_PASSWORD", password);
     }
@@ -544,6 +576,81 @@ async fn export_static(app: tauri::AppHandle, payload: ExportPayload) -> Result<
         .map_err(|err| err.to_string())?
 }
 
+fn discover_api_credentials_sync(
+    app: &tauri::AppHandle,
+    payload: ExportPayload,
+) -> Result<ApiBootstrapResult, String> {
+    let mut settings = payload.settings;
+    let config_path = app_data_file(app, "last_run_settings.json")?;
+    let config_raw = serde_json::to_string_pretty(&settings).map_err(|err| err.to_string())?;
+    fs::write(&config_path, config_raw).map_err(|err| err.to_string())?;
+    let script_path = resolve_script_path(app)?;
+    let data_dir = ensure_backend_data_dir(app)?;
+    let password = get_password().unwrap_or(None);
+
+    let mut lines = vec!["API bootstrap started".to_string()];
+    emit_line(app, "API bootstrap started");
+
+    let mut command = Command::new(&settings.python_path);
+    command
+        .arg("-u")
+        .arg(&script_path)
+        .env("TFK_SETTINGS_JSON", &config_path)
+        .env("TFK_MODE", "bootstrap_api")
+        .env("TFK_DATA_DIR", &data_dir)
+        .env("PYTHONUNBUFFERED", "1");
+    if settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
+    if !settings.username.trim().is_empty() {
+        command.env("TFK_USERNAME", &settings.username);
+    }
+    if !settings.api_username.trim().is_empty() {
+        command.env("TFK_API_USERNAME", &settings.api_username);
+    }
+    if !settings.api_key.trim().is_empty() {
+        command.env("TFK_API_KEY", &settings.api_key);
+    }
+    if !settings.api_secret.trim().is_empty() {
+        command.env("TFK_API_SECRET", &settings.api_secret);
+    }
+    if let Some(password) = password {
+        command.env("TFK_PASSWORD", password);
+    }
+
+    let state = app.state::<ProcessState>();
+    let status = run_with_live_logs(app, &state, command, &mut lines)?;
+    if !status.success() {
+        let message = format!("Process exited with code {}", status);
+        lines.push(message.clone());
+        emit_line(app, &message);
+    }
+
+    let raw = fs::read_to_string(&config_path).map_err(|err| err.to_string())?;
+    settings = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+
+    let settings_path = app_data_file(app, "settings.json")?;
+    let settings_raw = serde_json::to_string_pretty(&settings).map_err(|err| err.to_string())?;
+    fs::write(settings_path, settings_raw).map_err(|err| err.to_string())?;
+
+    Ok(ApiBootstrapResult {
+        ok: status.success(),
+        lines,
+        settings,
+    })
+}
+
+#[tauri::command]
+async fn discover_api_credentials(
+    app: tauri::AppHandle,
+    payload: ExportPayload,
+) -> Result<ApiBootstrapResult, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || discover_api_credentials_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
 #[tauri::command]
 fn cancel_run(app: tauri::AppHandle, state: tauri::State<ProcessState>) -> Result<(), String> {
     let mut guard = state.child.lock().map_err(|_| "Process lock poisoned".to_string())?;
@@ -573,7 +680,8 @@ pub fn run() {
             has_password,
             find_python,
             install_backend_deps,
-            install_playwright_browsers
+            install_playwright_browsers,
+            discover_api_credentials
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

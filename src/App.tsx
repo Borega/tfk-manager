@@ -18,6 +18,9 @@ type SettingsState = {
   loginUrl: string;
   dashboardUrl: string;
   username: string;
+  apiUsername: string;
+  apiKey: string;
+  apiSecret: string;
   pythonPath: string;
   headless: boolean;
   dryRun: boolean;
@@ -76,6 +79,9 @@ const DEFAULT_SETTINGS: SettingsState = {
   loginUrl: "https://your-opnsense-host",
   dashboardUrl: "https://your-opnsense-host/ui/core/dashboard",
   username: "",
+  apiUsername: "",
+  apiKey: "",
+  apiSecret: "",
   pythonPath: "python",
   headless: true,
   dryRun: false,
@@ -273,6 +279,12 @@ type HelpResult = {
   ok: boolean;
   lines: string[];
   value?: string | null;
+};
+
+type ApiBootstrapResult = {
+  ok: boolean;
+  lines: string[];
+  settings: SettingsState;
 };
 
 function App() {
@@ -522,7 +534,8 @@ function App() {
     setAutoExporting(true);
     setLogs([]);
     try {
-      const result = await invoke<RunRecord>("export_static", { payload: { settings } });
+      const settingsForExport = await bootstrapApiDataIfNeeded(settings);
+      const result = await invoke<RunRecord>("export_static", { payload: { settings: settingsForExport } });
       setHistory((prev) => [result, ...prev]);
       if (result.exportCsv) {
         setExistingCsv(result.exportCsv);
@@ -543,9 +556,39 @@ function App() {
     setAutoExportPrompt(false);
   }
 
+  function hasApiData(candidate: SettingsState): boolean {
+    return (
+      candidate.apiUsername.trim().length > 0 &&
+      candidate.apiKey.trim().length > 0 &&
+      candidate.apiSecret.trim().length > 0
+    );
+  }
+
+  function buildApiPulledLines(candidate: SettingsState): string[] {
+    return [
+      `API username: ${candidate.apiUsername || "-"}`,
+      `API key: ${candidate.apiKey || "-"}`,
+      `API secret: ${candidate.apiSecret || "-"}`,
+    ];
+  }
+
+  async function bootstrapApiDataIfNeeded(candidate: SettingsState): Promise<SettingsState> {
+    if (hasApiData(candidate)) {
+      return candidate;
+    }
+    const result = await invoke<ApiBootstrapResult>("discover_api_credentials", {
+      payload: { settings: candidate },
+    });
+    const nextSettings = normalizeSettings(result.settings);
+    setSettings(nextSettings);
+    setLogs((prev) => [...prev, ...result.lines, ...buildApiPulledLines(nextSettings)]);
+    return nextSettings;
+  }
+
   async function handleSaveSettings() {
     try {
       await invoke("save_settings", { settings });
+      const hasNewPassword = passwordInput.trim().length > 0;
       if (passwordInput.trim().length > 0) {
         await invoke("save_password", { password: passwordInput });
         setPasswordInput("");
@@ -555,7 +598,21 @@ function App() {
         setLogs(["Settings saved."]);
       }
 
-      if (settings.username.trim().length > 0 && hasPassword && hasRealUrls) {
+      const missingApiData =
+        settings.apiUsername.trim().length === 0 ||
+        settings.apiKey.trim().length === 0 ||
+        settings.apiSecret.trim().length === 0;
+      const hasPasswordNow = hasPassword || hasNewPassword;
+      if (
+        missingApiData &&
+        settings.username.trim().length > 0 &&
+        hasPasswordNow &&
+        hasRealUrls
+      ) {
+        await bootstrapApiDataIfNeeded(settings);
+      }
+
+      if (settings.username.trim().length > 0 && hasPasswordNow && hasRealUrls) {
         setAutoExportPrompt(true);
       }
     } catch (error) {
@@ -602,7 +659,8 @@ function App() {
       const deleteRows = displayDeletes.filter((row) => selectedDeleteKeys.has(rowKey(row)));
       const deleteCsv = buildDeleteCsv(deleteRows);
       if (existingCsv.trim().length === 0) {
-        const exportResult = await invoke<RunRecord>("export_static", { payload: { settings } });
+        const settingsForExport = await bootstrapApiDataIfNeeded(settings);
+        const exportResult = await invoke<RunRecord>("export_static", { payload: { settings: settingsForExport } });
         setHistory((prev) => [exportResult, ...prev]);
         if (exportResult.exportCsv) {
           existingCsvForRun = exportResult.exportCsv;
@@ -639,6 +697,7 @@ function App() {
     setRunError(null);
     setLogs([]);
     try {
+      const settingsForExport = await bootstrapApiDataIfNeeded(settings);
       const savePath = await save({
         filters: [{ name: "CSV", extensions: ["csv"] }],
         defaultPath: "export_static.csv",
@@ -648,7 +707,7 @@ function App() {
         return;
       }
       const result = await invoke<RunRecord>("export_static", {
-        payload: { settings, savePath },
+        payload: { settings: settingsForExport, savePath },
       });
       setHistory((prev) => [result, ...prev]);
       if (result.exportCsv) {
@@ -1102,6 +1161,45 @@ function App() {
                     const value = e.currentTarget.value;
                     setSettings((prev) => ({ ...prev, dashboardUrl: value }));
                   }}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="api-username">API username</label>
+                <input
+                  id="api-username"
+                  type="text"
+                  value={settings.apiUsername}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, apiUsername: value }));
+                  }}
+                  placeholder="Auto-filled from /api/tfk/dhcp/apiuserinformation"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="api-key">API key</label>
+                <input
+                  id="api-key"
+                  type="text"
+                  value={settings.apiKey}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, apiKey: value }));
+                  }}
+                  placeholder="Auto-filled from /api/tfk/dhcp/apiuserinformation"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="api-secret">API secret</label>
+                <input
+                  id="api-secret"
+                  type="text"
+                  value={settings.apiSecret}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, apiSecret: value }));
+                  }}
+                  placeholder="Auto-filled from /api/tfk/dhcp/apiuserinformation"
                 />
               </div>
               <div className="field">

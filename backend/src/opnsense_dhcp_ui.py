@@ -5,13 +5,17 @@ import re
 import sys
 import tkinter as tk
 import time
+import requests
 from tkinter import simpledialog
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from urllib3.exceptions import InsecureRequestWarning
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright._impl._errors import TargetClosedError
+
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -32,12 +36,18 @@ EDIT_DIALOG_TIMEOUT_MS = 15000
 UPDATE_MODE_DEFAULT = "skip"  # "skip" or "update"
 PROMPT_UPDATE_MODE = True
 SLOW_MO_MS = 0
+LAST_LEASE_SOURCE = "unknown"
+LAST_LEASE_SOURCE_DETAIL = ""
+SETTINGS_JSON_PATH: Optional[Path] = None
 
 BASE_URL = "https://<opnsense-host>"
 LOGIN_URL = "https://10.6.168.1:81"
 DHCP_STATIC_URL = "https://10.6.168.1:81/ui/core/dashboard"
 USERNAME: Optional[str] = None
 PASSWORD: Optional[str] = None
+API_USERNAME: Optional[str] = None
+API_KEY: Optional[str] = None
+API_SECRET: Optional[str] = None
 
 # Replace these with stable selectors from your UI
 SELECTORS: Dict[str, str] = {
@@ -64,6 +74,8 @@ def load_settings_from_json() -> None:
     settings_path = os.environ.get("TFK_SETTINGS_JSON")
     if not settings_path:
         return
+    global SETTINGS_JSON_PATH
+    SETTINGS_JSON_PATH = Path(settings_path)
     try:
         with open(settings_path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -76,12 +88,16 @@ def load_settings_from_json() -> None:
         return payload.get(camel)
 
     global BASE_URL, LOGIN_URL, DHCP_STATIC_URL, HEADLESS, DRY_RUN, USERNAME, DEBUG
+    global API_USERNAME, API_KEY, API_SECRET
     BASE_URL = get_setting(data, "base_url", "baseUrl") or BASE_URL
     LOGIN_URL = get_setting(data, "login_url", "loginUrl") or LOGIN_URL
     DHCP_STATIC_URL = get_setting(data, "dashboard_url", "dashboardUrl") or DHCP_STATIC_URL
     HEADLESS = get_setting(data, "headless", "headless") if "headless" in data else HEADLESS
     DRY_RUN = get_setting(data, "dry_run", "dryRun") if ("dry_run" in data or "dryRun" in data) else DRY_RUN
     USERNAME = get_setting(data, "username", "username") or USERNAME
+    API_USERNAME = get_setting(data, "api_username", "apiUsername") or API_USERNAME
+    API_KEY = get_setting(data, "api_key", "apiKey") or API_KEY
+    API_SECRET = get_setting(data, "api_secret", "apiSecret") or API_SECRET
     debug_setting = get_setting(data, "debug", "debug")
     if debug_setting is not None:
         if isinstance(debug_setting, str):
@@ -122,14 +138,23 @@ def load_delete_csv_path_from_env() -> None:
 
 
 def load_credentials_from_env() -> None:
-    global USERNAME, PASSWORD, DEBUG
+    global USERNAME, PASSWORD, DEBUG, API_USERNAME, API_KEY, API_SECRET
     env_user = os.environ.get("TFK_USERNAME")
     env_pass = os.environ.get("TFK_PASSWORD")
     env_debug = os.environ.get("TFK_DEBUG")
+    env_api_user = os.environ.get("TFK_API_USERNAME")
+    env_api_key = os.environ.get("TFK_API_KEY")
+    env_api_secret = os.environ.get("TFK_API_SECRET")
     if env_user:
         USERNAME = env_user
     if env_pass:
         PASSWORD = env_pass
+    if env_api_user:
+        API_USERNAME = env_api_user
+    if env_api_key:
+        API_KEY = env_api_key
+    if env_api_secret:
+        API_SECRET = env_api_secret
     if env_debug is not None:
         DEBUG = env_debug.strip().lower() in {"1", "true", "yes", "y"}
 
@@ -461,7 +486,315 @@ def append_log(lines: List[str]) -> None:
             handle.write(line + "\n")
 
 
-def get_existing_entries(page) -> List[DhcpRow]:
+def get_effective_base_url() -> str:
+    base = (BASE_URL or "").strip().rstrip("/")
+    if base and "<" not in base and ">" not in base:
+        return base
+    return (LOGIN_URL or "").strip().rstrip("/")
+
+
+def has_api_credentials() -> bool:
+    return bool((API_KEY or "").strip() and (API_SECRET or "").strip())
+
+
+def _walk_payload(node: Any):
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk_payload(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk_payload(value)
+
+
+def parse_api_user_information(payload: Any) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    username_keys = {"username", "user", "name", "apikeyname", "api_username", "apiusername"}
+    key_keys = {"key", "apikey", "api_key", "token"}
+    secret_keys = {"secret", "apisecret", "api_secret"}
+
+    for item in _walk_payload(payload):
+        item_ci = {str(key).lower(): value for key, value in item.items()}
+        username = None
+        key = None
+        secret = None
+
+        for candidate in username_keys:
+            if candidate in item_ci and str(item_ci[candidate]).strip():
+                username = str(item_ci[candidate]).strip()
+                break
+        for candidate in key_keys:
+            if candidate in item_ci and str(item_ci[candidate]).strip():
+                key = str(item_ci[candidate]).strip()
+                break
+        for candidate in secret_keys:
+            if candidate in item_ci and str(item_ci[candidate]).strip():
+                secret = str(item_ci[candidate]).strip()
+                break
+
+        if key and secret:
+            return username, key, secret
+
+    return None, None, None
+
+
+def save_api_credentials_to_settings() -> None:
+    if not SETTINGS_JSON_PATH or not SETTINGS_JSON_PATH.exists():
+        return
+    if not has_api_credentials():
+        return
+    try:
+        with SETTINGS_JSON_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    if API_USERNAME:
+        data["apiUsername"] = API_USERNAME
+    data["apiKey"] = API_KEY
+    data["apiSecret"] = API_SECRET
+
+    try:
+        with SETTINGS_JSON_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+    except OSError:
+        return
+
+
+def fetch_api_user_information_via_browser(page) -> Optional[Any]:
+    js = """
+    async () => {
+      const response = await fetch('/api/tfk/dhcp/apiuserinformation', {
+        method: 'GET',
+        credentials: 'include',
+        headers: { 'Accept': 'application/json' }
+      });
+      const text = await response.text();
+      let payload = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch (_err) {
+        payload = null;
+      }
+      return { ok: response.ok, status: response.status, payload, text };
+    }
+    """
+    try:
+        result = page.evaluate(js)
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    return result.get("payload")
+
+
+def refresh_api_credentials_via_browser(page) -> bool:
+    global API_USERNAME, API_KEY, API_SECRET
+    payload = fetch_api_user_information_via_browser(page)
+    if payload is None:
+        return False
+    api_username, api_key, api_secret = parse_api_user_information(payload)
+    if not api_key or not api_secret:
+        return False
+    API_USERNAME = api_username or API_USERNAME
+    API_KEY = api_key
+    API_SECRET = api_secret
+    save_api_credentials_to_settings()
+    return True
+
+
+def fetch_static_leases_via_direct_api() -> List[DhcpRow]:
+    global LAST_LEASE_SOURCE_DETAIL
+    if not has_api_credentials():
+        LAST_LEASE_SOURCE_DETAIL = "direct-api missing credentials"
+        return []
+
+    base = get_effective_base_url()
+    endpoints = [
+        "/api/tfk/dhcp/static_leases",
+        "/api/tfk/staticleases/get",
+    ]
+
+    auth_candidates: List[tuple[str, tuple[str, str]]] = []
+    api_user = (API_USERNAME or "").strip()
+    api_key = (API_KEY or "").strip()
+    api_secret = (API_SECRET or "").strip()
+
+    if api_key and api_secret:
+        auth_candidates.append(("apiKey:apiSecret", (api_key, api_secret)))
+    if api_user and api_secret:
+        auth_candidates.append(("apiUsername:apiSecret", (api_user, api_secret)))
+    if api_user and api_key:
+        auth_candidates.append(("apiUsername:apiKey", (api_user, api_key)))
+
+    seen_auths: set[tuple[str, str]] = set()
+    deduped_auths: List[tuple[str, tuple[str, str]]] = []
+    for label, auth in auth_candidates:
+        if auth in seen_auths:
+            continue
+        seen_auths.add(auth)
+        deduped_auths.append((label, auth))
+
+    attempts: List[str] = []
+    for endpoint in endpoints:
+        url = f"{base}{endpoint}"
+        for auth_label, auth in deduped_auths:
+            try:
+                response = requests.get(
+                    url,
+                    auth=auth,
+                    verify=False,
+                    timeout=(30, 60),
+                    headers={"Accept": "application/json"},
+                )
+            except requests.RequestException as exc:
+                attempts.append(f"{endpoint} {auth_label}=request-error:{exc}")
+                continue
+
+            if response.status_code != 200:
+                attempts.append(f"{endpoint} {auth_label}=status:{response.status_code}")
+                continue
+
+            try:
+                payload = response.json()
+            except json.JSONDecodeError:
+                attempts.append(f"{endpoint} {auth_label}=invalid-json")
+                continue
+
+            entries = _parse_static_leases_payload(payload)
+            if entries:
+                LAST_LEASE_SOURCE_DETAIL = (
+                    f"direct-api endpoint={endpoint} auth={auth_label} entries={len(entries)}"
+                )
+                return entries
+
+            payload_type = type(payload).__name__ if payload is not None else "none"
+            attempts.append(f"{endpoint} {auth_label}=entries:0 payload:{payload_type}")
+
+    LAST_LEASE_SOURCE_DETAIL = "direct-api failed; " + " | ".join(attempts[:6])
+    return []
+
+
+def _parse_static_leases_payload(payload: Any) -> List[DhcpRow]:
+    entries: List[DhcpRow] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_entry(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        item_ci = {str(key).lower(): value for key, value in item.items()}
+        hostname = str(item_ci.get("hostname") or item_ci.get("name") or "").strip()
+        mac = str(item_ci.get("mac") or "").strip()
+        ip = str(item_ci.get("ip") or item_ci.get("ipv4") or item_ci.get("address") or "").strip()
+        if not hostname or not mac or not ip:
+            return
+        key = (hostname, mac, ip)
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append(DhcpRow(hostname=hostname, mac=mac, ip=ip))
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            add_entry(node)
+            for value in node.values():
+                walk(value)
+            return
+        if isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload)
+
+    return entries
+
+
+def _fetch_static_leases_via_page_fetch(page) -> Any:
+        js = """
+        async () => {
+            const response = await fetch('/api/tfk/dhcp/static_leases', {
+                method: 'GET',
+                credentials: 'include',
+                headers: { 'Accept': 'application/json' }
+            });
+            const text = await response.text();
+            let payload = null;
+            try {
+                payload = text ? JSON.parse(text) : null;
+            } catch (_err) {
+                payload = null;
+            }
+            return { ok: response.ok, status: response.status, payload, text };
+        }
+        """
+        return page.evaluate(js)
+
+
+def get_existing_entries_from_api(page) -> List[DhcpRow]:
+    global LAST_LEASE_SOURCE_DETAIL
+    api_url = f"{get_effective_base_url()}/api/tfk/dhcp/static_leases"
+    LAST_LEASE_SOURCE_DETAIL = ""
+
+    try:
+        browser_result = _fetch_static_leases_via_page_fetch(page)
+        if isinstance(browser_result, dict) and browser_result.get("ok"):
+            payload = browser_result.get("payload")
+            entries = _parse_static_leases_payload(payload)
+            payload_type = type(payload).__name__ if payload is not None else "none"
+            payload_keys = ",".join(list(payload.keys())[:8]) if isinstance(payload, dict) else ""
+            LAST_LEASE_SOURCE_DETAIL = (
+                f"browser-fetch status={browser_result.get('status')} payload={payload_type} entries={len(entries)}"
+            )
+            if payload_keys:
+                LAST_LEASE_SOURCE_DETAIL += f" keys={payload_keys}"
+            if DEBUG:
+                print(f"DEBUG: API via browser fetch status={browser_result.get('status')} entries={len(entries)}")
+            return entries
+        if DEBUG and isinstance(browser_result, dict):
+            print(
+                "DEBUG: API via browser fetch failed "
+                f"status={browser_result.get('status')}"
+            )
+        if isinstance(browser_result, dict):
+            LAST_LEASE_SOURCE_DETAIL = f"browser-fetch failed status={browser_result.get('status')}"
+    except Exception as exc:
+        if DEBUG:
+            print(f"DEBUG: API via browser fetch error: {exc}")
+        LAST_LEASE_SOURCE_DETAIL = f"browser-fetch error={exc}"
+
+    try:
+        response = page.request.get(api_url, timeout=TIMEOUT_MS, fail_on_status_code=False)
+    except Exception as exc:
+        if DEBUG:
+            print(f"DEBUG: API fetch failed: {exc}")
+        LAST_LEASE_SOURCE_DETAIL = f"request-context error={exc}"
+        return []
+
+    if not response.ok:
+        if DEBUG:
+            print(f"DEBUG: API fetch returned status={response.status}")
+        LAST_LEASE_SOURCE_DETAIL = f"request-context status={response.status}"
+        return []
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        if DEBUG:
+            print(f"DEBUG: API payload decode failed: {exc}")
+        LAST_LEASE_SOURCE_DETAIL = f"request-context decode-error={exc}"
+        return []
+
+    entries = _parse_static_leases_payload(payload)
+    payload_type = type(payload).__name__ if payload is not None else "none"
+    payload_keys = ",".join(list(payload.keys())[:8]) if isinstance(payload, dict) else ""
+    LAST_LEASE_SOURCE_DETAIL = f"request-context status={response.status} payload={payload_type} entries={len(entries)}"
+    if payload_keys:
+        LAST_LEASE_SOURCE_DETAIL += f" keys={payload_keys}"
+    if DEBUG:
+        print(f"DEBUG: existing entries loaded via API ({len(entries)})")
+    return entries
+
+
+def get_existing_entries_from_ui(page) -> List[DhcpRow]:
     table_selector = SELECTORS.get("static_leases_table")
     if not table_selector:
         return []
@@ -521,6 +854,20 @@ def get_existing_entries(page) -> List[DhcpRow]:
         elapsed = time.monotonic() - start_time
         print(f"DEBUG: existing entries loaded ({len(existing)}) in {elapsed:.1f}s")
     return existing
+
+
+def get_existing_entries(page) -> List[DhcpRow]:
+    global LAST_LEASE_SOURCE
+    entries = get_existing_entries_from_api(page)
+    if entries:
+        LAST_LEASE_SOURCE = "api"
+        if DEBUG:
+            print("DEBUG: lease source=api")
+        return entries
+    LAST_LEASE_SOURCE = "ui-fallback"
+    if DEBUG:
+        print("DEBUG: lease source=ui-fallback (api empty or failed)")
+    return get_existing_entries_from_ui(page)
 
 
 def find_conflict(existing: List[DhcpRow], row: DhcpRow) -> Optional[DhcpRow]:
@@ -738,7 +1085,8 @@ def main() -> int:
     load_csv_path_from_env()
     load_delete_csv_path_from_env()
     load_credentials_from_env()
-    if os.environ.get("TFK_MODE", "").lower() == "export":
+    mode = os.environ.get("TFK_MODE", "").lower()
+    if mode == "bootstrap_api":
         if not USERNAME or not PASSWORD:
             username, password = prompt_credentials()
         else:
@@ -753,35 +1101,90 @@ def main() -> int:
                 "--start-maximized",
             ])
             context = browser.new_context(ignore_https_errors=True, viewport=None)
-
-            existing_entries: List[DhcpRow] = []
-            last_error: Optional[Exception] = None
-            for _ in range(2):
-                page = context.new_page()
-                page.bring_to_front()
-                page.set_default_timeout(TIMEOUT_MS)
-                page.set_default_navigation_timeout(TIMEOUT_MS)
-                try:
-                    open_dashboard_ready(page, username, password)
-                    existing_entries = get_existing_entries(page)
-                    export_static_leases(existing_entries)
-                    last_error = None
-                    break
-                except (PlaywrightTimeoutError, TargetClosedError) as exc:
-                    last_error = exc
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-                    continue
-
+            page = context.new_page()
+            page.bring_to_front()
+            page.set_default_timeout(TIMEOUT_MS)
+            page.set_default_navigation_timeout(TIMEOUT_MS)
+            open_dashboard_ready(page, username, password)
+            refreshed = refresh_api_credentials_via_browser(page)
             context.close()
             browser.close()
 
-            if last_error is not None:
-                print(f"ERROR: export failed: {last_error}")
-                return 1
+        if refreshed:
+            print("API credentials refreshed from /api/tfk/dhcp/apiuserinformation")
+            return 0
+        print("Failed to refresh API credentials from /api/tfk/dhcp/apiuserinformation")
+        return 1
 
+    if mode == "export":
+        global LAST_LEASE_SOURCE, LAST_LEASE_SOURCE_DETAIL
+        LAST_LEASE_SOURCE = "unknown"
+        LAST_LEASE_SOURCE_DETAIL = ""
+
+        existing_entries: List[DhcpRow] = []
+        if has_api_credentials():
+            existing_entries = fetch_static_leases_via_direct_api()
+            if existing_entries:
+                LAST_LEASE_SOURCE = "api"
+                export_static_leases(existing_entries)
+
+        if not existing_entries:
+            if not USERNAME or not PASSWORD:
+                username, password = prompt_credentials()
+            else:
+                username, password = USERNAME, PASSWORD
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO_MS, args=[
+                    "--disable-extensions",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--start-maximized",
+                ])
+                context = browser.new_context(ignore_https_errors=True, viewport=None)
+
+                last_error: Optional[Exception] = None
+                for _ in range(2):
+                    page = context.new_page()
+                    page.bring_to_front()
+                    page.set_default_timeout(TIMEOUT_MS)
+                    page.set_default_navigation_timeout(TIMEOUT_MS)
+                    try:
+                        open_dashboard_ready(page, username, password)
+                        refresh_api_credentials_via_browser(page)
+                        existing_entries = fetch_static_leases_via_direct_api()
+                        if existing_entries:
+                            LAST_LEASE_SOURCE = "api"
+                            export_static_leases(existing_entries)
+                        else:
+                            existing_entries = get_existing_entries(page)
+                            export_static_leases(existing_entries)
+                        last_error = None
+                        break
+                    except (PlaywrightTimeoutError, TargetClosedError) as exc:
+                        last_error = exc
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                        continue
+
+                context.close()
+                browser.close()
+
+                if last_error is not None:
+                    print(f"ERROR: export failed: {last_error}")
+                    return 1
+
+        detail = LAST_LEASE_SOURCE_DETAIL or "n/a"
+        append_log([
+            f"-;-;-;info;lease source={LAST_LEASE_SOURCE}",
+            f"-;-;-;info;lease source detail={detail}",
+            f"-;-;-;info;mode=export;entries={len(existing_entries)}",
+        ])
+        print(f"Lease source: {LAST_LEASE_SOURCE}")
+        print(f"Lease source detail: {detail}")
         print(f"Exported {len(existing_entries)} entries to {EXPORT_CSV_PATH}")
         return 0
 
@@ -835,6 +1238,7 @@ def main() -> int:
             wait_for_add_button(page)
 
         existing_entries = get_existing_entries(page)
+        log_lines.append(f"-;-;-;info;lease source={LAST_LEASE_SOURCE}")
         export_static_leases(existing_entries)
 
         delete_rows: List[DhcpRow] = []
