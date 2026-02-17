@@ -12,8 +12,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib3.exceptions import InsecureRequestWarning
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from playwright._impl._errors import TargetClosedError
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    from playwright._impl._errors import TargetClosedError
+except Exception:
+    sync_playwright = None
+
+    class PlaywrightTimeoutError(Exception):
+        pass
+
+    class TargetClosedError(Exception):
+        pass
 
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
@@ -39,6 +48,7 @@ SLOW_MO_MS = 0
 LAST_LEASE_SOURCE = "unknown"
 LAST_LEASE_SOURCE_DETAIL = ""
 SETTINGS_JSON_PATH: Optional[Path] = None
+DEFAULT_IFACE = os.environ.get("TFK_IFACE", "lan")
 
 BASE_URL = "https://<opnsense-host>"
 LOGIN_URL = "https://10.6.168.1:81"
@@ -48,6 +58,8 @@ PASSWORD: Optional[str] = None
 API_USERNAME: Optional[str] = None
 API_KEY: Optional[str] = None
 API_SECRET: Optional[str] = None
+COOKIE_HEADER: Optional[str] = None
+MSD_COOKIE: Optional[str] = None
 
 # Replace these with stable selectors from your UI
 SELECTORS: Dict[str, str] = {
@@ -88,7 +100,7 @@ def load_settings_from_json() -> None:
         return payload.get(camel)
 
     global BASE_URL, LOGIN_URL, DHCP_STATIC_URL, HEADLESS, DRY_RUN, USERNAME, DEBUG
-    global API_USERNAME, API_KEY, API_SECRET
+    global API_USERNAME, API_KEY, API_SECRET, COOKIE_HEADER, MSD_COOKIE
     BASE_URL = get_setting(data, "base_url", "baseUrl") or BASE_URL
     LOGIN_URL = get_setting(data, "login_url", "loginUrl") or LOGIN_URL
     DHCP_STATIC_URL = get_setting(data, "dashboard_url", "dashboardUrl") or DHCP_STATIC_URL
@@ -98,6 +110,8 @@ def load_settings_from_json() -> None:
     API_USERNAME = get_setting(data, "api_username", "apiUsername") or API_USERNAME
     API_KEY = get_setting(data, "api_key", "apiKey") or API_KEY
     API_SECRET = get_setting(data, "api_secret", "apiSecret") or API_SECRET
+    COOKIE_HEADER = get_setting(data, "cookie_header", "cookieHeader") or COOKIE_HEADER
+    MSD_COOKIE = get_setting(data, "msd_cookie", "msdCookie") or MSD_COOKIE
     debug_setting = get_setting(data, "debug", "debug")
     if debug_setting is not None:
         if isinstance(debug_setting, str):
@@ -138,13 +152,15 @@ def load_delete_csv_path_from_env() -> None:
 
 
 def load_credentials_from_env() -> None:
-    global USERNAME, PASSWORD, DEBUG, API_USERNAME, API_KEY, API_SECRET
+    global USERNAME, PASSWORD, DEBUG, API_USERNAME, API_KEY, API_SECRET, COOKIE_HEADER, MSD_COOKIE
     env_user = os.environ.get("TFK_USERNAME")
     env_pass = os.environ.get("TFK_PASSWORD")
     env_debug = os.environ.get("TFK_DEBUG")
     env_api_user = os.environ.get("TFK_API_USERNAME")
     env_api_key = os.environ.get("TFK_API_KEY")
     env_api_secret = os.environ.get("TFK_API_SECRET")
+    env_cookie_header = os.environ.get("TFK_COOKIE_HEADER")
+    env_msd_cookie = os.environ.get("TFK_MSD_COOKIE")
     if env_user:
         USERNAME = env_user
     if env_pass:
@@ -155,6 +171,10 @@ def load_credentials_from_env() -> None:
         API_KEY = env_api_key
     if env_api_secret:
         API_SECRET = env_api_secret
+    if env_cookie_header:
+        COOKIE_HEADER = env_cookie_header
+    if env_msd_cookie:
+        MSD_COOKIE = env_msd_cookie
     if env_debug is not None:
         DEBUG = env_debug.strip().lower() in {"1", "true", "yes", "y"}
 
@@ -497,6 +517,192 @@ def has_api_credentials() -> bool:
     return bool((API_KEY or "").strip() and (API_SECRET or "").strip())
 
 
+class OPNsenseApiSession:
+    def __init__(self, base_url: str, debug: bool = False) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.debug = debug
+        self.session = requests.Session()
+        self.session.verify = False
+        self.session.headers.update(
+            {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            }
+        )
+        self.csrf_token: Optional[str] = None
+
+    def _log(self, message: str) -> None:
+        if self.debug:
+            print(f"DEBUG: {message}")
+
+    def _apply_cookie_header(self, raw_cookie_header: str) -> None:
+        if not raw_cookie_header.strip():
+            return
+        parsed_count = 0
+        for part in raw_cookie_header.split(";"):
+            item = part.strip()
+            if not item or "=" not in item:
+                continue
+            name, value = item.split("=", 1)
+            name = name.strip()
+            value = value.strip()
+            if not name:
+                continue
+            self.session.cookies.set(name, value, path="/")
+            parsed_count += 1
+        self._log(f"Imported {parsed_count} cookie(s) from cookie header")
+
+    def _capture_csrf_token(self, html: str) -> None:
+        header_token = re.search(r'X-CSRFToken"\s*,\s*"([^\"]+)"', html)
+        if header_token:
+            self.csrf_token = header_token.group(1)
+            return
+        hidden_token = re.search(
+            r'<input[^>]*type=["\']hidden["\'][^>]*value=["\']([^"\']+)["\']',
+            html,
+            flags=re.IGNORECASE,
+        )
+        if hidden_token:
+            self.csrf_token = hidden_token.group(1)
+
+    @staticmethod
+    def _is_login_page(html: str) -> bool:
+        lowered = html.lower()
+        return "anmelden" in lowered or 'id="usernamefld"' in lowered
+
+    def _build_login_payload(self, login_html: str, username: str, password: str) -> Dict[str, str]:
+        hidden_fields = dict(
+            re.findall(
+                r'<input[^>]*type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']',
+                login_html,
+                flags=re.IGNORECASE,
+            )
+        )
+
+        payload: Dict[str, str] = {}
+        payload.update(hidden_fields)
+        payload["usernamefld"] = username
+        payload["passwordfld"] = password
+        payload["login"] = "1"
+        return payload
+
+    def authenticate(self, username: str, password: str, cookie_header: str = "", msd_cookie: str = "") -> bool:
+        login_page = self.session.get(f"{self.base_url}/", timeout=(30, 60), allow_redirects=True)
+        self._capture_csrf_token(login_page.text)
+
+        if cookie_header:
+            self._apply_cookie_header(cookie_header)
+        if msd_cookie:
+            self.session.cookies.set("MSD_Cookie", msd_cookie, path="/")
+
+        payload = self._build_login_payload(login_page.text, username, password)
+        login_response = self.session.post(
+            f"{self.base_url}/",
+            data=payload,
+            timeout=(30, 60),
+            allow_redirects=False,
+            headers={
+                "Referer": f"{self.base_url}/",
+                "Origin": self.base_url,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        self._log(
+            "GUI login attempt "
+            f"status={login_response.status_code} location={login_response.headers.get('Location', '')}"
+        )
+
+        if login_response.status_code in {301, 302, 303, 307, 308}:
+            location = login_response.headers.get("Location", "/")
+            if location.startswith("/"):
+                location = f"{self.base_url}{location}"
+            follow = self.session.get(location, timeout=(30, 60), allow_redirects=True)
+            self._capture_csrf_token(follow.text)
+
+        dashboard = self.session.get(
+            f"{self.base_url}/ui/core/dashboard",
+            timeout=(30, 60),
+            allow_redirects=True,
+        )
+        self._capture_csrf_token(dashboard.text)
+        ok = not self._is_login_page(dashboard.text)
+        self._log(f"Authenticated session={ok}")
+        return ok
+
+    def _ajax_headers(self) -> Dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{self.base_url}/ui/core/dashboard",
+            "Origin": self.base_url,
+        }
+        if self.csrf_token:
+            headers["X-CSRFToken"] = self.csrf_token
+        return headers
+
+    def api_get(self, endpoint: str) -> Dict[str, Any]:
+        response = self.session.get(
+            f"{self.base_url}{endpoint}",
+            timeout=(30, 60),
+            allow_redirects=True,
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{self.base_url}/ui/core/dashboard",
+                "Origin": self.base_url,
+            },
+        )
+        try:
+            parsed = response.json()
+            return {"ok": True, "http_status": response.status_code, "data": parsed}
+        except json.JSONDecodeError:
+            if self._is_login_page(response.text):
+                return {"ok": False, "status": "unauthenticated", "http_status": response.status_code}
+            return {"ok": False, "status": "non_json", "http_status": response.status_code, "text": response.text}
+
+    def api_post(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = self.session.post(
+            f"{self.base_url}{endpoint}",
+            data=json.dumps(payload),
+            timeout=(30, 60),
+            headers=self._ajax_headers(),
+        )
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                return parsed
+            return {"status": "unknown", "response": parsed}
+        except json.JSONDecodeError:
+            if self._is_login_page(response.text):
+                return {"status": "unauthenticated", "http_status": response.status_code}
+            return {"status": "non_json", "http_status": response.status_code, "text": response.text}
+
+
+def status_of_api_result(result: Dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return "unknown"
+    if "result" in result:
+        lowered = str(result.get("result", "")).lower()
+        if lowered == "ok":
+            return "success"
+        if lowered == "failed":
+            return "failed"
+    if "status" in result:
+        return str(result.get("status", ""))
+    return "success"
+
+
+def initialize_api_session(username: str, password: str) -> Optional[OPNsenseApiSession]:
+    base = get_effective_base_url()
+    session = OPNsenseApiSession(base, debug=DEBUG)
+    if not session.authenticate(username, password, cookie_header=COOKIE_HEADER or "", msd_cookie=MSD_COOKIE or ""):
+        return None
+    return session
+
+
 def _walk_payload(node: Any):
     if isinstance(node, dict):
         yield node
@@ -592,6 +798,22 @@ def refresh_api_credentials_via_browser(page) -> bool:
     payload = fetch_api_user_information_via_browser(page)
     if payload is None:
         return False
+    api_username, api_key, api_secret = parse_api_user_information(payload)
+    if not api_key or not api_secret:
+        return False
+    API_USERNAME = api_username or API_USERNAME
+    API_KEY = api_key
+    API_SECRET = api_secret
+    save_api_credentials_to_settings()
+    return True
+
+
+def refresh_api_credentials_via_session(session: OPNsenseApiSession) -> bool:
+    global API_USERNAME, API_KEY, API_SECRET
+    result = session.api_get("/api/tfk/dhcp/apiuserinformation")
+    if not result.get("ok"):
+        return False
+    payload = result.get("data")
     api_username, api_key, api_secret = parse_api_user_information(payload)
     if not api_key or not api_secret:
         return False
@@ -705,6 +927,19 @@ def _parse_static_leases_payload(payload: Any) -> List[DhcpRow]:
 
     walk(payload)
 
+    return entries
+
+
+def fetch_static_leases_via_session_api(session: OPNsenseApiSession) -> List[DhcpRow]:
+    global LAST_LEASE_SOURCE_DETAIL
+    response = session.api_get("/api/tfk/dhcp/static_leases")
+    if not response.get("ok"):
+        LAST_LEASE_SOURCE_DETAIL = f"session-api failed status={response.get('status', 'unknown')}"
+        return []
+
+    payload = response.get("data")
+    entries = _parse_static_leases_payload(payload)
+    LAST_LEASE_SOURCE_DETAIL = f"session-api entries={len(entries)}"
     return entries
 
 
@@ -1085,31 +1320,21 @@ def main() -> int:
     load_csv_path_from_env()
     load_delete_csv_path_from_env()
     load_credentials_from_env()
+    iface = os.environ.get("TFK_IFACE", DEFAULT_IFACE)
+
+    username = USERNAME
+    password = PASSWORD
+    if not username or not password:
+        username, password = prompt_credentials()
+
+    api_session = initialize_api_session(username, password)
+    if api_session is None:
+        print("ERROR: Could not establish authenticated API session")
+        return 1
+
     mode = os.environ.get("TFK_MODE", "").lower()
     if mode == "bootstrap_api":
-        if not USERNAME or not PASSWORD:
-            username, password = prompt_credentials()
-        else:
-            username, password = USERNAME, PASSWORD
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO_MS, args=[
-                "--disable-extensions",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-sandbox",
-                "--start-maximized",
-            ])
-            context = browser.new_context(ignore_https_errors=True, viewport=None)
-            page = context.new_page()
-            page.bring_to_front()
-            page.set_default_timeout(TIMEOUT_MS)
-            page.set_default_navigation_timeout(TIMEOUT_MS)
-            open_dashboard_ready(page, username, password)
-            refreshed = refresh_api_credentials_via_browser(page)
-            context.close()
-            browser.close()
-
+        refreshed = refresh_api_credentials_via_session(api_session)
         if refreshed:
             print("API credentials refreshed from /api/tfk/dhcp/apiuserinformation")
             return 0
@@ -1120,62 +1345,10 @@ def main() -> int:
         global LAST_LEASE_SOURCE, LAST_LEASE_SOURCE_DETAIL
         LAST_LEASE_SOURCE = "unknown"
         LAST_LEASE_SOURCE_DETAIL = ""
-
-        existing_entries: List[DhcpRow] = []
-        if has_api_credentials():
-            existing_entries = fetch_static_leases_via_direct_api()
-            if existing_entries:
-                LAST_LEASE_SOURCE = "api"
-                export_static_leases(existing_entries)
-
-        if not existing_entries:
-            if not USERNAME or not PASSWORD:
-                username, password = prompt_credentials()
-            else:
-                username, password = USERNAME, PASSWORD
-
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO_MS, args=[
-                    "--disable-extensions",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--no-sandbox",
-                    "--start-maximized",
-                ])
-                context = browser.new_context(ignore_https_errors=True, viewport=None)
-
-                last_error: Optional[Exception] = None
-                for _ in range(2):
-                    page = context.new_page()
-                    page.bring_to_front()
-                    page.set_default_timeout(TIMEOUT_MS)
-                    page.set_default_navigation_timeout(TIMEOUT_MS)
-                    try:
-                        open_dashboard_ready(page, username, password)
-                        refresh_api_credentials_via_browser(page)
-                        existing_entries = fetch_static_leases_via_direct_api()
-                        if existing_entries:
-                            LAST_LEASE_SOURCE = "api"
-                            export_static_leases(existing_entries)
-                        else:
-                            existing_entries = get_existing_entries(page)
-                            export_static_leases(existing_entries)
-                        last_error = None
-                        break
-                    except (PlaywrightTimeoutError, TargetClosedError) as exc:
-                        last_error = exc
-                        try:
-                            page.close()
-                        except Exception:
-                            pass
-                        continue
-
-                context.close()
-                browser.close()
-
-                if last_error is not None:
-                    print(f"ERROR: export failed: {last_error}")
-                    return 1
+        refresh_api_credentials_via_session(api_session)
+        existing_entries = fetch_static_leases_via_session_api(api_session)
+        LAST_LEASE_SOURCE = "api-session"
+        export_static_leases(existing_entries)
 
         detail = LAST_LEASE_SOURCE_DETAIL or "n/a"
         append_log([
@@ -1201,163 +1374,103 @@ def main() -> int:
         print("No valid rows found.")
         return 1
 
-    username = USERNAME
-    password = PASSWORD
-    if not username or not password:
-        username, password = prompt_credentials()
-
     update_mode = prompt_update_mode()
-
-    print(f"DEBUG: Starting browser (headless={HEADLESS})") if DEBUG else None
     log_lines: List[str] = ["hostname;mac;ip;status;message"]
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO_MS, args=[
-            "--disable-extensions",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--start-maximized",
-        ])
-        context = browser.new_context(ignore_https_errors=True, viewport=None)
-        page = context.new_page()
-        page.bring_to_front()
-        page.set_default_timeout(TIMEOUT_MS)
-        page.set_default_navigation_timeout(TIMEOUT_MS)
 
-        print("DEBUG: Logging in...") if DEBUG else None
-        login(page, username, password)
-        print("DEBUG: Opening dashboard...") if DEBUG else None
-        open_dashboard(page)
-        print("DEBUG: Waiting for DHCP widget...") if DEBUG else None
-        try:
-            wait_for_add_button(page)
-        except PlaywrightTimeoutError:
-            print("DEBUG: DHCP widget not visible yet, navigating to dashboard...") if DEBUG else None
-            page.goto(DHCP_STATIC_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-            open_dashboard(page)
-            wait_for_add_button(page)
+    refresh_api_credentials_via_session(api_session)
+    existing_entries = fetch_static_leases_via_session_api(api_session)
+    LAST_LEASE_SOURCE = "api-session"
+    log_lines.append(f"-;-;-;info;lease source={LAST_LEASE_SOURCE}")
+    export_static_leases(existing_entries)
 
-        existing_entries = get_existing_entries(page)
-        log_lines.append(f"-;-;-;info;lease source={LAST_LEASE_SOURCE}")
-        export_static_leases(existing_entries)
+    delete_rows: List[DhcpRow] = []
+    if DELETE_CSV_PATH.exists():
+        delete_rows = validate_rows(read_csv(DELETE_CSV_PATH))
 
-        delete_rows: List[DhcpRow] = []
-        if DELETE_CSV_PATH.exists():
-            delete_rows = validate_rows(read_csv(DELETE_CSV_PATH))
+    unique_rows: List[DhcpRow] = []
+    seen_macs: set[str] = set()
+    seen_ips: set[str] = set()
+    seen_names: set[str] = set()
 
-        unique_rows: List[DhcpRow] = []
-        seen_macs: set[str] = set()
-        seen_ips: set[str] = set()
-        seen_names: set[str] = set()
+    for row in rows:
+        if row.mac in seen_macs or row.ip in seen_ips or row.hostname in seen_names:
+            log_lines.append(f"{row.hostname};{row.mac};{row.ip};skipped;duplicate in csv")
+            continue
+        seen_macs.add(row.mac)
+        seen_ips.add(row.ip)
+        seen_names.add(row.hostname)
+        unique_rows.append(row)
 
-        for row in rows:
-            if row.mac in seen_macs or row.ip in seen_ips or row.hostname in seen_names:
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};skipped;duplicate in csv")
+    rows_to_add: List[DhcpRow] = []
+    rows_to_update: List[Tuple[DhcpRow, DhcpRow]] = []
+    for row in unique_rows:
+        conflict = find_conflict(existing_entries, row)
+        if conflict:
+            if row.mac == conflict.mac and row.ip == conflict.ip and row.hostname == conflict.hostname:
+                log_lines.append(f"{row.hostname};{row.mac};{row.ip};skipped;exact match")
                 continue
-            seen_macs.add(row.mac)
-            seen_ips.add(row.ip)
-            seen_names.add(row.hostname)
-            unique_rows.append(row)
+            if update_mode == "update":
+                rows_to_update.append((row, conflict))
+            else:
+                log_lines.append(f"{row.hostname};{row.mac};{row.ip};skipped;conflict exists")
+            continue
+        rows_to_add.append(row)
 
-        rows_to_add: List[DhcpRow] = []
-        rows_to_update: List[Tuple[DhcpRow, DhcpRow]] = []
-        for row in unique_rows:
-            conflict = find_conflict(existing_entries, row)
-            if conflict:
-                if row.mac == conflict.mac and row.ip == conflict.ip and row.hostname == conflict.hostname:
-                    log_lines.append(f"{row.hostname};{row.mac};{row.ip};skipped;exact match")
-                    continue
-                if update_mode == "update":
-                    rows_to_update.append((row, conflict))
-                else:
-                    log_lines.append(f"{row.hostname};{row.mac};{row.ip};skipped;conflict exists")
-                continue
-            rows_to_add.append(row)
+    write_temp_csv(rows_to_add)
 
-        write_temp_csv(rows_to_add)
+    summary = summarize_changes(rows_to_add, rows_to_update)
+    if not confirm_changes(summary):
+        log_lines.append("-;-;-;skipped;user canceled")
+        append_log(log_lines)
+        print("Canceled by user.")
+        return 0
 
-        summary = summarize_changes(rows_to_add, rows_to_update)
-        if not confirm_changes(summary):
-            log_lines.append("-;-;-;skipped;user canceled")
-            append_log(log_lines)
-            print("Canceled by user.")
-            return 0
-
+    if DRY_RUN:
         for row in delete_rows:
-            print(f"DEBUG: Deleting {row.hostname} {row.mac} {row.ip}") if DEBUG else None
-            try:
-                if delete_mapping(page, row):
-                    log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;deleted")
-                else:
-                    log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;delete selector missing")
-            except PlaywrightTimeoutError as exc:
-                print(f"ERROR: delete timeout for {row.hostname}: {exc}")
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;delete timeout")
-                continue
-            except Exception as exc:
-                print(f"ERROR: delete failed for {row.hostname}: {exc}")
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;{exc}")
-                continue
+            log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;dry-run delete")
+        for incoming_row, _existing_row in rows_to_update:
+            log_lines.append(f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};ok;dry-run update")
+        for row in rows_to_add:
+            log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;dry-run add")
+    else:
+        for row in delete_rows:
+            result = api_session.api_post(
+                "/api/tfk/dhcp/del_static_lease",
+                {"if": iface, "ip": row.ip, "mac": row.mac},
+            )
+            status = status_of_api_result(result)
+            if status in {"failed", "validation_failed", "error", "unauthenticated", "non_json"}:
+                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;delete {status}")
+            else:
+                log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;deleted")
 
         for incoming_row, existing_row in rows_to_update:
-            if DEBUG:
-                print(
-                    "DEBUG: Updating "
-                    f"{existing_row.hostname} {existing_row.mac} {existing_row.ip} "
-                    f"-> {incoming_row.hostname} {incoming_row.mac} {incoming_row.ip}"
-                )
-            try:
-                if update_mapping(page, incoming_row, existing_row):
-                    log_lines.append(
-                        f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};ok;updated"
-                    )
-                else:
-                    if DEBUG:
-                        print(
-                            "DEBUG: update target missing; falling back to add "
-                            f"{incoming_row.hostname} {incoming_row.mac} {incoming_row.ip}"
-                        )
-                    add_mapping(page, incoming_row)
-                    log_lines.append(
-                        f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};ok;added-after-missing"
-                    )
-            except PlaywrightTimeoutError as exc:
-                print(f"ERROR: update timeout for {incoming_row.hostname}: {exc}")
-                log_lines.append(
-                    f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};fail;update timeout"
-                )
-                continue
-            except Exception as exc:
-                print(f"ERROR: update/add failed for {incoming_row.hostname}: {exc}")
-                log_lines.append(
-                    f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};fail;{exc}"
-                )
-                continue
+            result = api_session.api_post(
+                "/api/tfk/dhcp/update_static_lease",
+                {
+                    "if": iface,
+                    "oldmac": existing_row.mac,
+                    "ip": incoming_row.ip,
+                    "mac": incoming_row.mac,
+                    "hostname": incoming_row.hostname,
+                },
+            )
+            status = status_of_api_result(result)
+            if status in {"failed", "validation_failed", "find_lease_failed", "error", "unauthenticated", "non_json"}:
+                log_lines.append(f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};fail;update {status}")
+            else:
+                log_lines.append(f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};ok;updated")
 
         for row in rows_to_add:
-            print(f"DEBUG: Processing {row.hostname} {row.mac} {row.ip}") if DEBUG else None
-            optional_clear_search(page)
-            if find_existing_by_mac(page, row.mac):
-                print(f"Skip existing MAC: {row.mac} ({row.hostname})")
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};skipped;mac exists")
-                continue
-            try:
-                add_mapping(page, row)
+            result = api_session.api_post(
+                "/api/tfk/dhcp/add_static_lease",
+                {"if": iface, "ip": row.ip, "mac": row.mac, "hostname": row.hostname},
+            )
+            status = status_of_api_result(result)
+            if status in {"failed", "validation_failed", "error", "unauthenticated", "non_json"}:
+                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;add {status}")
+            else:
                 log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;added")
-            except PlaywrightTimeoutError as exc:
-                print(f"ERROR: add_mapping timeout for {row.hostname}: {exc}")
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;timeout")
-                continue
-            except Exception as exc:
-                print(f"ERROR: add_mapping failed for {row.hostname}: {exc}")
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;{exc}")
-                continue
-
-        if not DRY_RUN:
-            apply_changes(page)
-
-        context.close()
-        browser.close()
 
     append_log(log_lines)
     print(f"Log written to {LOG_PATH}")

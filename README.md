@@ -16,14 +16,15 @@ A desktop UI for validating, diffing, and applying OPNsense static DHCP CSV chan
 2. Install dependencies:
 	- npm install
 
-## Backend (Playwright)
+## Backend (API Session)
 1. Create a Python environment and install deps:
 	- cd backend
 	- python -m venv .venv
 	- .venv\\Scripts\\activate
 	- pip install -r requirements.txt
-2. Install Playwright browsers:
-	- python -m playwright install
+
+The backend authenticates against OPNsense, captures session cookies, and calls
+the `/api/tfk/dhcp/*` endpoints directly.
 
 ## Run (Desktop)
 - npm run tauri dev

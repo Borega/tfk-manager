@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
@@ -21,6 +21,7 @@ type SettingsState = {
   apiUsername: string;
   apiKey: string;
   apiSecret: string;
+  cookieHeader: string;
   pythonPath: string;
   headless: boolean;
   dryRun: boolean;
@@ -82,6 +83,7 @@ const DEFAULT_SETTINGS: SettingsState = {
   apiUsername: "",
   apiKey: "",
   apiSecret: "",
+  cookieHeader: "",
   pythonPath: "python",
   headless: true,
   dryRun: false,
@@ -558,7 +560,6 @@ function App() {
 
   function hasApiData(candidate: SettingsState): boolean {
     return (
-      candidate.apiUsername.trim().length > 0 &&
       candidate.apiKey.trim().length > 0 &&
       candidate.apiSecret.trim().length > 0
     );
@@ -622,16 +623,25 @@ function App() {
     }
   }
 
-  function handleFile(event: React.ChangeEvent<HTMLInputElement>, target: "incoming" | "existing") {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const text = String(reader.result ?? "");
-      if (target === "incoming") setIncomingCsv(text);
-      else setExistingCsv(text);
-    };
-    reader.readAsText(file);
+  async function handlePickCsv(target: "incoming" | "existing") {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+      });
+      if (!selected) return;
+      const filePath = Array.isArray(selected) ? selected[0] : selected;
+      if (!filePath) return;
+      const text = await invoke<string>("read_text_file", { path: String(filePath) });
+      if (target === "incoming") {
+        setIncomingCsv(text);
+      } else {
+        setExistingCsv(text);
+      }
+    } catch (error) {
+      setRunError(`CSV import failed: ${error}`);
+      setLogs([`CSV import failed: ${error}`]);
+    }
   }
 
   async function handleRun() {
@@ -793,20 +803,6 @@ function App() {
       setHelpLogs(result.lines);
     } catch (error) {
       setHelpLogs([`Install requirements failed: ${error}`]);
-    } finally {
-      setHelpBusy(false);
-    }
-  }
-
-  async function handleInstallBrowsers() {
-    setHelpBusy(true);
-    try {
-      const result = await invoke<HelpResult>("install_playwright_browsers", {
-        pythonPath: settings.pythonPath,
-      });
-      setHelpLogs(result.lines);
-    } catch (error) {
-      setHelpLogs([`Install Playwright browsers failed: ${error}`]);
     } finally {
       setHelpBusy(false);
     }
@@ -1065,11 +1061,15 @@ function App() {
               </div>
               <div className="field">
                 <label>Import incoming CSV</label>
-                <input type="file" accept=".csv" onChange={(e) => handleFile(e, "incoming")} />
+                <button className="secondary" type="button" onClick={() => void handlePickCsv("incoming")}>
+                  Choose incoming CSV
+                </button>
               </div>
               <div className="field">
                 <label>Import existing export CSV</label>
-                <input type="file" accept=".csv" onChange={(e) => handleFile(e, "existing")} />
+                <button className="secondary" type="button" onClick={() => void handlePickCsv("existing")}>
+                  Choose existing CSV
+                </button>
               </div>
               <div className="field">
                 <label>Paste incoming CSV</label>
@@ -1203,6 +1203,19 @@ function App() {
                 />
               </div>
               <div className="field">
+                <label htmlFor="cookie-header">Cookie header (optional)</label>
+                <input
+                  id="cookie-header"
+                  type="text"
+                  value={settings.cookieHeader}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, cookieHeader: value }));
+                  }}
+                  placeholder="cookie_test=...; MSD_Cookie=...; PHPSESSID=..."
+                />
+              </div>
+              <div className="field">
                 <label htmlFor="debug-toggle">Debug logging</label>
                 <label className="toggle-pill">
                   <input
@@ -1292,8 +1305,7 @@ function App() {
             <div className="tab-panel help-panel">
               <h2>Help & Setup</h2>
               <p className="help-lead">
-                This app uses the bundled automation script. Use the buttons below to prepare Python and
-                Playwright if needed.
+                This app uses authenticated API calls via backend session cookies. Use the buttons below to prepare Python and dependencies.
               </p>
               <div className="help-section">
                 <h3>1) Detect Python</h3>
@@ -1310,17 +1322,11 @@ function App() {
                 </button>
               </div>
               <div className="help-section">
-                <h3>3) Install Playwright browsers</h3>
-                <p>Download the required browser binaries for automation.</p>
-                <button className="secondary" type="button" onClick={handleInstallBrowsers} disabled={helpBusy}>
-                  {helpBusy ? "Working..." : "Install Playwright browsers"}
-                </button>
-              </div>
-              <div className="help-section">
                 <h3>Checklist</h3>
                 <ul className="help-list">
                   <li>Enter OPNsense URLs and username in Settings.</li>
                   <li>Save a password in Settings (stored securely).</li>
+                  <li>Optional: paste Cookie header from browser DevTools for session reuse.</li>
                   <li>Import or paste your incoming and existing CSVs.</li>
                 </ul>
               </div>

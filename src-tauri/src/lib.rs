@@ -36,6 +36,8 @@ struct UiSettings {
     api_key: String,
     #[serde(default)]
     api_secret: String,
+    #[serde(default)]
+    cookie_header: String,
     python_path: String,
     headless: bool,
     dry_run: bool,
@@ -268,13 +270,6 @@ fn install_backend_deps(app: tauri::AppHandle, python_path: String) -> Result<He
     Ok(capture_output(&mut cmd))
 }
 
-#[tauri::command]
-fn install_playwright_browsers(python_path: String) -> Result<HelpResult, String> {
-    let mut cmd = Command::new(python_path);
-    cmd.arg("-m").arg("playwright").arg("install");
-    Ok(capture_output(&mut cmd))
-}
-
 fn credential_entry() -> Result<Entry, String> {
     Entry::new("tfk-manager", "opnsense").map_err(|err| err.to_string())
 }
@@ -361,6 +356,11 @@ fn save_password(password: String) -> Result<(), String> {
 #[tauri::command]
 fn has_password() -> Result<bool, String> {
     Ok(get_password()?.is_some())
+}
+
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -454,6 +454,9 @@ fn run_dhcp_sync(app: &tauri::AppHandle, payload: RunPayload) -> Result<RunRecor
     if !payload.settings.api_secret.trim().is_empty() {
         command.env("TFK_API_SECRET", &payload.settings.api_secret);
     }
+    if !payload.settings.cookie_header.trim().is_empty() {
+        command.env("TFK_COOKIE_HEADER", &payload.settings.cookie_header);
+    }
     if let Some(password) = password {
         command.env("TFK_PASSWORD", password);
     }
@@ -533,6 +536,9 @@ fn export_static_sync(app: &tauri::AppHandle, payload: ExportPayload) -> Result<
     }
     if !settings.api_secret.trim().is_empty() {
         command.env("TFK_API_SECRET", &settings.api_secret);
+    }
+    if !settings.cookie_header.trim().is_empty() {
+        command.env("TFK_COOKIE_HEADER", &settings.cookie_header);
     }
     if let Some(password) = password {
         command.env("TFK_PASSWORD", password);
@@ -614,6 +620,9 @@ fn discover_api_credentials_sync(
     if !settings.api_secret.trim().is_empty() {
         command.env("TFK_API_SECRET", &settings.api_secret);
     }
+    if !settings.cookie_header.trim().is_empty() {
+        command.env("TFK_COOKIE_HEADER", &settings.cookie_header);
+    }
     if let Some(password) = password {
         command.env("TFK_PASSWORD", password);
     }
@@ -678,9 +687,9 @@ pub fn run() {
             load_history,
             save_password,
             has_password,
+            read_text_file,
             find_python,
             install_backend_deps,
-            install_playwright_browsers,
             discover_api_credentials
         ])
         .run(tauri::generate_context!())
