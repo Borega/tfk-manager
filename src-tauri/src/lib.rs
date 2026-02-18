@@ -17,14 +17,6 @@ struct ProcessState {
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct SelectorSettings {
-    add_button: String,
-    edit_button: String,
-    cancel_edit_button: String,
-}
-
-#[derive(Deserialize, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct UiSettings {
     base_url: String,
     login_url: String,
@@ -39,11 +31,9 @@ struct UiSettings {
     #[serde(default)]
     cookie_header: String,
     python_path: String,
-    headless: bool,
     dry_run: bool,
     #[serde(default)]
     debug: bool,
-    selectors: SelectorSettings,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -415,7 +405,6 @@ fn run_dhcp_sync(app: &tauri::AppHandle, payload: RunPayload) -> Result<RunRecor
         format!("Incoming rows: {}", incoming_lines),
         format!("Existing rows: {}", existing_lines),
         format!("Update mode: {}", payload.update_mode),
-        format!("Headless: {}", payload.settings.headless),
         format!("Dry run: {}", payload.settings.dry_run),
         format!("Debug: {}", payload.settings.debug),
     ];
@@ -502,7 +491,6 @@ fn export_static_sync(app: &tauri::AppHandle, payload: ExportPayload) -> Result<
 
     let mut lines = vec![
         "Export started".to_string(),
-        format!("Headless: {}", settings.headless),
         format!("Dry run: {}", settings.dry_run),
         format!("Debug: {}", settings.debug),
     ];

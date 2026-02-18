@@ -4,25 +4,12 @@ import os
 import re
 import sys
 import tkinter as tk
-import time
 import requests
 from tkinter import simpledialog
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib3.exceptions import InsecureRequestWarning
-
-try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    from playwright._impl._errors import TargetClosedError
-except Exception:
-    sync_playwright = None
-
-    class PlaywrightTimeoutError(Exception):
-        pass
-
-    class TargetClosedError(Exception):
-        pass
 
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
@@ -37,7 +24,6 @@ TEMP_CSV_PATH = DATA_DIR / "to_add.csv"
 EXPORT_CSV_PATH = DATA_DIR / "export_static.csv"
 DELETE_CSV_PATH = DATA_DIR / "to_delete.csv"
 DEBUG = False
-HEADLESS = False
 DRY_RUN = True  # Set False to submit entries
 TIMEOUT_MS = 120000
 ADD_BUTTON_TIMEOUT_MS = 10000
@@ -51,8 +37,8 @@ SETTINGS_JSON_PATH: Optional[Path] = None
 DEFAULT_IFACE = os.environ.get("TFK_IFACE", "lan")
 
 BASE_URL = "https://<opnsense-host>"
-LOGIN_URL = "https://10.6.168.1:81"
-DHCP_STATIC_URL = "https://10.6.168.1:81/ui/core/dashboard"
+LOGIN_URL = BASE_URL
+DHCP_STATIC_URL = f"{BASE_URL.rstrip('/')}/ui/core/dashboard"
 USERNAME: Optional[str] = None
 PASSWORD: Optional[str] = None
 API_USERNAME: Optional[str] = None
@@ -60,26 +46,6 @@ API_KEY: Optional[str] = None
 API_SECRET: Optional[str] = None
 COOKIE_HEADER: Optional[str] = None
 MSD_COOKIE: Optional[str] = None
-
-# Replace these with stable selectors from your UI
-SELECTORS: Dict[str, str] = {
-    "username_input": "#usernamefld",
-    "password_input": "#passwordfld",
-    "login_button": ".btn",
-    "dashboard_link": "#Lobby > a:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1)",
-    "add_button": "button.btnAddLease[data-iface='lan']",
-    "mac_input": "#input-mac",
-    "ip_input": "#input-ip",
-    "hostname_input": "#input-hostname",
-    "save_button": ".btnSaveLease",
-    # Optional:
-    "search_input": "input[placeholder='Search']",
-    "apply_button": "button:has-text('Apply')",
-    "static_leases_table": "#statifdhcpleases-if-lease-table-lan",
-    "edit_button": "button.btnEditLease",
-    "cancel_edit_button": "button.btnCancelEditLease",
-    "delete_button": "button.btnDelLease",
-}
 
 
 def load_settings_from_json() -> None:
@@ -99,12 +65,21 @@ def load_settings_from_json() -> None:
             return payload.get(snake)
         return payload.get(camel)
 
-    global BASE_URL, LOGIN_URL, DHCP_STATIC_URL, HEADLESS, DRY_RUN, USERNAME, DEBUG
+    global BASE_URL, LOGIN_URL, DHCP_STATIC_URL, DRY_RUN, USERNAME, DEBUG
     global API_USERNAME, API_KEY, API_SECRET, COOKIE_HEADER, MSD_COOKIE
-    BASE_URL = get_setting(data, "base_url", "baseUrl") or BASE_URL
-    LOGIN_URL = get_setting(data, "login_url", "loginUrl") or LOGIN_URL
-    DHCP_STATIC_URL = get_setting(data, "dashboard_url", "dashboardUrl") or DHCP_STATIC_URL
-    HEADLESS = get_setting(data, "headless", "headless") if "headless" in data else HEADLESS
+    configured_base_url = get_setting(data, "base_url", "baseUrl")
+    if configured_base_url:
+        BASE_URL = configured_base_url
+
+    configured_login_url = get_setting(data, "login_url", "loginUrl")
+    LOGIN_URL = configured_login_url or BASE_URL or LOGIN_URL
+
+    configured_dashboard_url = get_setting(data, "dashboard_url", "dashboardUrl")
+    if configured_dashboard_url:
+        DHCP_STATIC_URL = configured_dashboard_url
+    else:
+        dashboard_base = (BASE_URL or LOGIN_URL).rstrip("/")
+        DHCP_STATIC_URL = f"{dashboard_base}/ui/core/dashboard"
     DRY_RUN = get_setting(data, "dry_run", "dryRun") if ("dry_run" in data or "dryRun" in data) else DRY_RUN
     USERNAME = get_setting(data, "username", "username") or USERNAME
     API_USERNAME = get_setting(data, "api_username", "apiUsername") or API_USERNAME
@@ -118,17 +93,6 @@ def load_settings_from_json() -> None:
             DEBUG = debug_setting.strip().lower() in {"1", "true", "yes", "y"}
         else:
             DEBUG = bool(debug_setting)
-
-    selectors = data.get("selectors") or {}
-    SELECTORS.update({
-        "add_button": selectors.get("add_button", selectors.get("addButton", SELECTORS["add_button"])),
-        "edit_button": selectors.get("edit_button", selectors.get("editButton", SELECTORS["edit_button"])),
-        "cancel_edit_button": selectors.get(
-            "cancel_edit_button",
-            selectors.get("cancelEditButton", SELECTORS["cancel_edit_button"]),
-        ),
-        "delete_button": selectors.get("delete_button", selectors.get("deleteButton", SELECTORS["delete_button"])),
-    })
 
 
 def load_csv_path_from_env() -> None:
@@ -232,44 +196,6 @@ def validate_rows(rows: List[DhcpRow]) -> List[DhcpRow]:
     return valid
 
 
-def safe_fill(page, selector: str, value: str) -> None:
-    page.locator(selector).wait_for(timeout=TIMEOUT_MS)
-    page.locator(selector).fill(value)
-
-
-def optional_clear_search(page) -> None:
-    search_selector = SELECTORS.get("search_input")
-    if not search_selector:
-        return
-    try:
-        locator = page.locator(search_selector)
-        locator.wait_for(timeout=1000)
-        locator.fill("")
-    except PlaywrightTimeoutError:
-        if DEBUG:
-            print("DEBUG: search input not found, skipping clear")
-        pass
-
-
-def find_existing_by_mac(page, mac: str) -> bool:
-    search_selector = SELECTORS.get("search_input")
-    if not search_selector:
-        return False
-    try:
-        locator = page.locator(search_selector)
-        locator.wait_for(timeout=1000)
-        locator.fill(mac)
-        try:
-            page.locator(f"text={mac}").first.wait_for(state="visible", timeout=1500)
-            return True
-        except PlaywrightTimeoutError:
-            return False
-    except PlaywrightTimeoutError:
-        if DEBUG:
-            print("DEBUG: search input not found, skipping existing check")
-        return False
-
-
 def prompt_credentials() -> tuple[str, str]:
     root = tk.Tk()
     root.withdraw()
@@ -292,211 +218,6 @@ def prompt_update_mode() -> str:
         return UPDATE_MODE_DEFAULT
     choice = input("Update mode on conflict? [skip/update] (default: skip): ").strip().lower()
     return "update" if choice == "update" else "skip"
-
-
-def login(page, username: str, password: str) -> None:
-    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-    safe_fill(page, SELECTORS["username_input"], username)
-    safe_fill(page, SELECTORS["password_input"], password)
-    page.locator(SELECTORS["login_button"]).click()
-    page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS * 4)
-
-
-def open_dashboard(page) -> None:
-    page.locator(SELECTORS["dashboard_link"]).click()
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=5000)
-    except PlaywrightTimeoutError:
-        pass
-
-
-def wait_for_edit_dialog_closed(page) -> None:
-    cancel_selector = SELECTORS.get("cancel_edit_button")
-    if not cancel_selector:
-        return
-    try:
-        page.locator(cancel_selector).wait_for(state="hidden", timeout=TIMEOUT_MS)
-    except PlaywrightTimeoutError:
-        try:
-            page.locator(cancel_selector).click()
-            page.locator(cancel_selector).wait_for(state="hidden", timeout=TIMEOUT_MS)
-        except PlaywrightTimeoutError:
-            pass
-
-
-def wait_for_add_dialog_closed(target) -> None:
-    hostname_selector = SELECTORS.get("hostname_input")
-    if not hostname_selector:
-        return
-    try:
-        if DEBUG:
-            print("DEBUG: waiting for add dialog to close (hostname hidden)")
-        target.locator(hostname_selector).wait_for(state="hidden", timeout=TIMEOUT_MS)
-        if DEBUG:
-            print("DEBUG: add dialog closed")
-    except PlaywrightTimeoutError:
-        if DEBUG:
-            print("DEBUG: add dialog did not close within timeout")
-        pass
-
-
-def wait_for_add_button(page) -> None:
-    add_selector = SELECTORS["add_button"]
-    try:
-        if page.locator(add_selector).first.is_visible():
-            if DEBUG:
-                print("DEBUG: add_button already visible")
-            return
-    except (PlaywrightTimeoutError, TargetClosedError):
-        pass
-    if DEBUG:
-        print("DEBUG: waiting for add_button to become visible")
-    page.locator(add_selector).first.wait_for(state="visible", timeout=ADD_BUTTON_TIMEOUT_MS)
-    if DEBUG:
-        print("DEBUG: add_button is visible")
-
-
-def open_dashboard_ready(page, username: str, password: str) -> None:
-    login(page, username, password)
-    open_dashboard(page)
-    try:
-        wait_for_add_button(page)
-    except PlaywrightTimeoutError:
-        if DEBUG:
-            print("DEBUG: add_button not found on dashboard, navigating to DHCP_STATIC_URL")
-        page.goto(DHCP_STATIC_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-        open_dashboard(page)
-        wait_for_add_button(page)
-
-
-def find_frame_with_selector(page, selector: str):
-    for frame in page.frames:
-        try:
-            if frame.locator(selector).count() > 0:
-                return frame
-        except PlaywrightTimeoutError:
-            continue
-    return None
-
-
-def add_mapping(page, row: DhcpRow) -> None:
-    if DEBUG:
-        print("DEBUG: add_mapping start")
-    add_selector = SELECTORS["add_button"]
-    add_locator = page.locator(add_selector)
-    if not add_locator.is_visible():
-        if DEBUG:
-            print("DEBUG: add_button not visible, reopening dashboard")
-        open_dashboard(page)
-        wait_for_add_button(page)
-    if DEBUG:
-        print(f"DEBUG: add_button visible={add_locator.is_visible()} enabled={add_locator.is_enabled()}")
-
-    if DEBUG:
-        try:
-            add_locator.highlight()
-            box = add_locator.bounding_box()
-            print(f"DEBUG: add_button box={box}")
-        except PlaywrightTimeoutError:
-            pass
-
-    add_locator.scroll_into_view_if_needed()
-
-    add_frame = find_frame_with_selector(page, add_selector)
-    target = page
-    if add_frame and add_frame != page.main_frame:
-        if DEBUG:
-            print(f"DEBUG: add_button found in iframe: {add_frame.url}")
-        add_frame.locator(add_selector).click(trial=True)
-        add_frame.locator(add_selector).click(force=True)
-        target = add_frame
-    else:
-        add_locator.click(trial=True)
-        add_locator.click(force=True)
-
-    if DEBUG:
-        print("DEBUG: add_button clicked, waiting for hostname input")
-
-    hostname_locator = target.locator(SELECTORS["hostname_input"])
-    for attempt in range(2):
-        try:
-            hostname_locator.wait_for(state="visible", timeout=3000)
-            break
-        except PlaywrightTimeoutError:
-            if DEBUG:
-                print("DEBUG: hostname input not visible, retrying add click")
-            if target != page:
-                target.locator(add_selector).click(force=True)
-            else:
-                add_locator.click(force=True)
-    hostname_locator.wait_for(state="visible", timeout=TIMEOUT_MS)
-    target.locator(SELECTORS["mac_input"]).wait_for(state="visible", timeout=TIMEOUT_MS)
-    target.locator(SELECTORS["ip_input"]).wait_for(state="visible", timeout=TIMEOUT_MS)
-    safe_fill(target, SELECTORS["mac_input"], row.mac)
-    safe_fill(target, SELECTORS["ip_input"], row.ip)
-    safe_fill(target, SELECTORS["hostname_input"], row.hostname)
-
-    if DRY_RUN:
-        print(f"DRY RUN: would save {row.hostname}")
-        return
-
-    save_selector = SELECTORS["save_button"]
-    if DEBUG:
-        print("DEBUG: waiting for save button visible")
-    target.locator(save_selector).wait_for(state="visible", timeout=TIMEOUT_MS)
-    if DEBUG:
-        print("DEBUG: clicking save button")
-    target.locator(save_selector).click()
-    wait_for_add_dialog_closed(target)
-    if DEBUG:
-        print("DEBUG: waiting for add button to return")
-    try:
-        wait_for_add_button(page)
-    except PlaywrightTimeoutError:
-        if DEBUG:
-            print("DEBUG: add_button not visible after save")
-    if DEBUG:
-        print("DEBUG: save flow complete")
-
-
-def apply_changes(page) -> None:
-    apply_selector = SELECTORS.get("apply_button")
-    if not apply_selector:
-        return
-    locator = page.locator(apply_selector).first
-    try:
-        if not locator.is_visible():
-            if DEBUG:
-                print("DEBUG: apply button not visible, skipping")
-            return
-        if DEBUG:
-            print("DEBUG: clicking apply button")
-        locator.click()
-        try:
-            locator.wait_for(state="hidden", timeout=30000)
-            if DEBUG:
-                print("DEBUG: apply button hidden")
-            return
-        except PlaywrightTimeoutError:
-            if DEBUG:
-                print("DEBUG: apply button still visible, checking disabled")
-        try:
-            page.wait_for_function(
-                "el => el.disabled === true || el.getAttribute('aria-disabled') === 'true'",
-                locator,
-                timeout=10000,
-            )
-            if DEBUG:
-                print("DEBUG: apply button disabled")
-        except PlaywrightTimeoutError:
-            if DEBUG:
-                print("DEBUG: apply did not complete before timeout")
-        try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except PlaywrightTimeoutError:
-            pass
-    except PlaywrightTimeoutError:
-        pass
 
 
 def append_log(lines: List[str]) -> None:
@@ -766,48 +487,6 @@ def save_api_credentials_to_settings() -> None:
         return
 
 
-def fetch_api_user_information_via_browser(page) -> Optional[Any]:
-    js = """
-    async () => {
-      const response = await fetch('/api/tfk/dhcp/apiuserinformation', {
-        method: 'GET',
-        credentials: 'include',
-        headers: { 'Accept': 'application/json' }
-      });
-      const text = await response.text();
-      let payload = null;
-      try {
-        payload = text ? JSON.parse(text) : null;
-      } catch (_err) {
-        payload = null;
-      }
-      return { ok: response.ok, status: response.status, payload, text };
-    }
-    """
-    try:
-        result = page.evaluate(js)
-    except Exception:
-        return None
-    if not isinstance(result, dict) or not result.get("ok"):
-        return None
-    return result.get("payload")
-
-
-def refresh_api_credentials_via_browser(page) -> bool:
-    global API_USERNAME, API_KEY, API_SECRET
-    payload = fetch_api_user_information_via_browser(page)
-    if payload is None:
-        return False
-    api_username, api_key, api_secret = parse_api_user_information(payload)
-    if not api_key or not api_secret:
-        return False
-    API_USERNAME = api_username or API_USERNAME
-    API_KEY = api_key
-    API_SECRET = api_secret
-    save_api_credentials_to_settings()
-    return True
-
-
 def refresh_api_credentials_via_session(session: OPNsenseApiSession) -> bool:
     global API_USERNAME, API_KEY, API_SECRET
     result = session.api_get("/api/tfk/dhcp/apiuserinformation")
@@ -943,327 +622,11 @@ def fetch_static_leases_via_session_api(session: OPNsenseApiSession) -> List[Dhc
     return entries
 
 
-def _fetch_static_leases_via_page_fetch(page) -> Any:
-        js = """
-        async () => {
-            const response = await fetch('/api/tfk/dhcp/static_leases', {
-                method: 'GET',
-                credentials: 'include',
-                headers: { 'Accept': 'application/json' }
-            });
-            const text = await response.text();
-            let payload = null;
-            try {
-                payload = text ? JSON.parse(text) : null;
-            } catch (_err) {
-                payload = null;
-            }
-            return { ok: response.ok, status: response.status, payload, text };
-        }
-        """
-        return page.evaluate(js)
-
-
-def get_existing_entries_from_api(page) -> List[DhcpRow]:
-    global LAST_LEASE_SOURCE_DETAIL
-    api_url = f"{get_effective_base_url()}/api/tfk/dhcp/static_leases"
-    LAST_LEASE_SOURCE_DETAIL = ""
-
-    try:
-        browser_result = _fetch_static_leases_via_page_fetch(page)
-        if isinstance(browser_result, dict) and browser_result.get("ok"):
-            payload = browser_result.get("payload")
-            entries = _parse_static_leases_payload(payload)
-            payload_type = type(payload).__name__ if payload is not None else "none"
-            payload_keys = ",".join(list(payload.keys())[:8]) if isinstance(payload, dict) else ""
-            LAST_LEASE_SOURCE_DETAIL = (
-                f"browser-fetch status={browser_result.get('status')} payload={payload_type} entries={len(entries)}"
-            )
-            if payload_keys:
-                LAST_LEASE_SOURCE_DETAIL += f" keys={payload_keys}"
-            if DEBUG:
-                print(f"DEBUG: API via browser fetch status={browser_result.get('status')} entries={len(entries)}")
-            return entries
-        if DEBUG and isinstance(browser_result, dict):
-            print(
-                "DEBUG: API via browser fetch failed "
-                f"status={browser_result.get('status')}"
-            )
-        if isinstance(browser_result, dict):
-            LAST_LEASE_SOURCE_DETAIL = f"browser-fetch failed status={browser_result.get('status')}"
-    except Exception as exc:
-        if DEBUG:
-            print(f"DEBUG: API via browser fetch error: {exc}")
-        LAST_LEASE_SOURCE_DETAIL = f"browser-fetch error={exc}"
-
-    try:
-        response = page.request.get(api_url, timeout=TIMEOUT_MS, fail_on_status_code=False)
-    except Exception as exc:
-        if DEBUG:
-            print(f"DEBUG: API fetch failed: {exc}")
-        LAST_LEASE_SOURCE_DETAIL = f"request-context error={exc}"
-        return []
-
-    if not response.ok:
-        if DEBUG:
-            print(f"DEBUG: API fetch returned status={response.status}")
-        LAST_LEASE_SOURCE_DETAIL = f"request-context status={response.status}"
-        return []
-
-    try:
-        payload = response.json()
-    except Exception as exc:
-        if DEBUG:
-            print(f"DEBUG: API payload decode failed: {exc}")
-        LAST_LEASE_SOURCE_DETAIL = f"request-context decode-error={exc}"
-        return []
-
-    entries = _parse_static_leases_payload(payload)
-    payload_type = type(payload).__name__ if payload is not None else "none"
-    payload_keys = ",".join(list(payload.keys())[:8]) if isinstance(payload, dict) else ""
-    LAST_LEASE_SOURCE_DETAIL = f"request-context status={response.status} payload={payload_type} entries={len(entries)}"
-    if payload_keys:
-        LAST_LEASE_SOURCE_DETAIL += f" keys={payload_keys}"
-    if DEBUG:
-        print(f"DEBUG: existing entries loaded via API ({len(entries)})")
-    return entries
-
-
-def get_existing_entries_from_ui(page) -> List[DhcpRow]:
-    table_selector = SELECTORS.get("static_leases_table")
-    if not table_selector:
-        return []
-    start_time = time.monotonic()
-    try:
-        table = page.locator(table_selector)
-        table.wait_for(timeout=5000)
-        edit_selector = SELECTORS.get("edit_button")
-        buttons = table.locator(edit_selector) if edit_selector else table.locator("tbody tr")
-        count = buttons.count()
-    except PlaywrightTimeoutError:
-        if DEBUG:
-            print("DEBUG: static leases table not found for existing check")
-        return []
-
-    existing: List[DhcpRow] = []
-    if edit_selector:
-        try:
-            raw_entries = table.locator(edit_selector).evaluate_all(
-                "els => els.map(el => ({hostname: el.getAttribute('data-hostname') || '', mac: el.getAttribute('data-mac') || '', ip: el.getAttribute('data-ip') || ''}))"
-            )
-            for entry in raw_entries:
-                hostname = entry.get("hostname", "")
-                mac = entry.get("mac", "")
-                ip = entry.get("ip", "")
-                if hostname and mac and ip:
-                    existing.append(DhcpRow(hostname=hostname, mac=mac, ip=ip))
-            if existing:
-                if DEBUG:
-                    elapsed = time.monotonic() - start_time
-                    print(f"DEBUG: existing entries loaded ({len(existing)}) in {elapsed:.1f}s")
-                return existing
-        except PlaywrightTimeoutError:
-            pass
-
-    for i in range(count):
-        row = buttons.nth(i)
-        try:
-            hostname = row.get_attribute("data-hostname") or ""
-            mac = row.get_attribute("data-mac") or ""
-            ip = row.get_attribute("data-ip") or ""
-            if hostname and mac and ip:
-                existing.append(DhcpRow(hostname=hostname, mac=mac, ip=ip))
-                continue
-
-            cells = row.locator("td").all_inner_texts()
-            row_text = " ".join(cells) if cells else row.inner_text()
-        except PlaywrightTimeoutError:
-            continue
-
-        mac_match = MAC_RE.search(row_text)
-        ip_match = IP_RE.search(row_text)
-        hostname = (cells[0].strip() if cells else "")
-        if mac_match and ip_match and hostname:
-            existing.append(DhcpRow(hostname=hostname, mac=mac_match.group(0), ip=ip_match.group(0)))
-    if DEBUG:
-        elapsed = time.monotonic() - start_time
-        print(f"DEBUG: existing entries loaded ({len(existing)}) in {elapsed:.1f}s")
-    return existing
-
-
-def get_existing_entries(page) -> List[DhcpRow]:
-    global LAST_LEASE_SOURCE
-    entries = get_existing_entries_from_api(page)
-    if entries:
-        LAST_LEASE_SOURCE = "api"
-        if DEBUG:
-            print("DEBUG: lease source=api")
-        return entries
-    LAST_LEASE_SOURCE = "ui-fallback"
-    if DEBUG:
-        print("DEBUG: lease source=ui-fallback (api empty or failed)")
-    return get_existing_entries_from_ui(page)
-
-
 def find_conflict(existing: List[DhcpRow], row: DhcpRow) -> Optional[DhcpRow]:
     for item in existing:
         if row.mac == item.mac or row.ip == item.ip or row.hostname == item.hostname:
             return item
     return None
-
-
-def wait_for_delete_gone(page, row: DhcpRow) -> bool:
-    table_selector = SELECTORS.get("static_leases_table")
-    delete_selector = SELECTORS.get("delete_button")
-    if not table_selector or not delete_selector:
-        return False
-
-    table = page.locator(table_selector)
-    deadline = time.monotonic() + (TIMEOUT_MS / 1000)
-    while time.monotonic() < deadline:
-        try:
-            locator = table.locator(f"{delete_selector}[data-mac='{row.mac}']")
-            if locator.count() == 0:
-                locator = table.locator(f"{delete_selector}[data-ip='{row.ip}']")
-            if locator.count() == 0:
-                locator = table.locator(f"{delete_selector}[data-hostname='{row.hostname}']")
-            if locator.count() == 0 or not locator.first.is_visible():
-                return True
-        except PlaywrightTimeoutError:
-            pass
-        page.wait_for_timeout(500)
-    return False
-
-
-def delete_mapping(page, row: DhcpRow) -> bool:
-    table_selector = SELECTORS.get("static_leases_table")
-    delete_selector = SELECTORS.get("delete_button")
-    if not table_selector or not delete_selector:
-        return False
-
-    table = page.locator(table_selector)
-    table.wait_for(timeout=5000)
-    delete_button = table.locator(f"{delete_selector}[data-mac='{row.mac}']").first
-    if delete_button.count() == 0:
-        delete_button = table.locator(f"{delete_selector}[data-ip='{row.ip}']").first
-    if delete_button.count() == 0:
-        delete_button = table.locator(f"{delete_selector}[data-hostname='{row.hostname}']").first
-    if delete_button.count() == 0:
-        return False
-
-    if DRY_RUN:
-        print(f"DRY RUN: would delete {row.hostname} {row.mac} {row.ip}")
-        return True
-
-    page.once("dialog", lambda dialog: dialog.accept())
-    delete_button.click()
-    if DEBUG:
-        print("DEBUG: waiting for delete to disappear")
-    return wait_for_delete_gone(page, row)
-
-
-def update_mapping(page, incoming: DhcpRow, existing: DhcpRow) -> bool:
-    table_selector = SELECTORS.get("static_leases_table")
-    edit_selector = SELECTORS.get("edit_button")
-    if not table_selector or not edit_selector:
-        return False
-
-    try:
-        page.locator(table_selector).wait_for(timeout=5000)
-    except PlaywrightTimeoutError:
-        if DEBUG:
-            print("DEBUG: static leases table not found for update lookup")
-
-    edit_button = page.locator(f"{edit_selector}[data-mac='{existing.mac}']").first
-    if edit_button.count() == 0:
-        edit_button = page.locator(f"{edit_selector}[data-ip='{existing.ip}']").first
-    if edit_button.count() == 0:
-        edit_button = page.locator(f"{edit_selector}[data-hostname='{existing.hostname}']").first
-    if edit_button.count() == 0:
-        buttons = page.locator(edit_selector)
-        count = buttons.count()
-        for idx in range(count):
-            candidate = buttons.nth(idx)
-            try:
-                data_mac = candidate.get_attribute("data-mac") or ""
-                data_ip = candidate.get_attribute("data-ip") or ""
-                data_host = candidate.get_attribute("data-hostname") or ""
-            except PlaywrightTimeoutError:
-                continue
-            if existing.mac == data_mac or existing.ip == data_ip or existing.hostname == data_host:
-                edit_button = candidate
-                break
-
-    if edit_button.count() == 0:
-        if DEBUG:
-            print(
-                "DEBUG: edit button not found for "
-                f"{existing.hostname} {existing.mac} {existing.ip}"
-            )
-        return False
-
-    target = page
-    last_error: Optional[Exception] = None
-    for attempt in range(2):
-        edit_frame = find_frame_with_selector(page, edit_selector)
-        target = edit_frame if edit_frame and edit_frame != page.main_frame else page
-        if DEBUG and edit_frame and edit_frame != page.main_frame:
-            print(f"DEBUG: edit button found in iframe: {edit_frame.url}")
-
-        try:
-            if target == page:
-                edit_button.click()
-            else:
-                target.locator(edit_selector).click(trial=True)
-                target.locator(edit_selector).click(force=True)
-
-            if DEBUG:
-                print("DEBUG: waiting for edit dialog inputs")
-            target.locator(SELECTORS["hostname_input"]).wait_for(
-                state="visible",
-                timeout=EDIT_DIALOG_TIMEOUT_MS,
-            )
-            target.locator(SELECTORS["mac_input"]).wait_for(
-                state="visible",
-                timeout=EDIT_DIALOG_TIMEOUT_MS,
-            )
-            target.locator(SELECTORS["ip_input"]).wait_for(
-                state="visible",
-                timeout=EDIT_DIALOG_TIMEOUT_MS,
-            )
-            safe_fill(target, SELECTORS["mac_input"], incoming.mac)
-            safe_fill(target, SELECTORS["ip_input"], incoming.ip)
-            safe_fill(target, SELECTORS["hostname_input"], incoming.hostname)
-            last_error = None
-            break
-        except PlaywrightTimeoutError as exc:
-            last_error = exc
-            if DEBUG:
-                print("DEBUG: edit dialog inputs not visible, retrying")
-            continue
-
-    if last_error is not None:
-        if DEBUG:
-            print(f"DEBUG: edit dialog never appeared: {last_error}")
-        return False
-
-    if DRY_RUN:
-        target.locator(SELECTORS["cancel_edit_button"]).click()
-        wait_for_edit_dialog_closed(target)
-        return True
-
-    target.locator(SELECTORS["save_button"]).click()
-    if DEBUG:
-        print("DEBUG: waiting for edit dialog to close after save")
-    wait_for_edit_dialog_closed(target)
-    if DEBUG:
-        print("DEBUG: waiting for add button after edit")
-    try:
-        wait_for_add_button(page)
-    except PlaywrightTimeoutError:
-        if DEBUG:
-            print("DEBUG: add_button not visible after edit")
-    return True
 
 
 def write_temp_csv(rows: List[DhcpRow]) -> None:
@@ -1425,6 +788,12 @@ def main() -> int:
         print("Canceled by user.")
         return 0
 
+    skipped_errors: List[Tuple[str, DhcpRow, str]] = []
+
+    def record_item_error(action: str, row: DhcpRow, error_message: str) -> None:
+        skipped_errors.append((action, row, error_message))
+        log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;{action} {error_message}")
+
     if DRY_RUN:
         for row in delete_rows:
             log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;dry-run delete")
@@ -1434,43 +803,61 @@ def main() -> int:
             log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;dry-run add")
     else:
         for row in delete_rows:
-            result = api_session.api_post(
-                "/api/tfk/dhcp/del_static_lease",
-                {"if": iface, "ip": row.ip, "mac": row.mac},
-            )
-            status = status_of_api_result(result)
-            if status in {"failed", "validation_failed", "error", "unauthenticated", "non_json"}:
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;delete {status}")
-            else:
+            try:
+                result = api_session.api_post(
+                    "/api/tfk/dhcp/del_static_lease",
+                    {"if": iface, "ip": row.ip, "mac": row.mac},
+                )
+                status = status_of_api_result(result)
+                if status in {"failed", "validation_failed", "error", "unauthenticated", "non_json"}:
+                    record_item_error("delete", row, status)
+                    continue
                 log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;deleted")
+            except Exception as exc:
+                record_item_error("delete", row, f"exception: {exc}")
 
         for incoming_row, existing_row in rows_to_update:
-            result = api_session.api_post(
-                "/api/tfk/dhcp/update_static_lease",
-                {
-                    "if": iface,
-                    "oldmac": existing_row.mac,
-                    "ip": incoming_row.ip,
-                    "mac": incoming_row.mac,
-                    "hostname": incoming_row.hostname,
-                },
-            )
-            status = status_of_api_result(result)
-            if status in {"failed", "validation_failed", "find_lease_failed", "error", "unauthenticated", "non_json"}:
-                log_lines.append(f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};fail;update {status}")
-            else:
+            try:
+                result = api_session.api_post(
+                    "/api/tfk/dhcp/update_static_lease",
+                    {
+                        "if": iface,
+                        "oldmac": existing_row.mac,
+                        "ip": incoming_row.ip,
+                        "mac": incoming_row.mac,
+                        "hostname": incoming_row.hostname,
+                    },
+                )
+                status = status_of_api_result(result)
+                if status in {"failed", "validation_failed", "find_lease_failed", "error", "unauthenticated", "non_json"}:
+                    record_item_error("update", incoming_row, status)
+                    continue
                 log_lines.append(f"{incoming_row.hostname};{incoming_row.mac};{incoming_row.ip};ok;updated")
+            except Exception as exc:
+                record_item_error("update", incoming_row, f"exception: {exc}")
 
         for row in rows_to_add:
-            result = api_session.api_post(
-                "/api/tfk/dhcp/add_static_lease",
-                {"if": iface, "ip": row.ip, "mac": row.mac, "hostname": row.hostname},
-            )
-            status = status_of_api_result(result)
-            if status in {"failed", "validation_failed", "error", "unauthenticated", "non_json"}:
-                log_lines.append(f"{row.hostname};{row.mac};{row.ip};fail;add {status}")
-            else:
+            try:
+                result = api_session.api_post(
+                    "/api/tfk/dhcp/add_static_lease",
+                    {"if": iface, "ip": row.ip, "mac": row.mac, "hostname": row.hostname},
+                )
+                status = status_of_api_result(result)
+                if status in {"failed", "validation_failed", "error", "unauthenticated", "non_json"}:
+                    record_item_error("add", row, status)
+                    continue
                 log_lines.append(f"{row.hostname};{row.mac};{row.ip};ok;added")
+            except Exception as exc:
+                record_item_error("add", row, f"exception: {exc}")
+
+    if skipped_errors:
+        log_lines.append(f"-;-;-;info;skipped_errors={len(skipped_errors)}")
+        print("Skipped items due to errors:")
+        for action, row, error_message in skipped_errors:
+            print(f"- {action.upper()} {row.hostname} {row.mac} {row.ip}: {error_message}")
+        print(f"Total skipped due to errors: {len(skipped_errors)}")
+    else:
+        print("No items skipped due to API errors.")
 
     append_log(log_lines)
     print(f"Log written to {LOG_PATH}")

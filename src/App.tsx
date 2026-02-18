@@ -23,14 +23,8 @@ type SettingsState = {
   apiSecret: string;
   cookieHeader: string;
   pythonPath: string;
-  headless: boolean;
   dryRun: boolean;
   debug: boolean;
-  selectors: {
-    addButton: string;
-    editButton: string;
-    cancelEditButton: string;
-  };
 };
 
 type ParseResult = {
@@ -85,14 +79,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   apiSecret: "",
   cookieHeader: "",
   pythonPath: "python",
-  headless: true,
   dryRun: false,
   debug: false,
-  selectors: {
-    addButton: "button.btnAddLease[data-iface='lan']",
-    editButton: "button.btnEditLease",
-    cancelEditButton: "button.btnCancelEditLease",
-  },
 };
 
 function normalizeSettings(loaded?: Partial<SettingsState> | null): SettingsState {
@@ -100,10 +88,6 @@ function normalizeSettings(loaded?: Partial<SettingsState> | null): SettingsStat
   return {
     ...DEFAULT_SETTINGS,
     ...loaded,
-    selectors: {
-      ...DEFAULT_SETTINGS.selectors,
-      ...(loaded.selectors ?? {}),
-    },
   };
 }
 
@@ -290,12 +274,12 @@ type ApiBootstrapResult = {
 };
 
 function App() {
+  const UPDATE_MODE: RunPayload["updateMode"] = "update";
   const [activeTab, setActiveTab] = useState<"console" | "settings" | "history" | "help">("console");
   const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS);
   const [history, setHistory] = useState<RunRecord[]>([]);
   const [incomingCsv, setIncomingCsv] = useState("");
   const [existingCsv, setExistingCsv] = useState("");
-  const [updateMode, setUpdateMode] = useState<"skip" | "update">("skip");
   const [confirmChanges, setConfirmChanges] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [isRunning, setIsRunning] = useState(false);
@@ -380,14 +364,6 @@ function App() {
     setAcknowledgeIgnored(false);
     setExactCollapsed(true);
   }, [incomingCsv, existingCsv]);
-
-  useEffect(() => {
-    if (updateMode === "skip") {
-      setExcludedConflictKeys(new Set(diff.conflicts.map(({ incoming }) => rowKey(incoming))));
-      return;
-    }
-    setExcludedConflictKeys(new Set());
-  }, [diff.conflicts, updateMode]);
 
   const credentialsReady = settings.username.trim().length > 0 && hasPassword;
   const hasRealUrls =
@@ -681,11 +657,20 @@ function App() {
         incomingCsv: filteredIncomingCsv,
         existingCsv: existingCsvForRun,
         deleteCsv,
-        updateMode,
+        updateMode: UPDATE_MODE,
         settings,
       };
       const result = await invoke<RunRecord>("run_dhcp", { payload });
       setHistory((prev) => [result, ...prev]);
+
+      const settingsForRefresh = await bootstrapApiDataIfNeeded(settings);
+      const refreshedList = await invoke<RunRecord>("export_static", {
+        payload: { settings: settingsForRefresh },
+      });
+      setHistory((prev) => [refreshedList, ...prev]);
+      if (refreshedList.exportCsv) {
+        setExistingCsv(refreshedList.exportCsv);
+      }
     } catch (error) {
       setRunError(String(error));
       setLogs(["Run failed. See error details."]);
@@ -999,8 +984,6 @@ function App() {
         <div className="status-card">
           <span>Version</span>
           <strong>{appVersion ? `v${appVersion}` : "v-"}</strong>
-          <span>Update Mode</span>
-          <strong>{updateMode === "update" ? "Update Conflicts" : "Skip Conflicts"}</strong>
         </div>
       </header>
 
@@ -1040,25 +1023,6 @@ function App() {
           {activeTab === "console" && (
             <div className="tab-panel">
               <h2>Run Console</h2>
-              <div className="field">
-                <label>Update behavior on conflict</label>
-                <div className="segmented">
-                  <button
-                    type="button"
-                    className={updateMode === "skip" ? "active" : ""}
-                    onClick={() => setUpdateMode("skip")}
-                  >
-                    Skip
-                  </button>
-                  <button
-                    type="button"
-                    className={updateMode === "update" ? "active" : ""}
-                    onClick={() => setUpdateMode("update")}
-                  >
-                    Update
-                  </button>
-                </div>
-              </div>
               <div className="field">
                 <label>Import incoming CSV</label>
                 <button className="secondary" type="button" onClick={() => void handlePickCsv("incoming")}>
@@ -1229,51 +1193,6 @@ function App() {
                   />
                   Enable verbose backend logs
                 </label>
-              </div>
-              <div className="field">
-                <label htmlFor="add-selector">Add button selector</label>
-                <input
-                  id="add-selector"
-                  type="text"
-                  value={settings.selectors.addButton}
-                  onChange={(e) => {
-                    const value = e.currentTarget.value;
-                    setSettings((prev) => ({
-                      ...prev,
-                      selectors: { ...prev.selectors, addButton: value },
-                    }));
-                  }}
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="edit-selector">Edit button selector</label>
-                <input
-                  id="edit-selector"
-                  type="text"
-                  value={settings.selectors.editButton}
-                  onChange={(e) => {
-                    const value = e.currentTarget.value;
-                    setSettings((prev) => ({
-                      ...prev,
-                      selectors: { ...prev.selectors, editButton: value },
-                    }));
-                  }}
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="cancel-selector">Cancel edit selector</label>
-                <input
-                  id="cancel-selector"
-                  type="text"
-                  value={settings.selectors.cancelEditButton}
-                  onChange={(e) => {
-                    const value = e.currentTarget.value;
-                    setSettings((prev) => ({
-                      ...prev,
-                      selectors: { ...prev.selectors, cancelEditButton: value },
-                    }));
-                  }}
-                />
               </div>
               <button className="secondary" type="button" onClick={handleSaveSettings}>
                 Save settings
@@ -1486,7 +1405,7 @@ function App() {
                       className="mini-action"
                       type="button"
                       onClick={toggleAllConflicts}
-                      disabled={diff.conflicts.length === 0 || updateMode === "skip"}
+                      disabled={diff.conflicts.length === 0}
                     >
                       {allConflictsChecked ? "Uncheck all" : "Check all"}
                     </button>
@@ -1633,18 +1552,6 @@ function App() {
               </div>
             )}
             <div className="run-toggles">
-              <label className="toggle-pill">
-                <input
-                  id="headless-toggle"
-                  type="checkbox"
-                  checked={settings.headless}
-                  onChange={(e) => {
-                    const checked = e.currentTarget.checked;
-                    setSettings((prev) => ({ ...prev, headless: checked }));
-                  }}
-                />
-                Headless
-              </label>
               <label className="toggle-pill">
                 <input
                   id="dryrun-toggle"

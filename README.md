@@ -23,6 +23,8 @@ A desktop UI for validating, diffing, and applying OPNsense static DHCP CSV chan
 	- .venv\\Scripts\\activate
 	- pip install -r requirements.txt
 
+Only `requests` is required for backend dependencies. Playwright and selector configuration are no longer needed.
+
 The backend authenticates against OPNsense, captures session cookies, and calls
 the `/api/tfk/dhcp/*` endpoints directly.
 
