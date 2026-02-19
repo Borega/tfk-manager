@@ -77,6 +77,68 @@ struct ApiBootstrapResult {
     settings: UiSettings,
 }
 
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DynamicLease {
+    iface: String,
+    ip: String,
+    mac: String,
+    hostname: String,
+    start: String,
+    end: String,
+    status: String,
+    online: bool,
+    movable_to_static: bool,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DynamicLeasesResult {
+    ok: bool,
+    rows: Vec<DynamicLease>,
+    movable_count: usize,
+    info_count: usize,
+    lease_source: String,
+    lease_source_detail: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MoveDynamicLeasePayload {
+    settings: UiSettings,
+    iface: String,
+    ip: String,
+    mac: String,
+    hostname: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MoveDynamicLeaseResult {
+    ok: bool,
+    status: String,
+    message: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStaticFromDynamicPayload {
+    settings: UiSettings,
+    old_mac: String,
+    iface: String,
+    ip: String,
+    mac: String,
+    hostname: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStaticFromDynamicResult {
+    ok: bool,
+    status: String,
+    message: String,
+}
+
 fn app_data_dir_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -648,6 +710,240 @@ async fn discover_api_credentials(
         .map_err(|err| err.to_string())?
 }
 
+fn load_dynamic_leases_sync(
+    app: &tauri::AppHandle,
+    payload: ExportPayload,
+) -> Result<DynamicLeasesResult, String> {
+    let settings = payload.settings;
+    let config_path = app_data_file(app, "last_run_settings.json")?;
+    let config_raw = serde_json::to_string_pretty(&settings).map_err(|err| err.to_string())?;
+    fs::write(&config_path, config_raw).map_err(|err| err.to_string())?;
+    let script_path = resolve_script_path(app)?;
+    let data_dir = ensure_backend_data_dir(app)?;
+    let password = get_password().unwrap_or(None);
+
+    let mut command = Command::new(&settings.python_path);
+    command
+        .arg("-u")
+        .arg(&script_path)
+        .env("TFK_SETTINGS_JSON", &config_path)
+        .env("TFK_MODE", "dynamic")
+        .env("TFK_DATA_DIR", &data_dir)
+        .env("PYTHONUNBUFFERED", "1");
+    if settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
+    if !settings.username.trim().is_empty() {
+        command.env("TFK_USERNAME", &settings.username);
+    }
+    if !settings.api_username.trim().is_empty() {
+        command.env("TFK_API_USERNAME", &settings.api_username);
+    }
+    if !settings.api_key.trim().is_empty() {
+        command.env("TFK_API_KEY", &settings.api_key);
+    }
+    if !settings.api_secret.trim().is_empty() {
+        command.env("TFK_API_SECRET", &settings.api_secret);
+    }
+    if !settings.cookie_header.trim().is_empty() {
+        command.env("TFK_COOKIE_HEADER", &settings.cookie_header);
+    }
+    if let Some(password) = password {
+        command.env("TFK_PASSWORD", password);
+    }
+
+    let output = command.output().map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(format!(
+            "Dynamic lease fetch failed ({}). stdout: {} stderr: {}",
+            output.status, stdout, stderr
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parsed: Option<DynamicLeasesResult> = None;
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<DynamicLeasesResult>(trimmed) {
+            parsed = Some(value);
+            break;
+        }
+    }
+
+    parsed.ok_or_else(|| "Could not parse dynamic lease JSON output".to_string())
+}
+
+#[tauri::command]
+async fn load_dynamic_leases(
+    app: tauri::AppHandle,
+    payload: ExportPayload,
+) -> Result<DynamicLeasesResult, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || load_dynamic_leases_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn move_dynamic_to_static_sync(
+    app: &tauri::AppHandle,
+    payload: MoveDynamicLeasePayload,
+) -> Result<MoveDynamicLeaseResult, String> {
+    let config_path = app_data_file(app, "last_run_settings.json")?;
+    let config_raw = serde_json::to_string_pretty(&payload.settings).map_err(|err| err.to_string())?;
+    fs::write(&config_path, config_raw).map_err(|err| err.to_string())?;
+    let script_path = resolve_script_path(app)?;
+    let data_dir = ensure_backend_data_dir(app)?;
+    let password = get_password().unwrap_or(None);
+
+    let mut command = Command::new(&payload.settings.python_path);
+    command
+        .arg("-u")
+        .arg(&script_path)
+        .env("TFK_SETTINGS_JSON", &config_path)
+        .env("TFK_MODE", "move_dynamic")
+        .env("TFK_DATA_DIR", &data_dir)
+        .env("TFK_DYNAMIC_IFACE", &payload.iface)
+        .env("TFK_DYNAMIC_IP", &payload.ip)
+        .env("TFK_DYNAMIC_MAC", &payload.mac)
+        .env("TFK_DYNAMIC_HOSTNAME", &payload.hostname)
+        .env("PYTHONUNBUFFERED", "1");
+    if payload.settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
+    if !payload.settings.username.trim().is_empty() {
+        command.env("TFK_USERNAME", &payload.settings.username);
+    }
+    if !payload.settings.api_username.trim().is_empty() {
+        command.env("TFK_API_USERNAME", &payload.settings.api_username);
+    }
+    if !payload.settings.api_key.trim().is_empty() {
+        command.env("TFK_API_KEY", &payload.settings.api_key);
+    }
+    if !payload.settings.api_secret.trim().is_empty() {
+        command.env("TFK_API_SECRET", &payload.settings.api_secret);
+    }
+    if !payload.settings.cookie_header.trim().is_empty() {
+        command.env("TFK_COOKIE_HEADER", &payload.settings.cookie_header);
+    }
+    if let Some(password) = password {
+        command.env("TFK_PASSWORD", password);
+    }
+
+    let output = command.output().map_err(|err| err.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parsed: Option<MoveDynamicLeaseResult> = None;
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<MoveDynamicLeaseResult>(trimmed) {
+            parsed = Some(value);
+            break;
+        }
+    }
+
+    let result = parsed.ok_or_else(|| "Could not parse move-dynamic JSON output".to_string())?;
+    if !output.status.success() && result.ok {
+        return Err("Dynamic move exited with error status".to_string());
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn move_dynamic_to_static(
+    app: tauri::AppHandle,
+    payload: MoveDynamicLeasePayload,
+) -> Result<MoveDynamicLeaseResult, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || move_dynamic_to_static_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn update_static_from_dynamic_sync(
+    app: &tauri::AppHandle,
+    payload: UpdateStaticFromDynamicPayload,
+) -> Result<UpdateStaticFromDynamicResult, String> {
+    let config_path = app_data_file(app, "last_run_settings.json")?;
+    let config_raw = serde_json::to_string_pretty(&payload.settings).map_err(|err| err.to_string())?;
+    fs::write(&config_path, config_raw).map_err(|err| err.to_string())?;
+    let script_path = resolve_script_path(app)?;
+    let data_dir = ensure_backend_data_dir(app)?;
+    let password = get_password().unwrap_or(None);
+
+    let mut command = Command::new(&payload.settings.python_path);
+    command
+        .arg("-u")
+        .arg(&script_path)
+        .env("TFK_SETTINGS_JSON", &config_path)
+        .env("TFK_MODE", "update_dynamic_conflict")
+        .env("TFK_DATA_DIR", &data_dir)
+        .env("TFK_DYNAMIC_OLD_MAC", &payload.old_mac)
+        .env("TFK_DYNAMIC_IFACE", &payload.iface)
+        .env("TFK_DYNAMIC_IP", &payload.ip)
+        .env("TFK_DYNAMIC_MAC", &payload.mac)
+        .env("TFK_DYNAMIC_HOSTNAME", &payload.hostname)
+        .env("PYTHONUNBUFFERED", "1");
+    if payload.settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
+    if !payload.settings.username.trim().is_empty() {
+        command.env("TFK_USERNAME", &payload.settings.username);
+    }
+    if !payload.settings.api_username.trim().is_empty() {
+        command.env("TFK_API_USERNAME", &payload.settings.api_username);
+    }
+    if !payload.settings.api_key.trim().is_empty() {
+        command.env("TFK_API_KEY", &payload.settings.api_key);
+    }
+    if !payload.settings.api_secret.trim().is_empty() {
+        command.env("TFK_API_SECRET", &payload.settings.api_secret);
+    }
+    if !payload.settings.cookie_header.trim().is_empty() {
+        command.env("TFK_COOKIE_HEADER", &payload.settings.cookie_header);
+    }
+    if let Some(password) = password {
+        command.env("TFK_PASSWORD", password);
+    }
+
+    let output = command.output().map_err(|err| err.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parsed: Option<UpdateStaticFromDynamicResult> = None;
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<UpdateStaticFromDynamicResult>(trimmed) {
+            parsed = Some(value);
+            break;
+        }
+    }
+
+    let result = parsed.ok_or_else(|| "Could not parse update-static JSON output".to_string())?;
+    if !output.status.success() && result.ok {
+        return Err("Static update exited with error status".to_string());
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn update_static_from_dynamic(
+    app: tauri::AppHandle,
+    payload: UpdateStaticFromDynamicPayload,
+) -> Result<UpdateStaticFromDynamicResult, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || update_static_from_dynamic_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
 #[tauri::command]
 fn cancel_run(app: tauri::AppHandle, state: tauri::State<ProcessState>) -> Result<(), String> {
     let mut guard = state.child.lock().map_err(|_| "Process lock poisoned".to_string())?;
@@ -678,7 +974,10 @@ pub fn run() {
             read_text_file,
             find_python,
             install_backend_deps,
-            discover_api_credentials
+            discover_api_credentials,
+            load_dynamic_leases,
+            move_dynamic_to_static,
+            update_static_from_dynamic
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

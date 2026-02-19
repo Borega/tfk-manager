@@ -53,6 +53,11 @@ type ConflictDeletePrompt = {
   conflict: SecondaryConflict;
 };
 
+type BaseUrlCleanupPrompt = {
+  enteredBaseUrl: string;
+  suggestedBaseUrl: string;
+};
+
 type RunPayload = {
   incomingCsv: string;
   existingCsv: string;
@@ -70,9 +75,9 @@ type RunRecord = {
 type UpdateInfo = Awaited<ReturnType<typeof check>>;
 
 const DEFAULT_SETTINGS: SettingsState = {
-  baseUrl: "https://your-opnsense-host",
-  loginUrl: "https://your-opnsense-host",
-  dashboardUrl: "https://your-opnsense-host/ui/core/dashboard",
+  baseUrl: "https://your-opnsense-host:81",
+  loginUrl: "https://your-opnsense-host:81",
+  dashboardUrl: "https://your-opnsense-host:81/ui/core/dashboard",
   username: "",
   apiUsername: "",
   apiKey: "",
@@ -83,11 +88,48 @@ const DEFAULT_SETTINGS: SettingsState = {
   debug: false,
 };
 
+function normalizeBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.port !== "81") {
+      parsed.port = "81";
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return trimmed;
+  }
+}
+
+function deriveUrlsFromBase(baseUrl: string): Pick<SettingsState, "baseUrl" | "loginUrl" | "dashboardUrl"> {
+  const enteredBase = baseUrl;
+  const dashboardBase = enteredBase.trim().replace(/\/+$/, "");
+  if (!dashboardBase) {
+    return {
+      baseUrl: "",
+      loginUrl: "",
+      dashboardUrl: "",
+    };
+  }
+  return {
+    baseUrl: enteredBase,
+    loginUrl: enteredBase,
+    dashboardUrl: `${dashboardBase}/ui/core/dashboard`,
+  };
+}
+
+function suggestCleanedUrls(baseUrl: string): Pick<SettingsState, "baseUrl" | "loginUrl" | "dashboardUrl"> {
+  return deriveUrlsFromBase(normalizeBaseUrl(baseUrl));
+}
+
 function normalizeSettings(loaded?: Partial<SettingsState> | null): SettingsState {
   if (!loaded) return DEFAULT_SETTINGS;
+  const baseSource = loaded.baseUrl ?? loaded.loginUrl ?? DEFAULT_SETTINGS.baseUrl;
   return {
     ...DEFAULT_SETTINGS,
     ...loaded,
+    ...deriveUrlsFromBase(baseSource),
   };
 }
 
@@ -261,6 +303,78 @@ function parseCsv(text: string): ParseResult {
   return { rows, errors, ignored };
 }
 
+function suggestAvailableIp(preferredIp: string, rows: ClientRow[]): string | undefined {
+  if (!IP_RE.test(preferredIp)) return undefined;
+  const parts = preferredIp.split(".").map((value) => Number(value));
+  if (parts.length !== 4 || parts.some((value) => Number.isNaN(value))) return undefined;
+  const used = new Set(rows.map((row) => row.ip));
+  if (!used.has(preferredIp)) return preferredIp;
+  const [first, second, third] = parts;
+  for (let host = 2; host < 255; host += 1) {
+    const candidate = `${first}.${second}.${third}.${host}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function suggestAvailableName(preferredName: string, rows: ClientRow[]): string | undefined {
+  const base = preferredName.trim() || "dynamic-lease";
+  const used = new Set(rows.map((row) => row.name.trim().toLowerCase()));
+  if (!used.has(base.toLowerCase())) return base;
+  for (let suffix = 2; suffix < 1000; suffix += 1) {
+    const candidate = `${base}-${suffix}`;
+    if (!used.has(candidate.toLowerCase())) return candidate;
+  }
+  return undefined;
+}
+
+function evaluateMoveConflicts(existingRows: ClientRow[], draft: MoveDynamicDraft): MoveConflictInfo {
+  const ip = draft.ip.trim();
+  const mac = draft.mac.trim().toLowerCase();
+  const hostname = draft.hostname.trim().toLowerCase();
+  const alreadyExists = existingRows.find(
+    (row) => row.ip === ip && row.mac.trim().toLowerCase() === mac && row.name.trim().toLowerCase() === hostname,
+  );
+  const ipConflict = existingRows.find((row) => row.ip === ip && row.mac.trim().toLowerCase() !== mac);
+  const macConflict = existingRows.find((row) => row.mac.trim().toLowerCase() === mac && row.ip !== ip);
+  const nameConflict = existingRows.find(
+    (row) => row.name.trim().toLowerCase() === hostname && row.mac.trim().toLowerCase() !== mac,
+  );
+  return {
+    alreadyExists,
+    ipConflict,
+    macConflict,
+    nameConflict,
+    suggestedIp: ipConflict ? suggestAvailableIp(ip, existingRows) : undefined,
+    suggestedName: nameConflict ? suggestAvailableName(draft.hostname, existingRows) : undefined,
+  };
+}
+
+function getDynamicRowBadges(lease: DynamicLease, existingRows: ClientRow[]): string[] {
+  const hostname = (lease.hostname || "").trim().toLowerCase();
+  const mac = lease.mac.trim().toLowerCase();
+  const ip = lease.ip.trim();
+  const same = existingRows.find(
+    (row) =>
+      row.ip === ip &&
+      row.mac.trim().toLowerCase() === mac &&
+      row.name.trim().toLowerCase() === hostname,
+  );
+  if (same) return ["Exists"];
+
+  const badges: string[] = [];
+  const ipTaken = existingRows.some((row) => row.ip === ip && row.mac.trim().toLowerCase() !== mac);
+  const macTaken = existingRows.some((row) => row.mac.trim().toLowerCase() === mac && row.ip !== ip);
+  const nameTaken = hostname
+    ? existingRows.some((row) => row.name.trim().toLowerCase() === hostname && row.mac.trim().toLowerCase() !== mac)
+    : false;
+
+  if (ipTaken) badges.push("IP taken");
+  if (nameTaken) badges.push("Name taken");
+  if (macTaken) badges.push("MAC taken");
+  return badges;
+}
+
 type HelpResult = {
   ok: boolean;
   lines: string[];
@@ -273,9 +387,75 @@ type ApiBootstrapResult = {
   settings: SettingsState;
 };
 
+type DynamicLease = {
+  iface: string;
+  ip: string;
+  mac: string;
+  hostname: string;
+  start: string;
+  end: string;
+  status: string;
+  online: boolean;
+  movableToStatic: boolean;
+};
+
+type DynamicLeasesResult = {
+  ok: boolean;
+  rows: DynamicLease[];
+  movableCount: number;
+  infoCount: number;
+  leaseSource: string;
+  leaseSourceDetail: string;
+};
+
+type MoveDynamicLeasePayload = {
+  settings: SettingsState;
+  iface: string;
+  ip: string;
+  mac: string;
+  hostname: string;
+};
+
+type MoveDynamicLeaseResult = {
+  ok: boolean;
+  status: string;
+  message: string;
+};
+
+type UpdateStaticFromDynamicPayload = {
+  settings: SettingsState;
+  oldMac: string;
+  iface: string;
+  ip: string;
+  mac: string;
+  hostname: string;
+};
+
+type UpdateStaticFromDynamicResult = {
+  ok: boolean;
+  status: string;
+  message: string;
+};
+
+type MoveDynamicDraft = {
+  iface: string;
+  ip: string;
+  mac: string;
+  hostname: string;
+};
+
+type MoveConflictInfo = {
+  alreadyExists?: ClientRow;
+  ipConflict?: ClientRow;
+  macConflict?: ClientRow;
+  nameConflict?: ClientRow;
+  suggestedIp?: string;
+  suggestedName?: string;
+};
+
 function App() {
   const UPDATE_MODE: RunPayload["updateMode"] = "update";
-  const [activeTab, setActiveTab] = useState<"console" | "settings" | "history" | "help">("console");
+  const [activeTab, setActiveTab] = useState<"leases" | "settings" | "history" | "help">("leases");
   const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS);
   const [history, setHistory] = useState<RunRecord[]>([]);
   const [incomingCsv, setIncomingCsv] = useState("");
@@ -294,6 +474,7 @@ function App() {
   const [selectedDeleteKeys, setSelectedDeleteKeys] = useState<Set<string>>(new Set());
     const [forcedDeleteRows, setForcedDeleteRows] = useState<Record<string, ClientRow>>({});
     const [deletePrompt, setDeletePrompt] = useState<ConflictDeletePrompt | null>(null);
+    const [baseUrlCleanupPrompt, setBaseUrlCleanupPrompt] = useState<BaseUrlCleanupPrompt | null>(null);
   const [autoExporting, setAutoExporting] = useState(false);
   const [lastAutoExportKey, setLastAutoExportKey] = useState<string | null>(null);
   const [autoExportPrompt, setAutoExportPrompt] = useState(false);
@@ -305,8 +486,26 @@ function App() {
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [addCollapsed, setAddCollapsed] = useState(false);
+  const [editCollapsed, setEditCollapsed] = useState(false);
+  const [deleteCollapsed, setDeleteCollapsed] = useState(false);
   const [exactCollapsed, setExactCollapsed] = useState(true);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [leaseView, setLeaseView] = useState<"static" | "dynamic" | "review" | "runlog">("static");
+  const [dynamicLeases, setDynamicLeases] = useState<DynamicLease[]>([]);
+  const [dynamicBusy, setDynamicBusy] = useState(false);
+  const [dynamicError, setDynamicError] = useState<string | null>(null);
+  const [staticRefreshBusy, setStaticRefreshBusy] = useState(false);
+  const [dynamicMeta, setDynamicMeta] = useState<{
+    movableCount: number;
+    infoCount: number;
+    leaseSource: string;
+    leaseSourceDetail: string;
+  } | null>(null);
+  const [moveDynamicPrompt, setMoveDynamicPrompt] = useState<MoveDynamicDraft | null>(null);
+  const [moveDynamicBusy, setMoveDynamicBusy] = useState(false);
+  const [updateStaticIpSelected, setUpdateStaticIpSelected] = useState(true);
+  const [updateStaticMacSelected, setUpdateStaticMacSelected] = useState(true);
 
   const incoming = useMemo(() => parseCsv(incomingCsv), [incomingCsv]);
   const existing = useMemo(() => parseCsv(existingCsv), [existingCsv]);
@@ -368,11 +567,7 @@ function App() {
   const credentialsReady = settings.username.trim().length > 0 && hasPassword;
   const hasRealUrls =
     settings.baseUrl.trim() !== DEFAULT_SETTINGS.baseUrl &&
-    settings.loginUrl.trim() !== DEFAULT_SETTINGS.loginUrl &&
-    settings.dashboardUrl.trim() !== DEFAULT_SETTINGS.dashboardUrl &&
-    settings.baseUrl.trim().length > 0 &&
-    settings.loginUrl.trim().length > 0 &&
-    settings.dashboardUrl.trim().length > 0;
+    settings.baseUrl.trim().length > 0;
   const canAutoExport = settingsLoaded && credentialsReady && hasRealUrls;
   const autoExportKey = canAutoExport
     ? `${settings.baseUrl}|${settings.loginUrl}|${settings.dashboardUrl}|${settings.username}`
@@ -429,6 +624,25 @@ function App() {
     existing.rows.forEach((row) => map.set(row.ip, row));
     return map;
   }, [existing.rows]);
+
+  const moveDynamicIp = moveDynamicPrompt?.ip.trim() ?? "";
+  const moveDynamicMac = moveDynamicPrompt?.mac.trim() ?? "";
+  const moveDynamicName = moveDynamicPrompt?.hostname.trim() ?? "";
+  const moveDynamicIpValid = moveDynamicIp.length > 0 && IP_RE.test(moveDynamicIp);
+  const moveDynamicMacValid = moveDynamicMac.length > 0 && MAC_RE.test(moveDynamicMac);
+  const moveDynamicNameValid = moveDynamicName.length > 0;
+  const moveConflicts = moveDynamicPrompt ? evaluateMoveConflicts(existing.rows, moveDynamicPrompt) : undefined;
+  const moveConflictTarget =
+    moveConflicts?.ipConflict ?? moveConflicts?.nameConflict ?? moveConflicts?.macConflict ?? moveConflicts?.alreadyExists;
+  const canSubmitMoveDynamic =
+    !!moveDynamicPrompt &&
+    moveDynamicIpValid &&
+    moveDynamicMacValid &&
+    moveDynamicNameValid &&
+    !moveConflicts?.ipConflict &&
+    !moveConflicts?.macConflict &&
+    !moveConflicts?.nameConflict &&
+    !moveConflicts?.alreadyExists;
 
   function findSecondaryConflict(incoming: ClientRow, existingRow: ClientRow): SecondaryConflict | null {
     if (incoming.mac !== existingRow.mac) {
@@ -503,6 +717,14 @@ function App() {
       setAutoExportPrompt(true);
     }
   }, [autoExportKey, autoExporting, canAutoExport, lastAutoExportKey, settings]);
+
+  useEffect(() => {
+    if (leaseView !== "dynamic") return;
+    if (dynamicBusy) return;
+    if (dynamicLeases.length > 0) return;
+    if (!credentialsReady) return;
+    void handleLoadDynamicLeases();
+  }, [leaseView, dynamicBusy, dynamicLeases.length, credentialsReady]);
 
   async function handleAutoExportConfirm() {
     if (!autoExportKey) return;
@@ -717,6 +939,89 @@ function App() {
     }
   }
 
+  async function handleLoadDynamicLeases(options: { silent?: boolean } = {}) {
+    const { silent = false } = options;
+    if (!credentialsReady) {
+      if (!silent) setDynamicError("Username and saved password are required.");
+      return;
+    }
+    setDynamicBusy(true);
+    if (!silent) setDynamicError(null);
+    try {
+      const settingsForFetch = await bootstrapApiDataIfNeeded(settings);
+      const result = await invoke<DynamicLeasesResult>("load_dynamic_leases", {
+        payload: { settings: settingsForFetch },
+      });
+      setDynamicLeases(result.rows);
+      setDynamicMeta({
+        movableCount: result.movableCount,
+        infoCount: result.infoCount,
+        leaseSource: result.leaseSource,
+        leaseSourceDetail: result.leaseSourceDetail,
+      });
+      if (!silent) {
+        const logLine = `Dynamic leases loaded: total=${result.rows.length}, movable=${result.movableCount}, info=${result.infoCount}`;
+        setLogs((prev) => [...prev, logLine]);
+        const record: RunRecord = {
+          timestamp: new Date().toISOString(),
+          lines: [
+            "Dynamic lease fetch",
+            logLine,
+            `Lease source: ${result.leaseSource}`,
+            `Lease source detail: ${result.leaseSourceDetail}`,
+          ],
+        };
+        setHistory((prev) => [record, ...prev]);
+      }
+    } catch (error) {
+      if (!silent) setDynamicError(String(error));
+    } finally {
+      setDynamicBusy(false);
+    }
+  }
+
+  async function refreshStaticLeases(options: { silent?: boolean } = {}) {
+    const { silent = false } = options;
+    setStaticRefreshBusy(true);
+    if (!credentialsReady) {
+      if (!silent) {
+        setRunError("Username and saved password are required.");
+        setLogs((prev) => [...prev, "Static refresh blocked: missing username/password."]);
+      }
+      setStaticRefreshBusy(false);
+      return;
+    }
+    try {
+      if (!silent) {
+        setRunError(null);
+        setLogs((prev) => [...prev, "Refreshing static leases..."]);
+      }
+      const settingsForExport = await bootstrapApiDataIfNeeded(settings);
+      const result = await invoke<RunRecord>("export_static", { payload: { settings: settingsForExport } });
+      if (result.exportCsv) {
+        setExistingCsv(result.exportCsv);
+      }
+      if (!silent) {
+        setHistory((prev) => [result, ...prev]);
+        setLogs((prev) => [...prev, "Static leases refreshed."]);
+      }
+    } catch (error) {
+      if (!silent) {
+        setRunError(String(error));
+        setLogs((prev) => [...prev, `Static refresh failed: ${error}`]);
+      }
+    } finally {
+      setStaticRefreshBusy(false);
+    }
+  }
+
+  async function refreshLeasesSilently() {
+    await Promise.all([
+      handleLoadDynamicLeases({ silent: true }),
+      refreshStaticLeases({ silent: true }),
+    ]);
+  }
+
   async function checkForUpdates(options: { silent?: boolean } = {}) {
     const { silent = false } = options;
     if (updateBusy || updateInstalling) return;
@@ -876,12 +1181,377 @@ function App() {
     setDeletePrompt(null);
   }
 
+  function applyBaseUrlCleanup() {
+    if (!baseUrlCleanupPrompt) return;
+    const next = suggestCleanedUrls(baseUrlCleanupPrompt.enteredBaseUrl);
+    setSettings((prev) => ({ ...prev, ...next }));
+    setBaseUrlCleanupPrompt(null);
+  }
+
+  function keepEnteredBaseUrl() {
+    if (!baseUrlCleanupPrompt) return;
+    const next = deriveUrlsFromBase(baseUrlCleanupPrompt.enteredBaseUrl);
+    setSettings((prev) => ({ ...prev, ...next }));
+    setBaseUrlCleanupPrompt(null);
+  }
+
+  function handleBaseUrlBlur() {
+    const entered = settings.baseUrl;
+    const enteredDerived = deriveUrlsFromBase(entered);
+    const suggestedDerived = suggestCleanedUrls(entered);
+    if (!enteredDerived.baseUrl) {
+      setSettings((prev) => ({ ...prev, ...enteredDerived }));
+      return;
+    }
+    if (suggestedDerived.baseUrl && suggestedDerived.baseUrl !== enteredDerived.baseUrl) {
+      setBaseUrlCleanupPrompt({
+        enteredBaseUrl: entered,
+        suggestedBaseUrl: suggestedDerived.baseUrl,
+      });
+      return;
+    }
+    setSettings((prev) => ({ ...prev, ...enteredDerived }));
+  }
+
+  function openMoveDynamicPrompt(lease: DynamicLease) {
+    setMoveDynamicPrompt({
+      iface: lease.iface,
+      ip: lease.ip,
+      mac: lease.mac,
+      hostname: lease.hostname,
+    });
+    setUpdateStaticIpSelected(true);
+    setUpdateStaticMacSelected(true);
+  }
+
+  async function cancelMoveDynamicPrompt() {
+    if (moveDynamicBusy) return;
+    setMoveDynamicPrompt(null);
+    setUpdateStaticIpSelected(true);
+    setUpdateStaticMacSelected(true);
+    await refreshLeasesSilently();
+  }
+
+  async function confirmMoveDynamicToStatic() {
+    if (!moveDynamicPrompt) return;
+    if (!canSubmitMoveDynamic) return;
+    setMoveDynamicBusy(true);
+    setDynamicError(null);
+    try {
+      setLogs((prev) => [...prev, "Preparing dynamic → static move..."]);
+      const settingsForMove = await bootstrapApiDataIfNeeded(settings);
+      setLogs((prev) => [...prev, "Refreshing static export for conflict precheck..."]);
+      const precheckExport = await invoke<RunRecord>("export_static", { payload: { settings: settingsForMove } });
+      if (precheckExport.exportCsv) {
+        setExistingCsv(precheckExport.exportCsv);
+      }
+      const refreshedRows = parseCsv(precheckExport.exportCsv ?? "").rows;
+      const precheck = evaluateMoveConflicts(refreshedRows, moveDynamicPrompt);
+      if (precheck.alreadyExists || precheck.ipConflict || precheck.macConflict || precheck.nameConflict) {
+        const messages: string[] = ["Move blocked by static-side conflict after refresh."];
+        if (precheck.ipConflict) {
+          messages.push(
+            `IP already used by ${precheck.ipConflict.name} (${precheck.ipConflict.mac}).`
+              + (precheck.suggestedIp ? ` Suggested free IP: ${precheck.suggestedIp}` : ""),
+          );
+        }
+        if (precheck.nameConflict) {
+          messages.push(
+            `Hostname already used by ${precheck.nameConflict.mac} (${precheck.nameConflict.ip}).`
+              + (precheck.suggestedName ? ` Suggested name: ${precheck.suggestedName}` : ""),
+          );
+        }
+        if (precheck.macConflict) {
+          messages.push(`MAC already exists on static IP ${precheck.macConflict.ip}.`);
+        }
+        if (precheck.alreadyExists) {
+          messages.push("Lease already exists on static side.");
+        }
+        setDynamicError(messages.join(" "));
+        setLogs((prev) => [...prev, ...messages]);
+        return;
+      }
+
+      setLogs((prev) => [...prev, "Submitting move request to router..."]);
+      const payload: MoveDynamicLeasePayload = {
+        settings: settingsForMove,
+        iface: moveDynamicPrompt.iface,
+        ip: moveDynamicPrompt.ip,
+        mac: moveDynamicPrompt.mac,
+        hostname: moveDynamicPrompt.hostname,
+      };
+      const result = await invoke<MoveDynamicLeaseResult>("move_dynamic_to_static", { payload });
+      if (!result.ok) {
+        setDynamicError(result.message || result.status || "Move to static failed.");
+        return;
+      }
+      const moveLine = `Moved dynamic lease to static: ${payload.hostname} ${payload.mac} ${payload.ip}`;
+      setLogs((prev) => [...prev, moveLine]);
+      const record: RunRecord = {
+        timestamp: new Date().toISOString(),
+        lines: ["Dynamic to static move", moveLine, `Status: ${result.status}`],
+      };
+      setHistory((prev) => [record, ...prev]);
+      setMoveDynamicPrompt(null);
+      setLogs((prev) => [...prev, "Refreshing dynamic leases after successful move..."]);
+      await handleLoadDynamicLeases();
+      setLogs((prev) => [...prev, "Refreshing static export after successful move..."]);
+      await refreshStaticLeases();
+      await refreshLeasesSilently();
+    } catch (error) {
+      setDynamicError(String(error));
+    } finally {
+      setMoveDynamicBusy(false);
+    }
+  }
+
+  async function confirmUpdateStaticFromDynamic() {
+    if (!moveDynamicPrompt || !moveConflictTarget) return;
+    if (!moveDynamicIpValid || !moveDynamicMacValid || !moveDynamicNameValid) return;
+    if (!updateStaticIpSelected && !updateStaticMacSelected) {
+      setDynamicError("Select at least one field (IP or MAC) to update.");
+      return;
+    }
+    setMoveDynamicBusy(true);
+    setDynamicError(null);
+    try {
+      setLogs((prev) => [...prev, "Updating existing static lease with dynamic values..."]);
+      const settingsForUpdate = await bootstrapApiDataIfNeeded(settings);
+      const nextIp = updateStaticIpSelected ? moveDynamicPrompt.ip : moveConflictTarget.ip;
+      const nextMac = updateStaticMacSelected ? moveDynamicPrompt.mac : moveConflictTarget.mac;
+      const payload: UpdateStaticFromDynamicPayload = {
+        settings: settingsForUpdate,
+        oldMac: moveConflictTarget.mac,
+        iface: moveDynamicPrompt.iface,
+        ip: nextIp,
+        mac: nextMac,
+        hostname: moveConflictTarget.name,
+      };
+      const result = await invoke<UpdateStaticFromDynamicResult>("update_static_from_dynamic", { payload });
+      if (!result.ok) {
+        setDynamicError(result.message || result.status || "Static update failed.");
+        return;
+      }
+      const updatedFields = [
+        updateStaticIpSelected ? "IP" : null,
+        updateStaticMacSelected ? "MAC" : null,
+      ].filter(Boolean).join("+");
+      const updateLine =
+        `Updated static lease ${moveConflictTarget.name} (${moveConflictTarget.mac}) `
+        + `[${updatedFields}] -> ${payload.mac} ${payload.ip}`;
+      setLogs((prev) => [...prev, updateLine]);
+      setHistory((prev) => [
+        {
+          timestamp: new Date().toISOString(),
+          lines: ["Static lease update from dynamic", updateLine, `Status: ${result.status}`],
+        },
+        ...prev,
+      ]);
+      setMoveDynamicPrompt(null);
+      setUpdateStaticIpSelected(true);
+      setUpdateStaticMacSelected(true);
+      setLogs((prev) => [...prev, "Refreshing dynamic/static data after static update..."]);
+      await handleLoadDynamicLeases();
+      const exportResult = await invoke<RunRecord>("export_static", { payload: { settings: settingsForUpdate } });
+      setHistory((prev) => [exportResult, ...prev]);
+      if (exportResult.exportCsv) {
+        setExistingCsv(exportResult.exportCsv);
+      }
+      await refreshLeasesSilently();
+    } catch (error) {
+      setDynamicError(String(error));
+    } finally {
+      setMoveDynamicBusy(false);
+    }
+  }
+
   return (
     <div
       className={`app ${
-        autoExporting || autoExportPrompt || isRunning || showUpdateOverlay ? "app-busy" : ""
+        autoExporting ||
+        autoExportPrompt ||
+        isRunning ||
+        showUpdateOverlay ||
+        baseUrlCleanupPrompt ||
+        moveDynamicPrompt
+          ? "app-busy"
+          : ""
       }`}
     >
+      {moveDynamicPrompt && (
+        <div className="overlay" aria-live="polite" aria-busy="true">
+          <div className="overlay-card move-overlay-card">
+            <div className="overlay-title">Move dynamic lease to static?</div>
+            <div className="overlay-subtitle">Only interface Gruen is supported for move.</div>
+            <div className="move-lease-grid">
+              <div className="move-lease-box">
+                <span className="move-lease-label">Interface</span>
+                <strong>{moveDynamicPrompt.iface}</strong>
+              </div>
+              <div className="move-lease-box">
+                <span className="move-lease-label">Dynamic MAC</span>
+                <strong>{moveDynamicPrompt.mac}</strong>
+              </div>
+            </div>
+            <div className="field">
+              <label htmlFor="move-dynamic-host">Hostname</label>
+              <input
+                id="move-dynamic-host"
+                type="text"
+                value={moveDynamicPrompt.hostname}
+                onChange={(e) =>
+                  setMoveDynamicPrompt((prev) => (prev ? { ...prev, hostname: e.currentTarget.value } : prev))
+                }
+                disabled={moveDynamicBusy}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="move-dynamic-ip">IP address</label>
+              <input
+                id="move-dynamic-ip"
+                type="text"
+                value={moveDynamicPrompt.ip}
+                onChange={(e) =>
+                  setMoveDynamicPrompt((prev) => (prev ? { ...prev, ip: e.currentTarget.value } : prev))
+                }
+                disabled={moveDynamicBusy}
+              />
+            </div>
+
+            {moveConflictTarget && (
+              <div className="move-conflict-wrap">
+                <div className="overlay-subtitle">Hostname/IP already used by static lease:</div>
+                <div className="move-lease-grid">
+                  <div className="move-lease-box">
+                    <span className="move-lease-label">Name</span>
+                    <strong>{moveConflictTarget.name}</strong>
+                  </div>
+                  <div className="move-lease-box">
+                    <span className="move-lease-label">IP</span>
+                    <strong>{moveConflictTarget.ip}</strong>
+                  </div>
+                  <div className="move-lease-box">
+                    <span className="move-lease-label">MAC</span>
+                    <strong>{moveConflictTarget.mac}</strong>
+                  </div>
+                </div>
+                <div className="move-update-options">
+                  <label className="toggle-pill">
+                    <input
+                      type="checkbox"
+                      checked={updateStaticIpSelected}
+                      onChange={(e) => setUpdateStaticIpSelected(e.currentTarget.checked)}
+                      disabled={moveDynamicBusy}
+                    />
+                    Update IP
+                  </label>
+                  <label className="toggle-pill">
+                    <input
+                      type="checkbox"
+                      checked={updateStaticMacSelected}
+                      onChange={(e) => setUpdateStaticMacSelected(e.currentTarget.checked)}
+                      disabled={moveDynamicBusy}
+                    />
+                    Update MAC
+                  </label>
+                </div>
+                <div className="overlay-actions">
+                  <button
+                    className="secondary"
+                    type="button"
+                    onClick={confirmUpdateStaticFromDynamic}
+                    disabled={
+                      moveDynamicBusy ||
+                      !moveDynamicIpValid ||
+                      !moveDynamicMacValid ||
+                      !moveDynamicNameValid ||
+                      (!updateStaticIpSelected && !updateStaticMacSelected)
+                    }
+                  >
+                    Update static entry with dynamic IP/MAC
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {!moveDynamicIpValid && <div className="overlay-subtitle">Enter a valid IPv4 address.</div>}
+            {!moveDynamicMacValid && <div className="overlay-subtitle">Invalid MAC address format.</div>}
+            {!moveDynamicNameValid && <div className="overlay-subtitle">Hostname is required.</div>}
+            {moveConflicts?.alreadyExists && (
+              <div className="overlay-subtitle">This lease already exists on the static side.</div>
+            )}
+            {moveConflicts?.suggestedIp && (
+              <div className="overlay-actions">
+                <button
+                  className="secondary"
+                  type="button"
+                  disabled={moveDynamicBusy}
+                  onClick={() =>
+                    setMoveDynamicPrompt((prev) =>
+                      prev ? { ...prev, ip: moveConflicts.suggestedIp ?? prev.ip } : prev,
+                    )
+                  }
+                >
+                  Use suggested IP {moveConflicts.suggestedIp}
+                </button>
+              </div>
+            )}
+            {moveConflicts?.suggestedName && (
+              <div className="overlay-actions">
+                <button
+                  className="secondary"
+                  type="button"
+                  disabled={moveDynamicBusy}
+                  onClick={() =>
+                    setMoveDynamicPrompt((prev) =>
+                      prev ? { ...prev, hostname: moveConflicts.suggestedName ?? prev.hostname } : prev,
+                    )
+                  }
+                >
+                  Use suggested name {moveConflicts.suggestedName}
+                </button>
+              </div>
+            )}
+            {moveConflicts?.macConflict && (
+              <div className="overlay-subtitle">
+                MAC conflict with static lease: {moveConflicts.macConflict.name} · {moveConflicts.macConflict.ip}
+              </div>
+            )}
+            <div className="overlay-actions">
+              <button
+                className="primary"
+                type="button"
+                onClick={confirmMoveDynamicToStatic}
+                disabled={moveDynamicBusy || !canSubmitMoveDynamic}
+              >
+                {moveDynamicBusy ? "Moving..." : "Move to static"}
+              </button>
+              <button className="secondary" type="button" onClick={() => void cancelMoveDynamicPrompt()} disabled={moveDynamicBusy}>
+                Cancel
+              </button>
+            </div>
+            {dynamicError && <p className="error-text">{dynamicError}</p>}
+          </div>
+        </div>
+      )}
+      {baseUrlCleanupPrompt && (
+        <div className="overlay" aria-live="polite" aria-busy="true">
+          <div className="overlay-card">
+            <div className="overlay-title">Clean Base URL?</div>
+            <div className="overlay-subtitle">
+              Suggested: {baseUrlCleanupPrompt.suggestedBaseUrl}
+            </div>
+            <div className="overlay-actions">
+              <button className="primary" type="button" onClick={applyBaseUrlCleanup}>
+                Apply cleanup
+              </button>
+              <button className="secondary" type="button" onClick={keepEnteredBaseUrl}>
+                Keep entered value
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {(autoExporting || autoExportPrompt) && (
         <div className="overlay" aria-live="polite" aria-busy="true">
           <div className="overlay-card">
@@ -978,8 +1648,8 @@ function App() {
         <header className="topbar">
         <div>
           <p className="eyebrow">TFK Manager</p>
-          <h1>Static DHCP Control Room</h1>
-          <p className="subhead">Validate, diff, and apply CSV changes with a modern, audit-first workflow.</p>
+          <h1>DHCP Lease Manager</h1>
+          <p className="subhead">Manage static and dynamic leases with validation, conflict checks, and guided change workflows.</p>
         </div>
         <div className="status-card">
           <span>Version</span>
@@ -992,10 +1662,10 @@ function App() {
           <div className="tab-group">
             <button
               type="button"
-              className={activeTab === "console" ? "active" : ""}
-              onClick={() => setActiveTab("console")}
+              className={activeTab === "leases" ? "active" : ""}
+              onClick={() => setActiveTab("leases")}
             >
-              Console
+              Leases
             </button>
             <button
               type="button"
@@ -1020,37 +1690,74 @@ function App() {
             </button>
           </div>
 
-          {activeTab === "console" && (
+          {activeTab === "leases" && (
             <div className="tab-panel">
-              <h2>Run Console</h2>
-              <div className="field">
-                <label>Import incoming CSV</label>
-                <button className="secondary" type="button" onClick={() => void handlePickCsv("incoming")}>
-                  Choose incoming CSV
+              <h2>Lease Inputs</h2>
+              <div className="lease-view-tabs">
+                <button
+                  type="button"
+                  className={leaseView === "static" ? "active" : ""}
+                  onClick={() => setLeaseView("static")}
+                >
+                  Static
+                </button>
+                <button
+                  type="button"
+                  className={leaseView === "dynamic" ? "active" : ""}
+                  onClick={() => setLeaseView("dynamic")}
+                >
+                  Dynamic
+                </button>
+                <button
+                  type="button"
+                  className={leaseView === "review" ? "active" : ""}
+                  onClick={() => setLeaseView("review")}
+                >
+                  Review
+                </button>
+                <button
+                  type="button"
+                  className={leaseView === "runlog" ? "active" : ""}
+                  onClick={() => setLeaseView("runlog")}
+                >
+                  Run Log
                 </button>
               </div>
-              <div className="field">
-                <label>Import existing export CSV</label>
-                <button className="secondary" type="button" onClick={() => void handlePickCsv("existing")}>
-                  Choose existing CSV
-                </button>
-              </div>
-              <div className="field">
-                <label>Paste incoming CSV</label>
-                <textarea
-                  value={incomingCsv}
-                  onChange={(e) => setIncomingCsv(e.currentTarget.value)}
-                  placeholder="Name;Raum;IP;MAC;Besitzer;Inventarnummer;Beschreibung"
-                />
-              </div>
-              <div className="field">
-                <label>Paste existing export CSV</label>
-                <textarea
-                  value={existingCsv}
-                  onChange={(e) => setExistingCsv(e.currentTarget.value)}
-                  placeholder="Name;MAC;IP"
-                />
-              </div>
+
+              {leaseView === "static" ? (
+                <>
+                  <div className="field">
+                    <label>Import incoming CSV</label>
+                    <button className="secondary" type="button" onClick={() => void handlePickCsv("incoming")}>
+                      Choose incoming CSV
+                    </button>
+                  </div>
+                  <div className="field">
+                    <label>Import existing export CSV</label>
+                    <button className="secondary" type="button" onClick={() => void handlePickCsv("existing")}>
+                      Choose existing CSV
+                    </button>
+                  </div>
+                  <div className="field">
+                    <label>Paste incoming CSV</label>
+                    <textarea
+                      value={incomingCsv}
+                      onChange={(e) => setIncomingCsv(e.currentTarget.value)}
+                      placeholder="Name;Raum;IP;MAC;Besitzer;Inventarnummer;Beschreibung"
+                    />
+                  </div>
+                  <div className="field">
+                    <label>Paste existing export CSV</label>
+                    <textarea
+                      value={existingCsv}
+                      onChange={(e) => setExistingCsv(e.currentTarget.value)}
+                      placeholder="Name;MAC;IP"
+                    />
+                  </div>
+                </>
+              ) : (
+                <p className="lease-meta">CSV import/edit is available in Static view.</p>
+              )}
             </div>
           )}
 
@@ -1067,6 +1774,7 @@ function App() {
                     const value = e.currentTarget.value;
                     setSettings((prev) => ({ ...prev, baseUrl: value }));
                   }}
+                  onBlur={handleBaseUrlBlur}
                 />
               </div>
               <div className="field">
@@ -1087,10 +1795,7 @@ function App() {
                   id="login-url"
                   type="text"
                   value={settings.loginUrl}
-                  onChange={(e) => {
-                    const value = e.currentTarget.value;
-                    setSettings((prev) => ({ ...prev, loginUrl: value }));
-                  }}
+                  readOnly
                 />
               </div>
               <div className="field">
@@ -1121,10 +1826,7 @@ function App() {
                   id="dashboard-url"
                   type="text"
                   value={settings.dashboardUrl}
-                  onChange={(e) => {
-                    const value = e.currentTarget.value;
-                    setSettings((prev) => ({ ...prev, dashboardUrl: value }));
-                  }}
+                  readOnly
                 />
               </div>
               <div className="field">
@@ -1271,6 +1973,188 @@ function App() {
         </aside>
 
         <section className="panel main">
+
+          {leaseView === "dynamic" && (
+            <div className="card full">
+              <div className="preview-header">
+                <h3>Dynamic Leases</h3>
+                <button className="mini-action" type="button" onClick={() => void handleLoadDynamicLeases()} disabled={dynamicBusy}>
+                  {dynamicBusy ? "Refreshing..." : "Refresh"}
+                </button>
+              </div>
+              {dynamicError && <p className="error-text">{dynamicError}</p>}
+              {dynamicMeta && (
+                <p className="lease-meta">
+                  Movable (Gruen): {dynamicMeta.movableCount} · Info only (WLANBYOD/other): {dynamicMeta.infoCount}
+                </p>
+              )}
+              <div className="dynamic-table-wrap">
+                <table className="dynamic-table">
+                  <thead>
+                    <tr>
+                      <th>Move</th>
+                      <th>Interface</th>
+                      <th>Hostname</th>
+                      <th>MAC</th>
+                      <th>IP</th>
+                      <th>Status</th>
+                      <th>Online</th>
+                      <th>Start</th>
+                      <th>End</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dynamicLeases.map((lease) => {
+                      const badges = getDynamicRowBadges(lease, existing.rows);
+                      return (
+                      <tr key={`${lease.iface}|${lease.mac}|${lease.ip}`}>
+                        <td>
+                          {lease.movableToStatic ? (
+                            <button
+                              className="mini-action"
+                              type="button"
+                              onClick={() => openMoveDynamicPrompt(lease)}
+                              disabled={moveDynamicBusy}
+                            >
+                              Move
+                            </button>
+                          ) : (
+                            "No"
+                          )}
+                        </td>
+                        <td>{lease.iface}</td>
+                        <td>
+                          <div>{lease.hostname || "-"}</div>
+                          {badges.length > 0 && (
+                            <div className="dynamic-badges">
+                              {badges.map((badge) => (
+                                <span key={`${lease.iface}|${lease.mac}|${lease.ip}|${badge}`} className="dynamic-badge">
+                                  {badge}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                        <td>{lease.mac}</td>
+                        <td>{lease.ip}</td>
+                        <td>{lease.status || "-"}</td>
+                        <td>{lease.online ? "Yes" : "No"}</td>
+                        <td>{lease.start || "-"}</td>
+                        <td>{lease.end || "-"}</td>
+                      </tr>
+                      );
+                    })}
+                    {dynamicLeases.length === 0 && !dynamicBusy && (
+                      <tr>
+                        <td colSpan={9} className="dynamic-empty">
+                          No dynamic leases loaded yet.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {leaseView === "review" && (
+            <div className="card full">
+              <h3>Review</h3>
+              <p className="lease-meta">Final check before export or apply.</p>
+              <div className="diff-grid">
+                <div>
+                  <span>Add</span>
+                  <strong>{diff.adds.length}</strong>
+                </div>
+                <div>
+                  <span>Conflicts</span>
+                  <strong>{diff.conflicts.length}</strong>
+                </div>
+                <div>
+                  <span>Deletes</span>
+                  <strong>{displayDeletes.length}</strong>
+                </div>
+                <div>
+                  <span>Ignored</span>
+                  <strong>{incoming.ignored.length + existing.ignored.length}</strong>
+                </div>
+              </div>
+              <div className="review-readiness">
+                <p>
+                  Credentials: <strong>{credentialsReady ? "Ready" : "Missing"}</strong>
+                </p>
+                <p>
+                  Confirmation: <strong>{confirmChanges ? "Checked" : "Not checked"}</strong>
+                </p>
+                <p>
+                  Validation: <strong>{incoming.errors.length === 0 && existing.errors.length === 0 ? "OK" : "Needs attention"}</strong>
+                </p>
+              </div>
+              <label className="confirm-toggle">
+                <input
+                  type="checkbox"
+                  checked={confirmChanges}
+                  onChange={(e) => setConfirmChanges(e.currentTarget.checked)}
+                />
+                I understand the changes above
+              </label>
+              {hasIgnored && (
+                <label className="confirm-toggle">
+                  <input
+                    type="checkbox"
+                    checked={acknowledgeIgnored}
+                    onChange={(e) => setAcknowledgeIgnored(e.currentTarget.checked)}
+                  />
+                  Acknowledge ignored rows to continue
+                </label>
+              )}
+              {runBlockers.length > 0 && (
+                <div className="run-hints">
+                  {runBlockers.map((item) => (
+                    <p key={`review-${item}`}>{item}</p>
+                  ))}
+                </div>
+              )}
+              <div className="review-actions">
+                <button className="secondary" type="button" onClick={() => setLeaseView("static")}>
+                  Open Static
+                </button>
+                <button className="secondary" type="button" onClick={() => setLeaseView("dynamic")}>
+                  Open Dynamic
+                </button>
+                <button className="secondary" type="button" disabled={!canExport || isRunning} onClick={handleExport}>
+                  Export Current List
+                </button>
+                <button className="primary" type="button" disabled={!canRun || isRunning} onClick={() => void handleRun()}>
+                  {isRunning ? "Running..." : "Run Changes"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {leaseView === "runlog" && (
+            <div className="card full logs">
+              <h3>Run Log</h3>
+              {runError && <p className="error-text">{runError}</p>}
+              <pre>{logs.join("\n") || "No runs yet."}</pre>
+            </div>
+          )}
+
+          {leaseView === "static" && (
+            <>
+          <div className="card full">
+            <div className="preview-header">
+              <h3>Static Leases</h3>
+              <button
+                className="mini-action"
+                type="button"
+                onClick={() => void refreshStaticLeases()}
+                disabled={staticRefreshBusy}
+              >
+                {staticRefreshBusy ? "Refreshing..." : "Refresh static list"}
+              </button>
+            </div>
+          </div>
           <div className="grid">
             <div className="card">
               <h3>Validation</h3>
@@ -1366,137 +2250,176 @@ function App() {
                 <div className="preview-section">
                   <div className="preview-header">
                     <h4>Add</h4>
-                    <button
-                      className="mini-action"
-                      type="button"
-                      onClick={toggleAllAdds}
-                      disabled={diff.adds.length === 0}
-                    >
-                      {allAddsChecked ? "Uncheck all" : "Check all"}
-                    </button>
+                    <div className="preview-actions">
+                      <button
+                        className="mini-action"
+                        type="button"
+                        onClick={() => setAddCollapsed((prev) => !prev)}
+                      >
+                        {addCollapsed ? `Show (${diff.adds.length})` : `Hide (${diff.adds.length})`}
+                      </button>
+                      {!addCollapsed && (
+                        <button
+                          className="mini-action"
+                          type="button"
+                          onClick={toggleAllAdds}
+                          disabled={diff.adds.length === 0}
+                        >
+                          {allAddsChecked ? "Uncheck all" : "Check all"}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <ul>
-                    {diff.adds.map((row) => (
-                      <li key={`add-${row.mac}`}>
-                        <label className="select-row">
-                          <input
-                            type="checkbox"
-                            checked={!excludedAddKeys.has(rowKey(row))}
-                            onChange={() => {
-                              const key = rowKey(row);
-                              setExcludedAddKeys((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(key)) next.delete(key);
-                                else next.add(key);
-                                return next;
-                              });
-                            }}
-                          />
-                          <span>{row.name} · {row.mac} · {row.ip}</span>
-                        </label>
-                      </li>
-                    ))}
-                  </ul>
+                  {!addCollapsed && (
+                    <ul>
+                      {diff.adds.map((row) => (
+                        <li key={`add-${row.mac}`}>
+                          <label className="select-row">
+                            <input
+                              type="checkbox"
+                              checked={!excludedAddKeys.has(rowKey(row))}
+                              onChange={() => {
+                                const key = rowKey(row);
+                                setExcludedAddKeys((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(key)) next.delete(key);
+                                  else next.add(key);
+                                  return next;
+                                });
+                              }}
+                            />
+                            <span>{row.name} · {row.mac} · {row.ip}</span>
+                          </label>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
                 <div className="preview-section conflicts">
                   <div className="preview-header">
                     <h4>Conflicts</h4>
-                    <button
-                      className="mini-action"
-                      type="button"
-                      onClick={toggleAllConflicts}
-                      disabled={diff.conflicts.length === 0}
-                    >
-                      {allConflictsChecked ? "Uncheck all" : "Check all"}
-                    </button>
+                    <div className="preview-actions">
+                      <button
+                        className="mini-action"
+                        type="button"
+                        onClick={() => setEditCollapsed((prev) => !prev)}
+                      >
+                        {editCollapsed ? `Show (${diff.conflicts.length})` : `Hide (${diff.conflicts.length})`}
+                      </button>
+                      {!editCollapsed && (
+                        <button
+                          className="mini-action"
+                          type="button"
+                          onClick={toggleAllConflicts}
+                          disabled={diff.conflicts.length === 0}
+                        >
+                          {allConflictsChecked ? "Uncheck all" : "Check all"}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <ul className="conflict-list">
-                    {diff.conflicts.map(({ incoming, existing }) => (
-                      <li key={`conf-${incoming.mac}-${existing.mac}`}>
-                        <label className="select-row">
-                          <input
-                            type="checkbox"
-                            checked={!excludedConflictKeys.has(rowKey(incoming))}
-                            onChange={() => {
-                              handleConflictToggle(incoming, existing);
-                            }}
-                          />
-                          <span>Apply change</span>
-                        </label>
-                        <div className="conflict-row">
-                          <div className="conflict-side">
-                            <span className="conflict-label">Existing</span>
-                            <div className="conflict-values">
-                              <span className={incoming.name !== existing.name ? "conflict-change" : ""}>
-                                {existing.name}
-                              </span>
-                              <span className={incoming.mac !== existing.mac ? "conflict-change" : ""}>
-                                {existing.mac}
-                              </span>
-                              <span className={incoming.ip !== existing.ip ? "conflict-change" : ""}>
-                                {existing.ip}
-                              </span>
+                  {!editCollapsed && (
+                    <ul className="conflict-list">
+                      {diff.conflicts.map(({ incoming, existing }) => (
+                        <li key={`conf-${incoming.mac}-${existing.mac}`}>
+                          <label className="select-row">
+                            <input
+                              type="checkbox"
+                              checked={!excludedConflictKeys.has(rowKey(incoming))}
+                              onChange={() => {
+                                handleConflictToggle(incoming, existing);
+                              }}
+                            />
+                            <span>Apply change</span>
+                          </label>
+                          <div className="conflict-row">
+                            <div className="conflict-side">
+                              <span className="conflict-label">Existing</span>
+                              <div className="conflict-values">
+                                <span className={incoming.name !== existing.name ? "conflict-change" : ""}>
+                                  {existing.name}
+                                </span>
+                                <span className={incoming.mac !== existing.mac ? "conflict-change" : ""}>
+                                  {existing.mac}
+                                </span>
+                                <span className={incoming.ip !== existing.ip ? "conflict-change" : ""}>
+                                  {existing.ip}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="conflict-arrow">→</div>
+                            <div className="conflict-side">
+                              <span className="conflict-label">Incoming</span>
+                              <div className="conflict-values">
+                                <span className={incoming.name !== existing.name ? "conflict-change" : ""}>
+                                  {incoming.name}
+                                </span>
+                                <span className={incoming.mac !== existing.mac ? "conflict-change" : ""}>
+                                  {incoming.mac}
+                                </span>
+                                <span className={incoming.ip !== existing.ip ? "conflict-change" : ""}>
+                                  {incoming.ip}
+                                </span>
+                              </div>
                             </div>
                           </div>
-                          <div className="conflict-arrow">→</div>
-                          <div className="conflict-side">
-                            <span className="conflict-label">Incoming</span>
-                            <div className="conflict-values">
-                              <span className={incoming.name !== existing.name ? "conflict-change" : ""}>
-                                {incoming.name}
-                              </span>
-                              <span className={incoming.mac !== existing.mac ? "conflict-change" : ""}>
-                                {incoming.mac}
-                              </span>
-                              <span className={incoming.ip !== existing.ip ? "conflict-change" : ""}>
-                                {incoming.ip}
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
                 <div className="preview-section deletions">
                   <div className="preview-header">
                     <h4>Deletes</h4>
-                    <button
-                      className="mini-action"
-                      type="button"
-                      onClick={toggleAllDeletes}
-                      disabled={diff.deletes.length === 0}
-                    >
-                      {allDeletesChecked ? "Uncheck all" : "Check all"}
-                    </button>
+                    <div className="preview-actions">
+                      <button
+                        className="mini-action"
+                        type="button"
+                        onClick={() => setDeleteCollapsed((prev) => !prev)}
+                      >
+                        {deleteCollapsed ? `Show (${displayDeletes.length})` : `Hide (${displayDeletes.length})`}
+                      </button>
+                      {!deleteCollapsed && (
+                        <button
+                          className="mini-action"
+                          type="button"
+                          onClick={toggleAllDeletes}
+                          disabled={diff.deletes.length === 0}
+                        >
+                          {allDeletesChecked ? "Uncheck all" : "Check all"}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <ul>
-                    {displayDeletes.map((row) => {
-                      const forced = forcedDeleteKeys.has(rowKey(row));
-                      return (
-                      <li key={`del-${row.mac}`}>
-                        <label className="select-row">
-                          <input
-                            type="checkbox"
-                            checked={selectedDeleteKeys.has(rowKey(row))}
-                            disabled={forced}
-                            onChange={() => {
-                              const key = rowKey(row);
-                              setSelectedDeleteKeys((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(key)) next.delete(key);
-                                else next.add(key);
-                                return next;
-                              });
-                            }}
-                          />
-                          <span>{row.name} · {row.mac} · {row.ip}</span>
-                          {forced && <span className="pill">Required</span>}
-                        </label>
-                      </li>
-                      );
-                    })}
-                  </ul>
+                  {!deleteCollapsed && (
+                    <ul>
+                      {displayDeletes.map((row) => {
+                        const forced = forcedDeleteKeys.has(rowKey(row));
+                        return (
+                        <li key={`del-${row.mac}`}>
+                          <label className="select-row">
+                            <input
+                              type="checkbox"
+                              checked={selectedDeleteKeys.has(rowKey(row))}
+                              disabled={forced}
+                              onChange={() => {
+                                const key = rowKey(row);
+                                setSelectedDeleteKeys((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(key)) next.delete(key);
+                                  else next.add(key);
+                                  return next;
+                                });
+                              }}
+                            />
+                            <span>{row.name} · {row.mac} · {row.ip}</span>
+                            {forced && <span className="pill">Required</span>}
+                          </label>
+                        </li>
+                        );
+                      })}
+                    </ul>
+                  )}
                 </div>
                 <div className="preview-section">
                   <div className="preview-header">
@@ -1573,11 +2496,8 @@ function App() {
             </button>
           </div>
 
-          <div className="card full logs">
-            <h3>Run Log</h3>
-            {runError && <p className="error-text">{runError}</p>}
-            <pre>{logs.join("\n") || "No runs yet."}</pre>
-          </div>
+          </>
+          )}
         </section>
         </div>
       </div>

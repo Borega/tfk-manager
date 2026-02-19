@@ -1,14 +1,15 @@
-# TFK Manager (Tauri + React)
+# DHCP Lease Manager (Tauri + React)
 
-A desktop UI for validating, diffing, and applying OPNsense static DHCP CSV changes.
+A desktop UI for managing OPNsense static and dynamic DHCP leases with validation, conflict checks, and guided apply flows.
 
 ## Features
-- Settings panel for update/skip behavior
-- CSV import and validation (incoming + existing export)
-- Diff summary (adds, conflicts, exact matches, duplicates)
-- Confirmation gate before running changes
-- Run log preview
-- Settings persistence and run history
+- Base URL-driven configuration (`login` and `dashboard` URLs are derived automatically, port `:81` enforced)
+- Static lease workflow: CSV import/validation, diffing, add/update/delete review
+- Dynamic lease workflow: load dynamic leases, move eligible leases to static, and update conflicting static entries
+- Conflict helpers with suggested free IP/hostname and field-level update selection (IP/MAC)
+- Lease views: `Static`, `Dynamic`, `Review`, and `Run Log`
+- Collapsible review sections (Add, Conflicts, Deletes)
+- Settings persistence, run history, and in-app updater support
 
 ## Setup
 1. Install Rust and Tauri prerequisites (Windows):
@@ -28,8 +29,18 @@ Only `requests` is required for backend dependencies. Playwright and selector co
 The backend authenticates against OPNsense, captures session cookies, and calls
 the `/api/tfk/dhcp/*` endpoints directly.
 
+### Backend modes used by the app
+- `export`: export static leases to `export_static.csv`
+- `dynamic`: fetch dynamic leases
+- `move_dynamic`: move a dynamic lease to static (restricted to `Gruen` source interface)
+- `update_dynamic_conflict`: update an existing static lease from dynamic values
+
 ## Run (Desktop)
 - npm run tauri dev
+
+## Tests
+- Dynamic lease backend slice tests:
+	- `python -m unittest -v backend/src/test_dynamic_leases_slice.py`
 
 ## Releases
 Compiled binaries are available on the GitHub releases page:
@@ -46,3 +57,4 @@ Compiled binaries are available on the GitHub releases page:
 - CSV format expects semicolon separators.
 - Backend script path is resolved automatically from the app; keep the `backend` folder next to the app.
 - Configure `Python path` in Settings if you use a non-default Python install.
+- `loginUrl` and `dashboardUrl` are read-only in the UI and derived from the Base URL.

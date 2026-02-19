@@ -9,6 +9,7 @@ from tkinter import simpledialog
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 from urllib3.exceptions import InsecureRequestWarning
 
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
@@ -36,7 +37,7 @@ LAST_LEASE_SOURCE_DETAIL = ""
 SETTINGS_JSON_PATH: Optional[Path] = None
 DEFAULT_IFACE = os.environ.get("TFK_IFACE", "lan")
 
-BASE_URL = "https://<opnsense-host>"
+BASE_URL = "https://<opnsense-host>:81"
 LOGIN_URL = BASE_URL
 DHCP_STATIC_URL = f"{BASE_URL.rstrip('/')}/ui/core/dashboard"
 USERNAME: Optional[str] = None
@@ -46,6 +47,39 @@ API_KEY: Optional[str] = None
 API_SECRET: Optional[str] = None
 COOKIE_HEADER: Optional[str] = None
 MSD_COOKIE: Optional[str] = None
+
+
+def normalize_base_url(base_url: str) -> str:
+    trimmed = (base_url or "").strip()
+    if not trimmed:
+        return ""
+    try:
+        parsed = urlsplit(trimmed)
+    except ValueError:
+        return trimmed.rstrip("/")
+
+    if not parsed.scheme or not parsed.netloc or not parsed.hostname:
+        return trimmed.rstrip("/")
+
+    host = parsed.hostname
+    host_display = f"[{host}]" if ":" in host else host
+    auth = ""
+    if parsed.username:
+        auth = parsed.username
+        if parsed.password:
+            auth = f"{auth}:{parsed.password}"
+        auth = f"{auth}@"
+
+    netloc = f"{auth}{host_display}:81"
+    normalized = urlunsplit((parsed.scheme, netloc, parsed.path.rstrip("/"), parsed.query, parsed.fragment))
+    return normalized.rstrip("/")
+
+
+def derive_urls_from_base(base_url: str) -> Tuple[str, str, str]:
+    normalized_base = normalize_base_url(base_url)
+    if not normalized_base:
+        return "", "", ""
+    return normalized_base, normalized_base, f"{normalized_base}/ui/core/dashboard"
 
 
 def load_settings_from_json() -> None:
@@ -71,15 +105,7 @@ def load_settings_from_json() -> None:
     if configured_base_url:
         BASE_URL = configured_base_url
 
-    configured_login_url = get_setting(data, "login_url", "loginUrl")
-    LOGIN_URL = configured_login_url or BASE_URL or LOGIN_URL
-
-    configured_dashboard_url = get_setting(data, "dashboard_url", "dashboardUrl")
-    if configured_dashboard_url:
-        DHCP_STATIC_URL = configured_dashboard_url
-    else:
-        dashboard_base = (BASE_URL or LOGIN_URL).rstrip("/")
-        DHCP_STATIC_URL = f"{dashboard_base}/ui/core/dashboard"
+    BASE_URL, LOGIN_URL, DHCP_STATIC_URL = derive_urls_from_base(BASE_URL)
     DRY_RUN = get_setting(data, "dry_run", "dryRun") if ("dry_run" in data or "dryRun" in data) else DRY_RUN
     USERNAME = get_setting(data, "username", "username") or USERNAME
     API_USERNAME = get_setting(data, "api_username", "apiUsername") or API_USERNAME
@@ -153,6 +179,35 @@ class DhcpRow:
     hostname: str
     mac: str
     ip: str
+
+
+@dataclass
+class DynamicLeaseRow:
+    iface: str
+    ip: str
+    mac: str
+    hostname: str
+    start: str
+    end: str
+    status: str
+    online: bool
+
+    @property
+    def movable_to_static(self) -> bool:
+        return self.iface == "Gruen"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "iface": self.iface,
+            "ip": self.ip,
+            "mac": self.mac,
+            "hostname": self.hostname,
+            "start": self.start,
+            "end": self.end,
+            "status": self.status,
+            "online": self.online,
+            "movableToStatic": self.movable_to_static,
+        }
 
 
 def read_csv(path: Path) -> List[DhcpRow]:
@@ -622,6 +677,276 @@ def fetch_static_leases_via_session_api(session: OPNsenseApiSession) -> List[Dhc
     return entries
 
 
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _parse_dynamic_leases_payload(payload: Any) -> List[DynamicLeaseRow]:
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+
+    entries: List[DynamicLeaseRow] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        iface = str(item.get("iface") or "").strip()
+        ip = str(item.get("ip") or "").strip()
+        mac = str(item.get("mac") or "").strip()
+        hostname = str(item.get("hostname") or "").strip()
+        start = str(item.get("start") or "").strip()
+        end = str(item.get("end") or "").strip()
+        status = str(item.get("status") or "").strip()
+        online = _parse_bool(item.get("online"))
+        if not iface or not ip or not mac:
+            continue
+        key = (iface, ip, mac.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(
+            DynamicLeaseRow(
+                iface=iface,
+                ip=ip,
+                mac=mac,
+                hostname=hostname,
+                start=start,
+                end=end,
+                status=status,
+                online=online,
+            )
+        )
+    return entries
+
+
+def fetch_dynamic_leases_via_session_api(session: OPNsenseApiSession) -> List[DynamicLeaseRow]:
+    global LAST_LEASE_SOURCE_DETAIL
+    response = session.api_get("/api/tfk/dhcp/dynamic_leases")
+    if not response.get("ok"):
+        LAST_LEASE_SOURCE_DETAIL = f"dynamic-session-api failed status={response.get('status', 'unknown')}"
+        return []
+
+    payload = response.get("data")
+    entries = _parse_dynamic_leases_payload(payload)
+    LAST_LEASE_SOURCE_DETAIL = f"dynamic-session-api entries={len(entries)}"
+    return entries
+
+
+def move_dynamic_lease_to_static(
+    session: OPNsenseApiSession,
+    iface: str,
+    ip: str,
+    mac: str,
+    hostname: str,
+) -> Dict[str, Any]:
+    def suggest_available_ip(preferred_ip: str, existing: List[DhcpRow]) -> Optional[str]:
+        parts = preferred_ip.split(".")
+        if len(parts) != 4:
+            return None
+        try:
+            octets = [int(part) for part in parts]
+        except ValueError:
+            return None
+        if any(part < 0 or part > 255 for part in octets):
+            return None
+        used = {item.ip for item in existing}
+        if preferred_ip not in used:
+            return preferred_ip
+        base = f"{octets[0]}.{octets[1]}.{octets[2]}"
+        for host in range(2, 255):
+            candidate = f"{base}.{host}"
+            if candidate not in used:
+                return candidate
+        return None
+
+    def suggest_available_hostname(preferred_name: str, existing: List[DhcpRow]) -> str:
+        base = preferred_name.strip() or "dynamic-lease"
+        used = {item.hostname.strip().lower() for item in existing}
+        if base.lower() not in used:
+            return base
+        for suffix in range(2, 1000):
+            candidate = f"{base}-{suffix}"
+            if candidate.lower() not in used:
+                return candidate
+        return base
+
+    cleaned_iface = iface.strip()
+    target_static_iface = (os.environ.get("TFK_IFACE", DEFAULT_IFACE) or DEFAULT_IFACE).strip()
+    cleaned_ip = ip.strip()
+    cleaned_mac = mac.strip()
+    cleaned_hostname = hostname.strip() or "dynamic-lease"
+
+    if cleaned_iface != "Gruen":
+        return {
+            "ok": False,
+            "status": "not_movable",
+            "message": "Only dynamic leases from iface 'Gruen' can be moved to static",
+        }
+    if not cleaned_ip or not cleaned_mac:
+        return {
+            "ok": False,
+            "status": "invalid_input",
+            "message": "IP and MAC are required",
+        }
+    if not IP_RE.match(cleaned_ip):
+        return {
+            "ok": False,
+            "status": "invalid_ip",
+            "message": f"Invalid IP: {cleaned_ip}",
+        }
+    if not MAC_RE.match(cleaned_mac):
+        return {
+            "ok": False,
+            "status": "invalid_mac",
+            "message": f"Invalid MAC: {cleaned_mac}",
+        }
+
+    existing_entries = fetch_static_leases_via_session_api(session)
+    suggested_ip = suggest_available_ip(cleaned_ip, existing_entries)
+    suggested_hostname = suggest_available_hostname(cleaned_hostname, existing_entries)
+    for item in existing_entries:
+        same_ip = item.ip == cleaned_ip
+        same_mac = item.mac.lower() == cleaned_mac.lower()
+        same_name = item.hostname.strip().lower() == cleaned_hostname.lower()
+        if same_ip and same_mac:
+            return {
+                "ok": False,
+                "status": "already_exists",
+                "message": "This lease already exists on static side",
+            }
+        if same_ip and not same_mac:
+            return {
+                "ok": False,
+                "status": "ip_conflict",
+                "message": f"IP {cleaned_ip} is already used by static lease {item.hostname} ({item.mac})"
+                + (f". Suggested free IP: {suggested_ip}" if suggested_ip else ""),
+                "suggestedIp": suggested_ip,
+            }
+        if same_mac and not same_ip:
+            return {
+                "ok": False,
+                "status": "mac_conflict",
+                "message": f"MAC {cleaned_mac} already exists on static IP {item.ip}",
+            }
+        if same_name and not same_mac:
+            return {
+                "ok": False,
+                "status": "name_conflict",
+                "message": f"Hostname {cleaned_hostname} already exists on static lease {item.ip} ({item.mac})"
+                + (f". Suggested hostname: {suggested_hostname}" if suggested_hostname else ""),
+                "suggestedHostname": suggested_hostname,
+            }
+
+    result = session.api_post(
+        "/api/tfk/dhcp/add_static_lease",
+        {
+            "if": target_static_iface,
+            "ip": cleaned_ip,
+            "mac": cleaned_mac,
+            "hostname": cleaned_hostname,
+        },
+    )
+    status = status_of_api_result(result)
+    if status in {"failed", "validation_failed", "error", "unauthenticated", "non_json"}:
+        detail = result.get("message") if isinstance(result, dict) else None
+        if not detail and isinstance(result, dict):
+            detail = result.get("status") or result.get("result")
+        if not detail:
+            detail = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+        return {
+            "ok": False,
+            "status": status,
+            "message": f"Router rejected move to static ({status})"
+            + (f": {detail}" if detail else ""),
+            "response": result,
+        }
+    return {
+        "ok": True,
+        "status": status or "success",
+        "message": "Dynamic lease moved to static",
+        "response": result,
+    }
+
+
+def update_static_from_dynamic_conflict(
+    session: OPNsenseApiSession,
+    old_mac: str,
+    iface: str,
+    ip: str,
+    mac: str,
+    hostname: str,
+) -> Dict[str, Any]:
+    cleaned_old_mac = old_mac.strip()
+    cleaned_iface = iface.strip()
+    target_static_iface = (os.environ.get("TFK_IFACE", DEFAULT_IFACE) or DEFAULT_IFACE).strip()
+    cleaned_ip = ip.strip()
+    cleaned_mac = mac.strip()
+    cleaned_hostname = hostname.strip() or "dynamic-lease"
+
+    if cleaned_iface != "Gruen":
+        return {
+            "ok": False,
+            "status": "not_movable",
+            "message": "Only interface 'Gruen' is supported",
+        }
+    if not cleaned_old_mac or not MAC_RE.match(cleaned_old_mac):
+        return {
+            "ok": False,
+            "status": "invalid_old_mac",
+            "message": "Valid old static MAC is required",
+        }
+    if not IP_RE.match(cleaned_ip):
+        return {
+            "ok": False,
+            "status": "invalid_ip",
+            "message": f"Invalid IP: {cleaned_ip}",
+        }
+    if not MAC_RE.match(cleaned_mac):
+        return {
+            "ok": False,
+            "status": "invalid_mac",
+            "message": f"Invalid MAC: {cleaned_mac}",
+        }
+
+    result = session.api_post(
+        "/api/tfk/dhcp/update_static_lease",
+        {
+            "if": target_static_iface,
+            "oldmac": cleaned_old_mac,
+            "ip": cleaned_ip,
+            "mac": cleaned_mac,
+            "hostname": cleaned_hostname,
+        },
+    )
+    status = status_of_api_result(result)
+    if status in {"failed", "validation_failed", "find_lease_failed", "error", "unauthenticated", "non_json"}:
+        detail = result.get("message") if isinstance(result, dict) else None
+        if not detail and isinstance(result, dict):
+            detail = result.get("status") or result.get("result")
+        if not detail:
+            detail = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+        return {
+            "ok": False,
+            "status": status,
+            "message": f"Router rejected static update ({status})"
+            + (f": {detail}" if detail else ""),
+            "response": result,
+        }
+    return {
+        "ok": True,
+        "status": status or "success",
+        "message": "Static lease updated with dynamic values",
+        "response": result,
+    }
+
+
 def find_conflict(existing: List[DhcpRow], row: DhcpRow) -> Optional[DhcpRow]:
     for item in existing:
         if row.mac == item.mac or row.ip == item.ip or row.hostname == item.hostname:
@@ -679,6 +1004,7 @@ def confirm_changes(summary: str) -> bool:
 
 
 def main() -> int:
+    global LAST_LEASE_SOURCE, LAST_LEASE_SOURCE_DETAIL
     load_settings_from_json()
     load_csv_path_from_env()
     load_delete_csv_path_from_env()
@@ -705,7 +1031,6 @@ def main() -> int:
         return 1
 
     if mode == "export":
-        global LAST_LEASE_SOURCE, LAST_LEASE_SOURCE_DETAIL
         LAST_LEASE_SOURCE = "unknown"
         LAST_LEASE_SOURCE_DETAIL = ""
         refresh_api_credentials_via_session(api_session)
@@ -723,6 +1048,73 @@ def main() -> int:
         print(f"Lease source detail: {detail}")
         print(f"Exported {len(existing_entries)} entries to {EXPORT_CSV_PATH}")
         return 0
+
+    if mode == "dynamic":
+        LAST_LEASE_SOURCE = "unknown"
+        LAST_LEASE_SOURCE_DETAIL = ""
+        dynamic_entries = fetch_dynamic_leases_via_session_api(api_session)
+        LAST_LEASE_SOURCE = "api-session-dynamic"
+
+        rows = [item.to_dict() for item in dynamic_entries]
+        movable_count = sum(1 for item in dynamic_entries if item.movable_to_static)
+        payload = {
+            "ok": True,
+            "rows": rows,
+            "movableCount": movable_count,
+            "infoCount": len(dynamic_entries) - movable_count,
+            "leaseSource": LAST_LEASE_SOURCE,
+            "leaseSourceDetail": LAST_LEASE_SOURCE_DETAIL or "n/a",
+        }
+        append_log([
+            f"-;-;-;info;mode=dynamic;entries={len(dynamic_entries)}",
+            f"-;-;-;info;dynamic_movable={movable_count}",
+            f"-;-;-;info;lease source={LAST_LEASE_SOURCE}",
+            f"-;-;-;info;lease source detail={LAST_LEASE_SOURCE_DETAIL or 'n/a'}",
+        ])
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    if mode == "move_dynamic":
+        dynamic_iface = os.environ.get("TFK_DYNAMIC_IFACE", "")
+        dynamic_ip = os.environ.get("TFK_DYNAMIC_IP", "")
+        dynamic_mac = os.environ.get("TFK_DYNAMIC_MAC", "")
+        dynamic_hostname = os.environ.get("TFK_DYNAMIC_HOSTNAME", "")
+        result = move_dynamic_lease_to_static(
+            api_session,
+            iface=dynamic_iface,
+            ip=dynamic_ip,
+            mac=dynamic_mac,
+            hostname=dynamic_hostname,
+        )
+        append_log([
+            "hostname;mac;ip;status;message",
+            f"{dynamic_hostname};{dynamic_mac};{dynamic_ip};"
+            f"{'ok' if result.get('ok') else 'fail'};move_dynamic status={result.get('status', 'unknown')}",
+        ])
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if bool(result.get("ok")) else 1
+
+    if mode == "update_dynamic_conflict":
+        dynamic_old_mac = os.environ.get("TFK_DYNAMIC_OLD_MAC", "")
+        dynamic_iface = os.environ.get("TFK_DYNAMIC_IFACE", "")
+        dynamic_ip = os.environ.get("TFK_DYNAMIC_IP", "")
+        dynamic_mac = os.environ.get("TFK_DYNAMIC_MAC", "")
+        dynamic_hostname = os.environ.get("TFK_DYNAMIC_HOSTNAME", "")
+        result = update_static_from_dynamic_conflict(
+            api_session,
+            old_mac=dynamic_old_mac,
+            iface=dynamic_iface,
+            ip=dynamic_ip,
+            mac=dynamic_mac,
+            hostname=dynamic_hostname,
+        )
+        append_log([
+            "hostname;mac;ip;status;message",
+            f"{dynamic_hostname};{dynamic_mac};{dynamic_ip};"
+            f"{'ok' if result.get('ok') else 'fail'};update_dynamic_conflict status={result.get('status', 'unknown')}",
+        ])
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if bool(result.get("ok")) else 1
 
     if not CSV_PATH.exists():
         print(f"CSV not found: {CSV_PATH}")
