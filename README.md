@@ -2,6 +2,11 @@
 
 A desktop UI for managing OPNsense static and dynamic DHCP leases with validation, conflict checks, and guided apply flows.
 
+## License
+- This project is licensed under PolyForm Noncommercial License 1.0.0.
+- Commercial use, commercial modification, and use in commercial applications are not permitted without a separate commercial license from the author.
+- See `LICENSE` for the full terms.
+
 ## Features
 - Base URL-driven configuration (`login` and `dashboard` URLs are derived automatically, port `:81` enforced)
 - Static lease workflow: CSV import/validation, diffing, add/update/delete review
@@ -58,3 +63,6 @@ Compiled binaries are available on the GitHub releases page:
 - Backend script path is resolved automatically from the app; keep the `backend` folder next to the app.
 - Configure `Python path` in Settings if you use a non-default Python install.
 - `loginUrl` and `dashboardUrl` are read-only in the UI and derived from the Base URL.
+
+## Commercial licensing
+- If you need commercial use rights, request a separate commercial license from the project owner.
