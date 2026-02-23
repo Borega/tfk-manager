@@ -9,11 +9,14 @@ A desktop UI for managing OPNsense static and dynamic DHCP leases with validatio
 
 ## Features
 - Base URL-driven configuration (`login` and `dashboard` URLs are derived automatically, port `:81` enforced)
-- Static lease workflow: CSV import/validation, diffing, add/update/delete review
-- Dynamic lease workflow: load dynamic leases, move eligible leases to static, and update conflicting static entries
+- **Static Gruen** lease workflow: CSV import/validation, diffing, add/update/delete review for the `lan` (Gruen) interface
+- **Static WLANBYOD** lease workflow: identical workflow for the `opt4` (WLANBYOD) interface — separate panel, separate CSV state
+- Dynamic lease workflow: load dynamic leases; move eligible leases to static and update conflicting static entries
+  - Supported source interfaces for move/update: `Gruen` → `lan`, `WLANBYOD` → `opt4`
 - Conflict helpers with suggested free IP/hostname and field-level update selection (IP/MAC)
-- Lease views: `Static`, `Dynamic`, `Review`, and `Run Log`
-- Collapsible review sections (Add, Conflicts, Deletes)
+- Lease views: `Static Gruen`, `Static WLANBYOD`, `Dynamic`, `Review`, and `Run Log`
+- Collapsible review sections (Add, Conflicts, Deletes) per interface panel
+- Static lease export fetches both Gruen (`export_static.csv`) and WLANBYOD (`export_static_wlanbyod.csv`) in a single API call
 - Settings persistence, run history, and in-app updater support
 
 ## Setup
@@ -35,13 +38,24 @@ The backend authenticates against OPNsense, captures session cookies, and calls
 the `/api/tfk/dhcp/*` endpoints directly.
 
 ### Backend modes used by the app
-- `export`: export static leases to `export_static.csv`
-- `dynamic`: fetch dynamic leases
-- `move_dynamic`: move a dynamic lease to static (restricted to `Gruen` source interface)
-- `update_dynamic_conflict`: update an existing static lease from dynamic values
+| Mode | Description |
+|---|---|
+| `export` | Fetch `/api/tfk/dhcp/static_leases` once; write `export_static.csv` (Gruen/`lan`) **and** `export_static_wlanbyod.csv` (WLANBYOD/`opt4`) |
+| `dynamic` | Fetch dynamic leases from `/api/tfk/dhcp/leases` |
+| `move_dynamic` | Move a dynamic lease to static — interface mapped via `TFK_IFACE` (`Gruen`→`lan`, `WLANBYOD`→`opt4`) |
+| `update_dynamic_conflict` | Update an existing static lease from dynamic values — same interface mapping as above |
+
+### Interface mapping
+| UI name | OPNsense API `if` value |
+|---|---|
+| Gruen | `lan` |
+| WLANBYOD | `opt4` |
 
 ## Run (Desktop)
 - npm run tauri dev
+
+## Build
+Running `npm run build` automatically copies `backend/` into `src-tauri/resources/backend/` via `scripts/copy-backend.mjs` before compiling — no manual sync needed for production or CI builds.
 
 ## Tests
 - Dynamic lease backend slice tests:

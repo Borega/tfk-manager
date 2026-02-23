@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "node scripts/copy-backend.mjs && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

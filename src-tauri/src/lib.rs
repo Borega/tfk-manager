@@ -44,6 +44,8 @@ struct RunPayload {
     delete_csv: String,
     update_mode: String,
     settings: UiSettings,
+    #[serde(default)]
+    iface: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -53,6 +55,8 @@ struct RunRecord {
     lines: Vec<String>,
     #[serde(alias = "export_csv")]
     export_csv: Option<String>,
+    #[serde(alias = "export_wlanbyod_csv", skip_serializing_if = "Option::is_none", default)]
+    export_wlanbyod_csv: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -161,6 +165,11 @@ fn ensure_backend_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 fn read_export_csv(data_dir: &Path) -> Option<String> {
     let path = data_dir.join("export_static.csv");
+    fs::read_to_string(&path).ok()
+}
+
+fn read_export_wlanbyod_csv(data_dir: &Path) -> Option<String> {
+    let path = data_dir.join("export_static_wlanbyod.csv");
     fs::read_to_string(&path).ok()
 }
 
@@ -511,6 +520,12 @@ fn run_dhcp_sync(app: &tauri::AppHandle, payload: RunPayload) -> Result<RunRecor
     if let Some(password) = password {
         command.env("TFK_PASSWORD", password);
     }
+    if let Some(iface) = &payload.iface {
+        let trimmed = iface.trim();
+        if !trimmed.is_empty() {
+            command.env("TFK_IFACE", trimmed);
+        }
+    }
 
     let state = app.state::<ProcessState>();
     let status = run_with_live_logs(app, &state, command, &mut lines)?;
@@ -524,6 +539,7 @@ fn run_dhcp_sync(app: &tauri::AppHandle, payload: RunPayload) -> Result<RunRecor
         timestamp: chrono::Local::now().to_rfc3339(),
         lines,
         export_csv: None,
+        export_wlanbyod_csv: None,
     };
     let mut history = load_history(app.clone()).unwrap_or_default();
     history.insert(0, record.clone());
@@ -603,6 +619,7 @@ fn export_static_sync(app: &tauri::AppHandle, payload: ExportPayload) -> Result<
     }
 
     let export_csv = read_export_csv(&data_dir);
+    let export_wlanbyod_csv = read_export_wlanbyod_csv(&data_dir);
     if let (Some(path), Some(csv)) = (payload.save_path.as_ref(), export_csv.as_ref()) {
         match fs::write(path, csv) {
             Ok(()) => lines.push(format!("Saved export to {}", path)),
@@ -614,6 +631,7 @@ fn export_static_sync(app: &tauri::AppHandle, payload: ExportPayload) -> Result<
         timestamp: chrono::Local::now().to_rfc3339(),
         lines,
         export_csv,
+        export_wlanbyod_csv,
     };
     let mut history = load_history(app.clone()).unwrap_or_default();
     history.insert(0, record.clone());

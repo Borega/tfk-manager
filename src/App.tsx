@@ -64,12 +64,14 @@ type RunPayload = {
   deleteCsv: string;
   updateMode: "skip" | "update";
   settings: SettingsState;
+  iface?: string;
 };
 
 type RunRecord = {
   timestamp: string;
   lines: string[];
   exportCsv?: string;
+  exportWlanbyodCsv?: string;
 };
 
 type UpdateInfo = Awaited<ReturnType<typeof check>>;
@@ -491,7 +493,7 @@ function App() {
   const [deleteCollapsed, setDeleteCollapsed] = useState(false);
   const [exactCollapsed, setExactCollapsed] = useState(true);
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [leaseView, setLeaseView] = useState<"static" | "dynamic" | "review" | "runlog">("static");
+  const [leaseView, setLeaseView] = useState<"static" | "staticWlanbyod" | "dynamic" | "review" | "runlog">("static");
   const [dynamicLeases, setDynamicLeases] = useState<DynamicLease[]>([]);
   const [dynamicBusy, setDynamicBusy] = useState(false);
   const [dynamicError, setDynamicError] = useState<string | null>(null);
@@ -507,8 +509,25 @@ function App() {
   const [updateStaticIpSelected, setUpdateStaticIpSelected] = useState(true);
   const [updateStaticMacSelected, setUpdateStaticMacSelected] = useState(true);
 
+  // WLANBYOD (opt4) static lease state
+  const [incomingCsvW, setIncomingCsvW] = useState("");
+  const [existingCsvW, setExistingCsvW] = useState("");
+  const [excludedAddKeysW, setExcludedAddKeysW] = useState<Set<string>>(new Set());
+  const [excludedConflictKeysW, setExcludedConflictKeysW] = useState<Set<string>>(new Set());
+  const [selectedDeleteKeysW, setSelectedDeleteKeysW] = useState<Set<string>>(new Set());
+  const [forcedDeleteRowsW, setForcedDeleteRowsW] = useState<Record<string, ClientRow>>({});
+  const [deletePromptW, setDeletePromptW] = useState<ConflictDeletePrompt | null>(null);
+  const [confirmChangesW, setConfirmChangesW] = useState(false);
+  const [acknowledgeIgnoredW, setAcknowledgeIgnoredW] = useState(false);
+  const [addCollapsedW, setAddCollapsedW] = useState(false);
+  const [editCollapsedW, setEditCollapsedW] = useState(false);
+  const [deleteCollapsedW, setDeleteCollapsedW] = useState(false);
+  const [exactCollapsedW, setExactCollapsedW] = useState(true);
+
   const incoming = useMemo(() => parseCsv(incomingCsv), [incomingCsv]);
   const existing = useMemo(() => parseCsv(existingCsv), [existingCsv]);
+  const incomingW = useMemo(() => parseCsv(incomingCsvW), [incomingCsvW]);
+  const existingW = useMemo(() => parseCsv(existingCsvW), [existingCsvW]);
 
   const diff = useMemo(() => {
     const exact: ClientRow[] = [];
@@ -556,6 +575,33 @@ function App() {
     return { exact, conflicts, adds, duplicates, deletes };
   }, [incoming.rows, existing.rows]);
 
+  const diffW = useMemo(() => {
+    const exact: ClientRow[] = [];
+    const conflicts: { incoming: ClientRow; existing: ClientRow }[] = [];
+    const adds: ClientRow[] = [];
+    const duplicates: ClientRow[] = [];
+    const deletes: ClientRow[] = [];
+    const seen = new Set<string>();
+    const existingRows = existingW.rows;
+    const isExact = (row: ClientRow, other: ClientRow) =>
+      row.name === other.name && row.mac === other.mac && row.ip === other.ip;
+    const isAnyMatch = (row: ClientRow, other: ClientRow) =>
+      row.name === other.name || row.mac === other.mac || row.ip === other.ip;
+    incomingW.rows.forEach((row) => {
+      const key = rowKey(row);
+      if (seen.has(key)) { duplicates.push(row); return; }
+      seen.add(key);
+      const match = existingRows.find((item) => isAnyMatch(row, item));
+      if (!match) { adds.push(row); return; }
+      if (isExact(row, match)) { exact.push(row); } else { conflicts.push({ incoming: row, existing: match }); }
+    });
+    existingRows.forEach((row) => {
+      const match = incomingW.rows.find((item) => isAnyMatch(item, row));
+      if (!match) { deletes.push(row); }
+    });
+    return { exact, conflicts, adds, duplicates, deletes };
+  }, [incomingW.rows, existingW.rows]);
+
   useEffect(() => {
     setExcludedAddKeys(new Set());
     setExcludedConflictKeys(new Set());
@@ -563,6 +609,14 @@ function App() {
     setAcknowledgeIgnored(false);
     setExactCollapsed(true);
   }, [incomingCsv, existingCsv]);
+
+  useEffect(() => {
+    setExcludedAddKeysW(new Set());
+    setExcludedConflictKeysW(new Set());
+    setSelectedDeleteKeysW(new Set());
+    setAcknowledgeIgnoredW(false);
+    setExactCollapsedW(true);
+  }, [incomingCsvW, existingCsvW]);
 
   const credentialsReady = settings.username.trim().length > 0 && hasPassword;
   const hasRealUrls =
@@ -587,6 +641,17 @@ function App() {
   const deletableDeletes = useMemo(
     () => displayDeletes.filter((row) => !forcedDeleteKeys.has(rowKey(row))),
     [displayDeletes, forcedDeleteKeys],
+  );
+  const forcedDeleteKeysW = useMemo(() => new Set(Object.keys(forcedDeleteRowsW)), [forcedDeleteRowsW]);
+  const displayDeletesW = useMemo(() => {
+    const map = new Map<string, ClientRow>();
+    diffW.deletes.forEach((row) => map.set(rowKey(row), row));
+    Object.values(forcedDeleteRowsW).forEach((row) => map.set(rowKey(row), row));
+    return Array.from(map.values());
+  }, [diffW.deletes, forcedDeleteRowsW]);
+  const deletableDeletesW = useMemo(
+    () => displayDeletesW.filter((row) => !forcedDeleteKeysW.has(rowKey(row))),
+    [displayDeletesW, forcedDeleteKeysW],
   );
 
   const canRun =
@@ -613,6 +678,30 @@ function App() {
     !hasPassword ? "Save a password in Settings" : null,
     !confirmChanges ? "Confirm the changes to enable running" : null,
   ].filter(Boolean) as string[];
+
+  const hasIgnoredW = incomingW.ignored.length > 0 || existingW.ignored.length > 0;
+  const canRunW =
+    incomingW.rows.length > 0 &&
+    incomingW.errors.length === 0 &&
+    existingW.errors.length === 0 &&
+    (!hasIgnoredW || acknowledgeIgnoredW) &&
+    confirmChangesW &&
+    credentialsReady;
+  const allAddsCheckedW = diffW.adds.length > 0 && diffW.adds.every((row) => !excludedAddKeysW.has(rowKey(row)));
+  const allConflictsCheckedW =
+    diffW.conflicts.length > 0 &&
+    diffW.conflicts.every(({ incoming: r }) => !excludedConflictKeysW.has(rowKey(r)));
+  const allDeletesCheckedW =
+    deletableDeletesW.length > 0 && deletableDeletesW.every((row) => selectedDeleteKeysW.has(rowKey(row)));
+  const runBlockersW = [
+    incomingW.rows.length === 0 ? "Incoming CSV is empty" : null,
+    incomingW.errors.length > 0 ? "Incoming CSV has validation errors" : null,
+    existingW.errors.length > 0 ? "Existing CSV has validation errors" : null,
+    hasIgnoredW && !acknowledgeIgnoredW ? "Acknowledge ignored rows to continue" : null,
+    settings.username.trim().length === 0 ? "Enter a username in Settings" : null,
+    !hasPassword ? "Save a password in Settings" : null,
+    !confirmChangesW ? "Confirm the changes to enable running" : null,
+  ].filter(Boolean) as string[];
   const existingByMac = useMemo(() => {
     const map = new Map<string, ClientRow>();
     existing.rows.forEach((row) => map.set(row.mac.toLowerCase(), row));
@@ -624,6 +713,17 @@ function App() {
     existing.rows.forEach((row) => map.set(row.ip, row));
     return map;
   }, [existing.rows]);
+
+  const existingByMacW = useMemo(() => {
+    const map = new Map<string, ClientRow>();
+    existingW.rows.forEach((row) => map.set(row.mac.toLowerCase(), row));
+    return map;
+  }, [existingW.rows]);
+  const existingByIpW = useMemo(() => {
+    const map = new Map<string, ClientRow>();
+    existingW.rows.forEach((row) => map.set(row.ip, row));
+    return map;
+  }, [existingW.rows]);
 
   const moveDynamicIp = moveDynamicPrompt?.ip.trim() ?? "";
   const moveDynamicMac = moveDynamicPrompt?.mac.trim() ?? "";
@@ -653,6 +753,22 @@ function App() {
     }
     if (incoming.ip !== existingRow.ip) {
       const match = existingByIp.get(incoming.ip);
+      if (match && rowKey(match) !== rowKey(existingRow)) {
+        return { row: match, field: "ip" };
+      }
+    }
+    return null;
+  }
+
+  function findSecondaryConflictW(incoming: ClientRow, existingRow: ClientRow): SecondaryConflict | null {
+    if (incoming.mac !== existingRow.mac) {
+      const match = existingByMacW.get(incoming.mac.toLowerCase());
+      if (match && rowKey(match) !== rowKey(existingRow)) {
+        return { row: match, field: "mac" };
+      }
+    }
+    if (incoming.ip !== existingRow.ip) {
+      const match = existingByIpW.get(incoming.ip);
       if (match && rowKey(match) !== rowKey(existingRow)) {
         return { row: match, field: "ip" };
       }
@@ -739,6 +855,9 @@ function App() {
       setHistory((prev) => [result, ...prev]);
       if (result.exportCsv) {
         setExistingCsv(result.exportCsv);
+      }
+      if (result.exportWlanbyodCsv) {
+        setExistingCsvW(result.exportWlanbyodCsv);
       }
       setLastAutoExportKey(autoExportKey);
     } catch (error) {
@@ -842,6 +961,27 @@ function App() {
     }
   }
 
+  async function handlePickCsvW(target: "incoming" | "existing") {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+      });
+      if (!selected) return;
+      const filePath = Array.isArray(selected) ? selected[0] : selected;
+      if (!filePath) return;
+      const text = await invoke<string>("read_text_file", { path: String(filePath) });
+      if (target === "incoming") {
+        setIncomingCsvW(text);
+      } else {
+        setExistingCsvW(text);
+      }
+    } catch (error) {
+      setRunError(`CSV import failed: ${error}`);
+      setLogs([`CSV import failed: ${error}`]);
+    }
+  }
+
   async function handleRun() {
     if (!credentialsReady) {
       setRunError("Username and saved password are required.");
@@ -874,6 +1014,9 @@ function App() {
           existingCsvForRun = exportResult.exportCsv;
           setExistingCsv(exportResult.exportCsv);
         }
+        if (exportResult.exportWlanbyodCsv) {
+          setExistingCsvW(exportResult.exportWlanbyodCsv);
+        }
       }
       const payload: RunPayload = {
         incomingCsv: filteredIncomingCsv,
@@ -890,6 +1033,80 @@ function App() {
         payload: { settings: settingsForRefresh },
       });
       setHistory((prev) => [refreshedList, ...prev]);
+      if (refreshedList.exportCsv) {
+        setExistingCsv(refreshedList.exportCsv);
+      }
+      if (refreshedList.exportWlanbyodCsv) {
+        setExistingCsvW(refreshedList.exportWlanbyodCsv);
+      }
+    } catch (error) {
+      setRunError(String(error));
+      setLogs(["Run failed. See error details."]);
+    } finally {
+      setIsRunning(false);
+      setActiveProcess(null);
+    }
+  }
+
+  async function handleRunW() {
+    if (!credentialsReady) {
+      setRunError("Username and saved password are required.");
+      setLogs(["Missing credentials. Open Settings to save them."]);
+      return;
+    }
+    setCancelRequested(false);
+    setActiveProcess("run");
+    setIsRunning(true);
+    setRunError(null);
+    setLogs([]);
+    try {
+      let existingCsvForRun = existingCsvW;
+      const addKeys = new Set(diffW.adds.map(rowKey));
+      const conflictKeys = new Set(diffW.conflicts.map(({ incoming: r }) => rowKey(r)));
+      const filteredRows = incomingW.rows.filter((row) => {
+        const key = rowKey(row);
+        if (addKeys.has(key) && excludedAddKeysW.has(key)) return false;
+        if (conflictKeys.has(key) && excludedConflictKeysW.has(key)) return false;
+        return true;
+      });
+      const filteredIncomingCsv = buildIncomingCsv(filteredRows);
+      const deleteRows = displayDeletesW.filter((row) => selectedDeleteKeysW.has(rowKey(row)));
+      const deleteCsv = buildDeleteCsv(deleteRows);
+      if (existingCsvW.trim().length === 0) {
+        const settingsForExport = await bootstrapApiDataIfNeeded(settings);
+        const exportResult = await invoke<RunRecord>("export_static", { payload: { settings: settingsForExport } });
+        setHistory((prev) => [exportResult, ...prev]);
+        if (exportResult.exportWlanbyodCsv) {
+          existingCsvForRun = exportResult.exportWlanbyodCsv;
+          setExistingCsvW(exportResult.exportWlanbyodCsv);
+        } else if (exportResult.exportCsv) {
+          existingCsvForRun = exportResult.exportCsv;
+          setExistingCsvW(exportResult.exportCsv);
+        }
+        if (exportResult.exportCsv) {
+          setExistingCsv(exportResult.exportCsv);
+        }
+      }
+      const payload: RunPayload = {
+        incomingCsv: filteredIncomingCsv,
+        existingCsv: existingCsvForRun,
+        deleteCsv,
+        updateMode: UPDATE_MODE,
+        settings,
+        iface: "opt4",
+      };
+      const result = await invoke<RunRecord>("run_dhcp", { payload });
+      setHistory((prev) => [result, ...prev]);
+      const settingsForRefresh = await bootstrapApiDataIfNeeded(settings);
+      const refreshedList = await invoke<RunRecord>("export_static", {
+        payload: { settings: settingsForRefresh },
+      });
+      setHistory((prev) => [refreshedList, ...prev]);
+      if (refreshedList.exportWlanbyodCsv) {
+        setExistingCsvW(refreshedList.exportWlanbyodCsv);
+      } else if (refreshedList.exportCsv) {
+        setExistingCsvW(refreshedList.exportCsv);
+      }
       if (refreshedList.exportCsv) {
         setExistingCsv(refreshedList.exportCsv);
       }
@@ -927,6 +1144,48 @@ function App() {
         payload: { settings: settingsForExport, savePath },
       });
       setHistory((prev) => [result, ...prev]);
+      if (result.exportCsv) {
+        setExistingCsv(result.exportCsv);
+      }
+    } catch (error) {
+      setRunError(String(error));
+      setLogs(["Export failed. See error details."]);
+    } finally {
+      setIsRunning(false);
+      setActiveProcess(null);
+    }
+  }
+
+  async function handleExportW() {
+    if (!credentialsReady) {
+      setRunError("Username and saved password are required.");
+      setLogs(["Missing credentials. Open Settings to save them."]);
+      return;
+    }
+    setCancelRequested(false);
+    setActiveProcess("export");
+    setIsRunning(true);
+    setRunError(null);
+    setLogs([]);
+    try {
+      const settingsForExport = await bootstrapApiDataIfNeeded(settings);
+      const savePath = await save({
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+        defaultPath: "export_static_wlanbyod.csv",
+      });
+      if (!savePath) {
+        setLogs(["Export canceled."]);
+        return;
+      }
+      const result = await invoke<RunRecord>("export_static", {
+        payload: { settings: settingsForExport, savePath },
+      });
+      setHistory((prev) => [result, ...prev]);
+      if (result.exportWlanbyodCsv) {
+        setExistingCsvW(result.exportWlanbyodCsv);
+      } else if (result.exportCsv) {
+        setExistingCsvW(result.exportCsv);
+      }
       if (result.exportCsv) {
         setExistingCsv(result.exportCsv);
       }
@@ -1000,6 +1259,9 @@ function App() {
       const result = await invoke<RunRecord>("export_static", { payload: { settings: settingsForExport } });
       if (result.exportCsv) {
         setExistingCsv(result.exportCsv);
+      }
+      if (result.exportWlanbyodCsv) {
+        setExistingCsvW(result.exportWlanbyodCsv);
       }
       if (!silent) {
         setHistory((prev) => [result, ...prev]);
@@ -1133,29 +1395,52 @@ function App() {
     });
   }
 
+  function toggleAllAddsW() {
+    if (diffW.adds.length === 0) return;
+    if (allAddsCheckedW) { setExcludedAddKeysW(new Set(diffW.adds.map(rowKey))); return; }
+    setExcludedAddKeysW(new Set());
+  }
+
+  function toggleAllConflictsW() {
+    if (diffW.conflicts.length === 0) return;
+    if (allConflictsCheckedW) {
+      setExcludedConflictKeysW(new Set(diffW.conflicts.map(({ incoming: r }) => rowKey(r))));
+      return;
+    }
+    setExcludedConflictKeysW(new Set());
+  }
+
+  function toggleAllDeletesW() {
+    if (deletableDeletesW.length === 0) return;
+    if (allDeletesCheckedW) {
+      setSelectedDeleteKeysW((prev) => { const next = new Set(prev); deletableDeletesW.forEach((row) => next.delete(rowKey(row))); return next; });
+      return;
+    }
+    setSelectedDeleteKeysW((prev) => { const next = new Set(prev); deletableDeletesW.forEach((row) => next.add(rowKey(row))); return next; });
+  }
+
   function handleConflictToggle(incoming: ClientRow, existingRow: ClientRow) {
     const key = rowKey(incoming);
     const currentlyChecked = !excludedConflictKeys.has(key);
     if (currentlyChecked) {
-      setExcludedConflictKeys((prev) => {
-        const next = new Set(prev);
-        next.add(key);
-        return next;
-      });
+      setExcludedConflictKeys((prev) => { const next = new Set(prev); next.add(key); return next; });
       return;
     }
-
     const secondary = findSecondaryConflict(incoming, existingRow);
-    if (secondary) {
-      setDeletePrompt({ incoming, existing: existingRow, conflict: secondary });
+    if (secondary) { setDeletePrompt({ incoming, existing: existingRow, conflict: secondary }); return; }
+    setExcludedConflictKeys((prev) => { const next = new Set(prev); next.delete(key); return next; });
+  }
+
+  function handleConflictToggleW(incoming: ClientRow, existingRow: ClientRow) {
+    const key = rowKey(incoming);
+    const currentlyChecked = !excludedConflictKeysW.has(key);
+    if (currentlyChecked) {
+      setExcludedConflictKeysW((prev) => { const next = new Set(prev); next.add(key); return next; });
       return;
     }
-
-    setExcludedConflictKeys((prev) => {
-      const next = new Set(prev);
-      next.delete(key);
-      return next;
-    });
+    const secondary = findSecondaryConflictW(incoming, existingRow);
+    if (secondary) { setDeletePromptW({ incoming, existing: existingRow, conflict: secondary }); return; }
+    setExcludedConflictKeysW((prev) => { const next = new Set(prev); next.delete(key); return next; });
   }
 
   function confirmDeleteConflict() {
@@ -1163,22 +1448,29 @@ function App() {
     const { incoming, conflict } = deletePrompt;
     const incomingKey = rowKey(incoming);
     const conflictKey = rowKey(conflict.row);
-    setExcludedConflictKeys((prev) => {
-      const next = new Set(prev);
-      next.delete(incomingKey);
-      return next;
-    });
+    setExcludedConflictKeys((prev) => { const next = new Set(prev); next.delete(incomingKey); return next; });
     setForcedDeleteRows((prev) => ({ ...prev, [conflictKey]: conflict.row }));
-    setSelectedDeleteKeys((prev) => {
-      const next = new Set(prev);
-      next.add(conflictKey);
-      return next;
-    });
+    setSelectedDeleteKeys((prev) => { const next = new Set(prev); next.add(conflictKey); return next; });
     setDeletePrompt(null);
   }
 
   function cancelDeleteConflict() {
     setDeletePrompt(null);
+  }
+
+  function confirmDeleteConflictW() {
+    if (!deletePromptW) return;
+    const { incoming, conflict } = deletePromptW;
+    const incomingKey = rowKey(incoming);
+    const conflictKey = rowKey(conflict.row);
+    setExcludedConflictKeysW((prev) => { const next = new Set(prev); next.delete(incomingKey); return next; });
+    setForcedDeleteRowsW((prev) => ({ ...prev, [conflictKey]: conflict.row }));
+    setSelectedDeleteKeysW((prev) => { const next = new Set(prev); next.add(conflictKey); return next; });
+    setDeletePromptW(null);
+  }
+
+  function cancelDeleteConflictW() {
+    setDeletePromptW(null);
   }
 
   function applyBaseUrlCleanup() {
@@ -1373,7 +1665,8 @@ function App() {
         isRunning ||
         showUpdateOverlay ||
         baseUrlCleanupPrompt ||
-        moveDynamicPrompt
+        moveDynamicPrompt ||
+        deletePromptW
           ? "app-busy"
           : ""
       }`}
@@ -1382,7 +1675,7 @@ function App() {
         <div className="overlay" aria-live="polite" aria-busy="true">
           <div className="overlay-card move-overlay-card">
             <div className="overlay-title">Move dynamic lease to static?</div>
-            <div className="overlay-subtitle">Only interface Gruen is supported for move.</div>
+            <div className="overlay-subtitle">Supported interfaces: Gruen (LAN) and WLANBYOD (opt4).</div>
             <div className="move-lease-grid">
               <div className="move-lease-box">
                 <span className="move-lease-label">Interface</span>
@@ -1596,6 +1889,28 @@ function App() {
           </div>
         </div>
       )}
+      {deletePromptW && (
+        <div className="overlay" aria-live="polite" aria-busy="true">
+          <div className="overlay-card">
+            <div className="overlay-title">Delete conflicting WLANBYOD lease?</div>
+            <div className="overlay-subtitle">
+              The update for {deletePromptW.incoming.name} will reuse the same {deletePromptW.conflict.field.toUpperCase()}.
+              Delete the existing lease first?
+            </div>
+            <div className="overlay-actions">
+              <button className="primary" type="button" onClick={confirmDeleteConflictW}>
+                Delete and continue
+              </button>
+              <button className="secondary" type="button" onClick={cancelDeleteConflictW}>
+                Cancel
+              </button>
+            </div>
+            <div className="overlay-subtitle">
+              Existing: {deletePromptW.conflict.row.name} · {deletePromptW.conflict.row.mac} · {deletePromptW.conflict.row.ip}
+            </div>
+          </div>
+        </div>
+      )}
       {showUpdateOverlay && (
         <div className="overlay" aria-live="polite" aria-busy="true">
           <div className="overlay-card run-overlay-card">
@@ -1699,7 +2014,14 @@ function App() {
                   className={leaseView === "static" ? "active" : ""}
                   onClick={() => setLeaseView("static")}
                 >
-                  Static
+                  Static Gruen
+                </button>
+                <button
+                  type="button"
+                  className={leaseView === "staticWlanbyod" ? "active" : ""}
+                  onClick={() => setLeaseView("staticWlanbyod")}
+                >
+                  Static WLANBYOD
                 </button>
                 <button
                   type="button"
@@ -1751,6 +2073,37 @@ function App() {
                     <textarea
                       value={existingCsv}
                       onChange={(e) => setExistingCsv(e.currentTarget.value)}
+                      placeholder="Name;MAC;IP"
+                    />
+                  </div>
+                </>
+              ) : leaseView === "staticWlanbyod" ? (
+                <>
+                  <div className="field">
+                    <label>Import incoming CSV (WLANBYOD)</label>
+                    <button className="secondary" type="button" onClick={() => void handlePickCsvW("incoming")}>
+                      Choose incoming CSV
+                    </button>
+                  </div>
+                  <div className="field">
+                    <label>Import existing export CSV (WLANBYOD)</label>
+                    <button className="secondary" type="button" onClick={() => void handlePickCsvW("existing")}>
+                      Choose existing CSV
+                    </button>
+                  </div>
+                  <div className="field">
+                    <label>Paste incoming CSV (WLANBYOD)</label>
+                    <textarea
+                      value={incomingCsvW}
+                      onChange={(e) => setIncomingCsvW(e.currentTarget.value)}
+                      placeholder="Name;Raum;IP;MAC;Besitzer;Inventarnummer;Beschreibung"
+                    />
+                  </div>
+                  <div className="field">
+                    <label>Paste existing export CSV (WLANBYOD)</label>
+                    <textarea
+                      value={existingCsvW}
+                      onChange={(e) => setExistingCsvW(e.currentTarget.value)}
                       placeholder="Name;MAC;IP"
                     />
                   </div>
@@ -1985,7 +2338,7 @@ function App() {
               {dynamicError && <p className="error-text">{dynamicError}</p>}
               {dynamicMeta && (
                 <p className="lease-meta">
-                  Movable (Gruen): {dynamicMeta.movableCount} · Info only (WLANBYOD/other): {dynamicMeta.infoCount}
+                  Movable (Gruen/WLANBYOD): {dynamicMeta.movableCount} · Info only (other): {dynamicMeta.infoCount}
                 </p>
               )}
               <div className="dynamic-table-wrap">
@@ -2117,7 +2470,7 @@ function App() {
               )}
               <div className="review-actions">
                 <button className="secondary" type="button" onClick={() => setLeaseView("static")}>
-                  Open Static
+                  Open Static Gruen
                 </button>
                 <button className="secondary" type="button" onClick={() => setLeaseView("dynamic")}>
                   Open Dynamic
@@ -2497,6 +2850,286 @@ function App() {
           </div>
 
           </>
+          )}
+
+          {leaseView === "staticWlanbyod" && (
+            <>
+          <div className="card full">
+            <div className="preview-header">
+              <h3>Static Leases (WLANBYOD / opt4)</h3>
+              <button
+                className="mini-action"
+                type="button"
+                onClick={() => void refreshStaticLeases()}
+                disabled={staticRefreshBusy}
+              >
+                {staticRefreshBusy ? "Refreshing..." : "Refresh static list"}
+              </button>
+            </div>
+          </div>
+          <div className="grid">
+            <div className="card">
+              <h3>Validation</h3>
+              <div className="metrics">
+                <span>Incoming</span>
+                <strong>{incomingW.rows.length}</strong>
+                <span>Existing</span>
+                <strong>{existingW.rows.length}</strong>
+              </div>
+            </div>
+            <div className="card">
+              <h3>Diff Summary</h3>
+              <div className="diff-grid">
+                <div><span>Add</span><strong>{diffW.adds.length}</strong></div>
+                <div><span>Conflicts</span><strong>{diffW.conflicts.length}</strong></div>
+                <div><span>Exact</span><strong>{diffW.exact.length}</strong></div>
+                <div><span>Duplicates</span><strong>{diffW.duplicates.length}</strong></div>
+              </div>
+            </div>
+          </div>
+
+          {(incomingW.ignored.length > 0 || existingW.ignored.length > 0) && (
+            <div className="card full ignored-card">
+              <div className="ignored-header">
+                <h3>Ignored</h3>
+                <p>Rows skipped during validation with the reason listed.</p>
+              </div>
+              <div className={`ignored-columns ${incomingW.ignored.length > 0 && existingW.ignored.length > 0 ? "" : "single"}`}>
+                {incomingW.ignored.length > 0 && (
+                  <div className="ignored-section">
+                    <h4>Incoming</h4>
+                    <ul className="ignored-list">
+                      {incomingW.ignored.map((item, idx) => (
+                        <li key={`ign-win-${item.lineNumber}-${idx}`} className="ignored-item">
+                          <div className="ignored-main">
+                            <span className="ignored-entry">
+                              {item.name || item.mac || item.ip ? `${item.name || "?"} · ${item.mac || "?"} · ${item.ip || "?"}` : item.raw || "(empty row)"}
+                            </span>
+                            <span className="ignored-reason">{item.reason}</span>
+                          </div>
+                          <span className="ignored-meta">Row {item.lineNumber}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {existingW.ignored.length > 0 && (
+                  <div className="ignored-section">
+                    <h4>Existing</h4>
+                    <ul className="ignored-list">
+                      {existingW.ignored.map((item, idx) => (
+                        <li key={`ign-wex-${item.lineNumber}-${idx}`} className="ignored-item">
+                          <div className="ignored-main">
+                            <span className="ignored-entry">
+                              {item.name || item.mac || item.ip ? `${item.name || "?"} · ${item.mac || "?"} · ${item.ip || "?"}` : item.raw || "(empty row)"}
+                            </span>
+                            <span className="ignored-reason">{item.reason}</span>
+                          </div>
+                          <span className="ignored-meta">Row {item.lineNumber}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="card full">
+            <h3>Change Preview</h3>
+            <div className="preview-columns">
+              <div className="preview-stack">
+                <div className="preview-section">
+                  <div className="preview-header">
+                    <h4>Add</h4>
+                    <div className="preview-actions">
+                      <button className="mini-action" type="button" onClick={() => setAddCollapsedW((p) => !p)}>
+                        {addCollapsedW ? `Show (${diffW.adds.length})` : `Hide (${diffW.adds.length})`}
+                      </button>
+                      {!addCollapsedW && (
+                        <button className="mini-action" type="button" onClick={toggleAllAddsW} disabled={diffW.adds.length === 0}>
+                          {allAddsCheckedW ? "Uncheck all" : "Check all"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {!addCollapsedW && (
+                    <ul>
+                      {diffW.adds.map((row) => (
+                        <li key={`wadd-${row.mac}`}>
+                          <label className="select-row">
+                            <input
+                              type="checkbox"
+                              checked={!excludedAddKeysW.has(rowKey(row))}
+                              onChange={() => {
+                                const key = rowKey(row);
+                                setExcludedAddKeysW((prev) => { const next = new Set(prev); if (next.has(key)) next.delete(key); else next.add(key); return next; });
+                              }}
+                            />
+                            <span>{row.name} · {row.mac} · {row.ip}</span>
+                          </label>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <div className="preview-section conflicts">
+                  <div className="preview-header">
+                    <h4>Conflicts</h4>
+                    <div className="preview-actions">
+                      <button className="mini-action" type="button" onClick={() => setEditCollapsedW((p) => !p)}>
+                        {editCollapsedW ? `Show (${diffW.conflicts.length})` : `Hide (${diffW.conflicts.length})`}
+                      </button>
+                      {!editCollapsedW && (
+                        <button className="mini-action" type="button" onClick={toggleAllConflictsW} disabled={diffW.conflicts.length === 0}>
+                          {allConflictsCheckedW ? "Uncheck all" : "Check all"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {!editCollapsedW && (
+                    <ul className="conflict-list">
+                      {diffW.conflicts.map(({ incoming: inc, existing: ex }) => (
+                        <li key={`wconf-${inc.mac}-${ex.mac}`}>
+                          <label className="select-row">
+                            <input
+                              type="checkbox"
+                              checked={!excludedConflictKeysW.has(rowKey(inc))}
+                              onChange={() => handleConflictToggleW(inc, ex)}
+                            />
+                            <span>Apply change</span>
+                          </label>
+                          <div className="conflict-row">
+                            <div className="conflict-side">
+                              <span className="conflict-label">Existing</span>
+                              <div className="conflict-values">
+                                <span className={inc.name !== ex.name ? "conflict-change" : ""}>{ex.name}</span>
+                                <span className={inc.mac !== ex.mac ? "conflict-change" : ""}>{ex.mac}</span>
+                                <span className={inc.ip !== ex.ip ? "conflict-change" : ""}>{ex.ip}</span>
+                              </div>
+                            </div>
+                            <div className="conflict-arrow">→</div>
+                            <div className="conflict-side">
+                              <span className="conflict-label">Incoming</span>
+                              <div className="conflict-values">
+                                <span className={inc.name !== ex.name ? "conflict-change" : ""}>{inc.name}</span>
+                                <span className={inc.mac !== ex.mac ? "conflict-change" : ""}>{inc.mac}</span>
+                                <span className={inc.ip !== ex.ip ? "conflict-change" : ""}>{inc.ip}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <div className="preview-section deletions">
+                  <div className="preview-header">
+                    <h4>Deletes</h4>
+                    <div className="preview-actions">
+                      <button className="mini-action" type="button" onClick={() => setDeleteCollapsedW((p) => !p)}>
+                        {deleteCollapsedW ? `Show (${displayDeletesW.length})` : `Hide (${displayDeletesW.length})`}
+                      </button>
+                      {!deleteCollapsedW && (
+                        <button className="mini-action" type="button" onClick={toggleAllDeletesW} disabled={diffW.deletes.length === 0}>
+                          {allDeletesCheckedW ? "Uncheck all" : "Check all"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {!deleteCollapsedW && (
+                    <ul>
+                      {displayDeletesW.map((row) => {
+                        const forced = forcedDeleteKeysW.has(rowKey(row));
+                        return (
+                          <li key={`wdel-${row.mac}`}>
+                            <label className="select-row">
+                              <input
+                                type="checkbox"
+                                checked={selectedDeleteKeysW.has(rowKey(row))}
+                                disabled={forced}
+                                onChange={() => {
+                                  const key = rowKey(row);
+                                  setSelectedDeleteKeysW((prev) => { const next = new Set(prev); if (next.has(key)) next.delete(key); else next.add(key); return next; });
+                                }}
+                              />
+                              <span>{row.name} · {row.mac} · {row.ip}</span>
+                              {forced && <span className="pill">Required</span>}
+                            </label>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </div>
+                <div className="preview-section">
+                  <div className="preview-header">
+                    <h4>Exact Matches</h4>
+                    <button className="mini-action" type="button" onClick={() => setExactCollapsedW((p) => !p)}>
+                      {exactCollapsedW ? `Show (${diffW.exact.length})` : `Hide (${diffW.exact.length})`}
+                    </button>
+                  </div>
+                  {!exactCollapsedW && (
+                    <ul>
+                      {diffW.exact.map((row) => (
+                        <li key={`wexact-${row.mac}`}>{row.name} · {row.mac} · {row.ip}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="card full confirm">
+            <div>
+              <h3>Ready to apply (WLANBYOD)</h3>
+              <p>Review the changes, then confirm to execute the run on opt4.</p>
+            </div>
+            <label className="confirm-toggle">
+              <input
+                type="checkbox"
+                checked={confirmChangesW}
+                onChange={(e) => setConfirmChangesW(e.currentTarget.checked)}
+              />
+              I understand the changes above
+            </label>
+            {hasIgnoredW && (
+              <label className="confirm-toggle">
+                <input
+                  type="checkbox"
+                  checked={acknowledgeIgnoredW}
+                  onChange={(e) => setAcknowledgeIgnoredW(e.currentTarget.checked)}
+                />
+                I understand some rows will be ignored
+              </label>
+            )}
+            {runBlockersW.length > 0 && (
+              <div className="run-hints">
+                {runBlockersW.map((item) => (
+                  <p key={`w-${item}`}>{item}</p>
+                ))}
+              </div>
+            )}
+            <div className="run-toggles">
+              <label className="toggle-pill">
+                <input
+                  type="checkbox"
+                  checked={settings.dryRun}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setSettings((prev) => ({ ...prev, dryRun: checked })); }}
+                />
+                Dry run
+              </label>
+            </div>
+            <button className="primary" disabled={!canRunW || isRunning} onClick={() => void handleRunW()}>
+              {isRunning ? "Running..." : "Run Changes (WLANBYOD)"}
+            </button>
+            <button className="secondary" type="button" disabled={!canExport || isRunning} onClick={() => void handleExportW()}>
+              Export Current List
+            </button>
+          </div>
+
+            </>
           )}
         </section>
         </div>

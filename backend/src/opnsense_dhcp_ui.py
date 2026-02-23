@@ -23,6 +23,7 @@ CSV_PATH = DATA_DIR / "daten_template.csv"
 LOG_PATH = DATA_DIR / "run_log.csv"
 TEMP_CSV_PATH = DATA_DIR / "to_add.csv"
 EXPORT_CSV_PATH = DATA_DIR / "export_static.csv"
+EXPORT_WLANBYOD_CSV_PATH = DATA_DIR / "export_static_wlanbyod.csv"
 DELETE_CSV_PATH = DATA_DIR / "to_delete.csv"
 DEBUG = False
 DRY_RUN = True  # Set False to submit entries
@@ -194,7 +195,7 @@ class DynamicLeaseRow:
 
     @property
     def movable_to_static(self) -> bool:
-        return self.iface == "Gruen"
+        return self.iface in ("Gruen", "WLANBYOD")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -664,14 +665,21 @@ def _parse_static_leases_payload(payload: Any) -> List[DhcpRow]:
     return entries
 
 
-def fetch_static_leases_via_session_api(session: OPNsenseApiSession) -> List[DhcpRow]:
+def _fetch_static_leases_raw(session: "OPNsenseApiSession") -> Any:
+    """Return the raw /api/tfk/dhcp/static_leases payload dict, or None on failure."""
     global LAST_LEASE_SOURCE_DETAIL
     response = session.api_get("/api/tfk/dhcp/static_leases")
     if not response.get("ok"):
         LAST_LEASE_SOURCE_DETAIL = f"session-api failed status={response.get('status', 'unknown')}"
-        return []
+        return None
+    return response.get("data")
 
-    payload = response.get("data")
+
+def fetch_static_leases_via_session_api(session: "OPNsenseApiSession") -> List[DhcpRow]:
+    global LAST_LEASE_SOURCE_DETAIL
+    payload = _fetch_static_leases_raw(session)
+    if payload is None:
+        return []
     entries = _parse_static_leases_payload(payload)
     LAST_LEASE_SOURCE_DETAIL = f"session-api entries={len(entries)}"
     return entries
@@ -777,17 +785,18 @@ def move_dynamic_lease_to_static(
                 return candidate
         return base
 
+    IFACE_TO_API = {"Gruen": "lan", "WLANBYOD": "opt4"}
     cleaned_iface = iface.strip()
-    target_static_iface = (os.environ.get("TFK_IFACE", DEFAULT_IFACE) or DEFAULT_IFACE).strip()
+    target_static_iface = IFACE_TO_API.get(cleaned_iface, (os.environ.get("TFK_IFACE", DEFAULT_IFACE) or DEFAULT_IFACE).strip())
     cleaned_ip = ip.strip()
     cleaned_mac = mac.strip()
     cleaned_hostname = hostname.strip() or "dynamic-lease"
 
-    if cleaned_iface != "Gruen":
+    if cleaned_iface not in IFACE_TO_API:
         return {
             "ok": False,
             "status": "not_movable",
-            "message": "Only dynamic leases from iface 'Gruen' can be moved to static",
+            "message": "Only dynamic leases from iface 'Gruen' or 'WLANBYOD' can be moved to static",
         }
     if not cleaned_ip or not cleaned_mac:
         return {
@@ -883,18 +892,19 @@ def update_static_from_dynamic_conflict(
     mac: str,
     hostname: str,
 ) -> Dict[str, Any]:
+    IFACE_TO_API = {"Gruen": "lan", "WLANBYOD": "opt4"}
     cleaned_old_mac = old_mac.strip()
     cleaned_iface = iface.strip()
-    target_static_iface = (os.environ.get("TFK_IFACE", DEFAULT_IFACE) or DEFAULT_IFACE).strip()
+    target_static_iface = IFACE_TO_API.get(cleaned_iface, (os.environ.get("TFK_IFACE", DEFAULT_IFACE) or DEFAULT_IFACE).strip())
     cleaned_ip = ip.strip()
     cleaned_mac = mac.strip()
     cleaned_hostname = hostname.strip() or "dynamic-lease"
 
-    if cleaned_iface != "Gruen":
+    if cleaned_iface not in IFACE_TO_API:
         return {
             "ok": False,
             "status": "not_movable",
-            "message": "Only interface 'Gruen' is supported",
+            "message": "Only interfaces 'Gruen' and 'WLANBYOD' are supported",
         }
     if not cleaned_old_mac or not MAC_RE.match(cleaned_old_mac):
         return {
@@ -972,6 +982,15 @@ def export_static_leases(rows: List[DhcpRow]) -> None:
             writer.writerow([row.hostname, row.mac, row.ip])
 
 
+def export_static_wlanbyod_leases(rows: List[DhcpRow]) -> None:
+    EXPORT_WLANBYOD_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with EXPORT_WLANBYOD_CSV_PATH.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter=";")
+        writer.writerow(["Name", "MAC", "IP"])
+        for row in rows:
+            writer.writerow([row.hostname, row.mac, row.ip])
+
+
 def summarize_changes(to_add: List[DhcpRow], to_update: List[Tuple[DhcpRow, DhcpRow]]) -> str:
     lines = []
     if to_add:
@@ -1034,19 +1053,27 @@ def main() -> int:
         LAST_LEASE_SOURCE = "unknown"
         LAST_LEASE_SOURCE_DETAIL = ""
         refresh_api_credentials_via_session(api_session)
-        existing_entries = fetch_static_leases_via_session_api(api_session)
+        raw_payload = _fetch_static_leases_raw(api_session)
+        if isinstance(raw_payload, dict):
+            existing_entries = _parse_static_leases_payload(raw_payload.get("lan"))
+            wlanbyod_entries = _parse_static_leases_payload(raw_payload.get("opt4"))
+        else:
+            existing_entries = _parse_static_leases_payload(raw_payload)
+            wlanbyod_entries = []
         LAST_LEASE_SOURCE = "api-session"
         export_static_leases(existing_entries)
+        export_static_wlanbyod_leases(wlanbyod_entries)
 
         detail = LAST_LEASE_SOURCE_DETAIL or "n/a"
         append_log([
             f"-;-;-;info;lease source={LAST_LEASE_SOURCE}",
             f"-;-;-;info;lease source detail={detail}",
-            f"-;-;-;info;mode=export;entries={len(existing_entries)}",
+            f"-;-;-;info;mode=export;entries={len(existing_entries)};wlanbyod={len(wlanbyod_entries)}",
         ])
         print(f"Lease source: {LAST_LEASE_SOURCE}")
         print(f"Lease source detail: {detail}")
         print(f"Exported {len(existing_entries)} entries to {EXPORT_CSV_PATH}")
+        print(f"Exported {len(wlanbyod_entries)} WLANBYOD entries to {EXPORT_WLANBYOD_CSV_PATH}")
         return 0
 
     if mode == "dynamic":
