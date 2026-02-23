@@ -1045,3 +1045,210 @@ input[type="checkbox"]:disabled {
     grid-template-columns: 1fr;
   }
 }
+
+/* ─── Firewall Log ──────────────────────────────────────────── */
+
+.fw-sidebar-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.fw-stream-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  color: #9ab8b4;
+}
+
+.fw-live-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4eddaa;
+  box-shadow: 0 0 6px #4eddaa;
+  animation: fw-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes fw-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.fw-filter-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.fw-filter-tabs button {
+  padding: 4px 10px;
+  font-size: 0.78rem;
+  border-radius: 8px;
+  border: 1px solid rgba(109, 173, 167, 0.25);
+  background: rgba(255, 255, 255, 0.04);
+  color: #9ab8b4;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.fw-filter-tabs button.active {
+  background: rgba(109, 173, 167, 0.18);
+  color: #cce8e4;
+  border-color: rgba(109, 173, 167, 0.5);
+}
+
+.fw-filter-tabs button:hover:not(.active) {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+/* Main log table */
+
+.fw-table-wrap {
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: calc(100vh - 280px);
+  border-radius: 10px;
+  border: 1px solid rgba(109, 173, 167, 0.12);
+}
+
+.fw-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.fw-table th {
+  background: rgba(7, 12, 16, 0.7);
+  color: #5a8a85;
+  text-align: left;
+  padding: 7px 10px;
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  border-bottom: 1px solid rgba(109, 173, 167, 0.14);
+  white-space: nowrap;
+}
+
+.fw-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.fw-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* Row tinting by action */
+.fw-row-block {
+  background: rgba(220, 60, 60, 0.06);
+}
+
+.fw-row-block:hover {
+  background: rgba(220, 60, 60, 0.11) !important;
+}
+
+.fw-row-rdr {
+  background: rgba(240, 160, 50, 0.06);
+}
+
+.fw-row-rdr:hover {
+  background: rgba(240, 160, 50, 0.11) !important;
+}
+
+/* Action badges */
+.fw-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.fw-badge-pass {
+  background: rgba(60, 190, 130, 0.18);
+  color: #5de8a8;
+}
+
+.fw-badge-block {
+  background: rgba(220, 60, 60, 0.2);
+  color: #f0706c;
+}
+
+.fw-badge-rdr {
+  background: rgba(240, 160, 50, 0.18);
+  color: #f0c165;
+}
+
+.fw-badge-other {
+  background: rgba(255, 255, 255, 0.08);
+  color: #9ab8b4;
+}
+
+/* Cell helpers */
+.fw-cell-time {
+  font-family: monospace;
+  color: #7a9e9a;
+  font-size: 0.75rem;
+}
+
+.fw-cell-dir {
+  font-size: 0.8rem;
+  color: #9ab8b4;
+  white-space: nowrap;
+}
+
+.fw-cell-iface {
+  font-size: 0.74rem;
+  color: #7a9e9a;
+}
+
+.fw-cell-proto {
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  color: #9ab8b4;
+}
+
+.fw-cell-addr {
+  font-family: monospace;
+  font-size: 0.76rem;
+}
+
+.fw-port {
+  color: #6ab8b0;
+  font-size: 0.72rem;
+}
+
+.fw-cell-label {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #cce8e4;
+  font-size: 0.78rem;
+}
+
+.fw-cell-count {
+  text-align: right;
+  color: #7a9e9a;
+  font-size: 0.74rem;
+}
+
+.fw-empty {
+  text-align: center;
+  padding: 40px !important;
+  color: #5a8a85;
+  font-size: 0.9rem;
+}
+

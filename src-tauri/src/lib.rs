@@ -15,6 +15,11 @@ struct ProcessState {
     child: Mutex<Option<std::process::Child>>,
 }
 
+#[derive(Default)]
+struct FirewallLogState {
+    child: Mutex<Option<std::process::Child>>,
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct UiSettings {
@@ -962,6 +967,132 @@ async fn update_static_from_dynamic(
         .map_err(|err| err.to_string())?
 }
 
+fn resolve_firewall_stream_script(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    // The firewall stream script lives next to opnsense_dhcp_ui.py
+    let main_script = resolve_script_path(app)?;
+    let dir = main_script
+        .parent()
+        .ok_or_else(|| "Cannot resolve backend/src directory".to_string())?;
+    let fw_script = dir.join("fetch_firewall_log_stream.py");
+    if fw_script.exists() {
+        return Ok(fw_script);
+    }
+    Err(format!(
+        "Could not locate fetch_firewall_log_stream.py (expected at {})",
+        fw_script.display()
+    ))
+}
+
+#[tauri::command]
+async fn start_firewall_log_stream(
+    app: tauri::AppHandle,
+    settings: UiSettings,
+) -> Result<(), String> {
+    // Stop any previously running stream first
+    {
+        let state = app.state::<FirewallLogState>();
+        let mut guard = state
+            .child
+            .lock()
+            .map_err(|_| "FirewallLogState lock poisoned".to_string())?;
+        if let Some(child) = guard.as_mut() {
+            let _ = child.kill();
+        }
+        *guard = None;
+    }
+
+    let script_path = resolve_firewall_stream_script(&app)?;
+    let config_path = app_data_file(&app, "last_run_settings.json")?;
+    let config_raw = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    fs::write(&config_path, config_raw).map_err(|e| e.to_string())?;
+
+    let password = get_password().unwrap_or(None);
+
+    let mut command = Command::new(&settings.python_path);
+    command
+        .arg("-u")
+        .arg(&script_path)
+        .env("TFK_SETTINGS_JSON", &config_path)
+        .env("PYTHONUNBUFFERED", "1");
+    if !settings.username.trim().is_empty() {
+        command.env("TFK_USERNAME", &settings.username);
+    }
+    if !settings.api_username.trim().is_empty() {
+        command.env("TFK_API_USERNAME", &settings.api_username);
+    }
+    if !settings.api_key.trim().is_empty() {
+        command.env("TFK_API_KEY", &settings.api_key);
+    }
+    if !settings.api_secret.trim().is_empty() {
+        command.env("TFK_API_SECRET", &settings.api_secret);
+    }
+    if !settings.cookie_header.trim().is_empty() {
+        command.env("TFK_COOKIE_HEADER", &settings.cookie_header);
+    }
+    if settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
+    if let Some(pw) = password {
+        command.env("TFK_PASSWORD", pw);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to spawn firewall log stream: {}", e))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "No stdout handle for firewall stream".to_string())?;
+
+    // Store the child so we can kill it later
+    {
+        let state = app.state::<FirewallLogState>();
+        let mut guard = state
+            .child
+            .lock()
+            .map_err(|_| "FirewallLogState lock poisoned".to_string())?;
+        *guard = Some(child);
+    }
+
+    // Spawn a background thread that reads JSON lines and emits Tauri events
+    let app_clone = app.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(text) => {
+                    let trimmed = text.trim().to_string();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let _ = app_clone.emit("firewall-log-entry", trimmed);
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = app_clone.emit("firewall-log-stopped", ());
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_firewall_log_stream(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<FirewallLogState>();
+    let mut guard = state
+        .child
+        .lock()
+        .map_err(|_| "FirewallLogState lock poisoned".to_string())?;
+    if let Some(child) = guard.as_mut() {
+        let _ = child.kill();
+    }
+    *guard = None;
+    let _ = app.emit("firewall-log-stopped", ());
+    Ok(())
+}
+
 #[tauri::command]
 fn cancel_run(app: tauri::AppHandle, state: tauri::State<ProcessState>) -> Result<(), String> {
     let mut guard = state.child.lock().map_err(|_| "Process lock poisoned".to_string())?;
@@ -976,6 +1107,7 @@ fn cancel_run(app: tauri::AppHandle, state: tauri::State<ProcessState>) -> Resul
 pub fn run() {
     tauri::Builder::default()
         .manage(ProcessState::default())
+        .manage(FirewallLogState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
@@ -995,7 +1127,9 @@ pub fn run() {
             discover_api_credentials,
             load_dynamic_leases,
             move_dynamic_to_static,
-            update_static_from_dynamic
+            update_static_from_dynamic,
+            start_firewall_log_stream,
+            stop_firewall_log_stream
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -76,6 +76,28 @@ type RunRecord = {
 
 type UpdateInfo = Awaited<ReturnType<typeof check>>;
 
+type FirewallLogEntry = {
+  rulenr?: string;
+  interface?: string;
+  action?: string;
+  dir?: string;
+  protoname?: string;
+  protonum?: string;
+  src?: string;
+  dst?: string;
+  srcport?: string;
+  dstport?: string;
+  label?: string;
+  counter?: number;
+  __timestamp__?: string;
+  reason?: string;
+  tcpflags?: string;
+  length?: string;
+  error?: string;
+};
+
+const MAX_FW_LOG_ENTRIES = 500;
+
 const DEFAULT_SETTINGS: SettingsState = {
   baseUrl: "https://your-opnsense-host:81",
   loginUrl: "https://your-opnsense-host:81",
@@ -455,9 +477,27 @@ type MoveConflictInfo = {
   suggestedName?: string;
 };
 
+function fwFormatTime(ts?: string): string {
+  if (!ts) return "-";
+  return ts.slice(11, 19); // extract HH:MM:SS from ISO timestamp
+}
+
+function fwBadgeClass(action?: string): string {
+  if (action === "pass") return "fw-badge-pass";
+  if (action === "block" || action === "drop") return "fw-badge-block";
+  if (action === "rdr") return "fw-badge-rdr";
+  return "fw-badge-other";
+}
+
+function fwRowClass(action?: string): string {
+  if (action === "block" || action === "drop") return "fw-row-block";
+  if (action === "rdr") return "fw-row-rdr";
+  return "";
+}
+
 function App() {
   const UPDATE_MODE: RunPayload["updateMode"] = "update";
-  const [activeTab, setActiveTab] = useState<"leases" | "settings" | "history" | "help">("leases");
+  const [activeTab, setActiveTab] = useState<"leases" | "settings" | "history" | "help" | "firewall">("leases");
   const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS);
   const [history, setHistory] = useState<RunRecord[]>([]);
   const [incomingCsv, setIncomingCsv] = useState("");
@@ -524,10 +564,22 @@ function App() {
   const [deleteCollapsedW, setDeleteCollapsedW] = useState(false);
   const [exactCollapsedW, setExactCollapsedW] = useState(true);
 
+  // Firewall log stream state
+  const [fwLogs, setFwLogs] = useState<FirewallLogEntry[]>([]);
+  const [fwStreaming, setFwStreaming] = useState(false);
+  const [fwError, setFwError] = useState<string | null>(null);
+  const [fwFilter, setFwFilter] = useState<"all" | "pass" | "block" | "rdr">("all");
+
   const incoming = useMemo(() => parseCsv(incomingCsv), [incomingCsv]);
   const existing = useMemo(() => parseCsv(existingCsv), [existingCsv]);
   const incomingW = useMemo(() => parseCsv(incomingCsvW), [incomingCsvW]);
   const existingW = useMemo(() => parseCsv(existingCsvW), [existingCsvW]);
+
+  const fwLogsFiltered = useMemo(() => {
+    if (fwFilter === "all") return fwLogs;
+    if (fwFilter === "block") return fwLogs.filter((e) => e.action === "block" || e.action === "drop");
+    return fwLogs.filter((e) => e.action === fwFilter);
+  }, [fwLogs, fwFilter]);
 
   const diff = useMemo(() => {
     const exact: ClientRow[] = [];
@@ -841,6 +893,33 @@ function App() {
     if (!credentialsReady) return;
     void handleLoadDynamicLeases();
   }, [leaseView, dynamicBusy, dynamicLeases.length, credentialsReady]);
+
+  // Firewall log stream event listeners
+  useEffect(() => {
+    const unlistenEntry = listen<string>("firewall-log-entry", (event) => {
+      try {
+        const entry = JSON.parse(event.payload) as FirewallLogEntry;
+        if (entry.error) {
+          setFwError(entry.error);
+          setFwStreaming(false);
+          return;
+        }
+        setFwLogs((prev) => {
+          const next = [...prev, entry];
+          return next.length > MAX_FW_LOG_ENTRIES ? next.slice(next.length - MAX_FW_LOG_ENTRIES) : next;
+        });
+      } catch (_) {
+        // ignore parse failures
+      }
+    });
+    const unlistenStopped = listen<void>("firewall-log-stopped", () => {
+      setFwStreaming(false);
+    });
+    return () => {
+      void unlistenEntry.then((fn) => fn());
+      void unlistenStopped.then((fn) => fn());
+    };
+  }, []);
 
   async function handleAutoExportConfirm() {
     if (!autoExportKey) return;
@@ -1317,6 +1396,22 @@ function App() {
       setUpdateStatus(`Update failed: ${error}`);
       setUpdateInstalling(false);
     }
+  }
+
+  async function handleStartFwLog() {
+    setFwError(null);
+    setFwStreaming(true);
+    try {
+      await invoke("start_firewall_log_stream", { settings });
+    } catch (err) {
+      setFwError(String(err));
+      setFwStreaming(false);
+    }
+  }
+
+  function handleStopFwLog() {
+    void invoke("stop_firewall_log_stream");
+    setFwStreaming(false);
   }
 
   async function handleCancelRun() {
@@ -2003,6 +2098,13 @@ function App() {
             >
               Help
             </button>
+            <button
+              type="button"
+              className={activeTab === "firewall" ? "active" : ""}
+              onClick={() => setActiveTab("firewall")}
+            >
+              Firewall
+            </button>
           </div>
 
           {activeTab === "leases" && (
@@ -2323,11 +2425,122 @@ function App() {
               </div>
             </div>
           )}
+
+          {activeTab === "firewall" && (
+            <div className="tab-panel">
+              <h2>Firewall Log</h2>
+              <div className="fw-sidebar-controls">
+                <div className="fw-stream-status">
+                  {fwStreaming && <span className="fw-live-dot" />}
+                  <span>{fwStreaming ? "Live" : "Stopped"}</span>
+                </div>
+                <button
+                  className={fwStreaming ? "secondary" : "primary"}
+                  type="button"
+                  onClick={fwStreaming ? handleStopFwLog : () => void handleStartFwLog()}
+                >
+                  {fwStreaming ? "Stop" : "Start"}
+                </button>
+                <button
+                  className="secondary"
+                  type="button"
+                  onClick={() => setFwLogs([])}
+                >
+                  Clear
+                </button>
+              </div>
+              <div className="fw-filter-tabs">
+                {(["all", "pass", "block", "rdr"] as const).map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    className={fwFilter === f ? "active" : ""}
+                    onClick={() => setFwFilter(f)}
+                  >
+                    {f === "all" ? "All" : f === "pass" ? "Passed" : f === "block" ? "Blocked" : "Redirect"}
+                  </button>
+                ))}
+              </div>
+              <p className="lease-meta">
+                {fwLogsFiltered.length} of {fwLogs.length} entries
+                {fwLogs.length === MAX_FW_LOG_ENTRIES ? " (max — oldest removed)" : ""}
+              </p>
+              {fwError && <p className="error-text">{fwError}</p>}
+            </div>
+          )}
         </aside>
 
         <section className="panel main">
 
-          {leaseView === "dynamic" && (
+          {activeTab === "firewall" && (
+            <div className="card full">
+              <div className="preview-header">
+                <h3>Firewall Log</h3>
+                <span className="lease-meta">
+                  {fwStreaming ? (
+                    <><span className="fw-live-dot" /> Live — {fwLogsFiltered.length} entries</>
+                  ) : (
+                    `${fwLogsFiltered.length} entries · stopped`
+                  )}
+                </span>
+              </div>
+              <div className="fw-table-wrap">
+                <table className="fw-table">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Action</th>
+                      <th>Dir</th>
+                      <th>Iface</th>
+                      <th>Proto</th>
+                      <th>Source</th>
+                      <th>Destination</th>
+                      <th>Rule</th>
+                      <th>#</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {fwLogsFiltered.slice().reverse().map((entry, idx) => (
+                      <tr key={idx} className={fwRowClass(entry.action)}>
+                        <td className="fw-cell-time">{fwFormatTime(entry.__timestamp__)}</td>
+                        <td>
+                          <span className={`fw-badge ${fwBadgeClass(entry.action)}`}>
+                            {entry.action ?? "?"}
+                          </span>
+                        </td>
+                        <td className="fw-cell-dir">
+                          {entry.dir === "in" ? "↓ in" : entry.dir === "out" ? "↑ out" : (entry.dir ?? "?")}
+                        </td>
+                        <td className="fw-cell-iface">{entry.interface ?? "-"}</td>
+                        <td className="fw-cell-proto">{entry.protoname ?? "-"}</td>
+                        <td className="fw-cell-addr">
+                          {entry.src ?? "-"}
+                          {entry.srcport ? <span className="fw-port">:{entry.srcport}</span> : null}
+                        </td>
+                        <td className="fw-cell-addr">
+                          {entry.dst ?? "-"}
+                          {entry.dstport ? <span className="fw-port">:{entry.dstport}</span> : null}
+                        </td>
+                        <td className="fw-cell-label">{entry.label ?? "-"}</td>
+                        <td className="fw-cell-count">{entry.counter ?? "-"}</td>
+                      </tr>
+                    ))}
+                    {fwLogsFiltered.length === 0 && (
+                      <tr>
+                        <td colSpan={9} className="fw-empty">
+                          {fwStreaming
+                            ? "Waiting for log entries..."
+                            : "Press Start in the sidebar to begin streaming firewall log entries."}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {activeTab !== "firewall" && leaseView === "dynamic" && (
             <div className="card full">
               <div className="preview-header">
                 <h3>Dynamic Leases</h3>
@@ -2410,7 +2623,7 @@ function App() {
             </div>
           )}
 
-          {leaseView === "review" && (
+          {activeTab !== "firewall" && leaseView === "review" && (
             <div className="card full">
               <h3>Review</h3>
               <p className="lease-meta">Final check before export or apply.</p>
@@ -2485,7 +2698,7 @@ function App() {
             </div>
           )}
 
-          {leaseView === "runlog" && (
+          {activeTab !== "firewall" && leaseView === "runlog" && (
             <div className="card full logs">
               <h3>Run Log</h3>
               {runError && <p className="error-text">{runError}</p>}
@@ -2493,7 +2706,7 @@ function App() {
             </div>
           )}
 
-          {leaseView === "static" && (
+          {activeTab !== "firewall" && leaseView === "static" && (
             <>
           <div className="card full">
             <div className="preview-header">
@@ -2852,7 +3065,7 @@ function App() {
           </>
           )}
 
-          {leaseView === "staticWlanbyod" && (
+          {activeTab !== "firewall" && leaseView === "staticWlanbyod" && (
             <>
           <div className="card full">
             <div className="preview-header">
