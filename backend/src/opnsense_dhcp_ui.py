@@ -266,6 +266,76 @@ def prompt_credentials() -> tuple[str, str]:
     return username, password
 
 
+def run_firewall_stream() -> int:
+    """
+    Stream /api/diagnostics/firewall/streamLog using a GUI session cookie.
+    Each parsed SSE data line is printed as a JSON object to stdout.
+    Called when TFK_MODE=firewall_stream.
+    """
+    base_url = get_effective_base_url()
+    if not base_url:
+        print(json.dumps({"error": "Base URL not configured"}), flush=True)
+        return 1
+
+    cookie_header = (COOKIE_HEADER or "").strip()
+    msd_cookie = (MSD_COOKIE or "").strip()
+    username = USERNAME
+    password = PASSWORD or os.environ.get("TFK_PASSWORD", "")
+
+    session = OPNsenseApiSession(base_url, debug=DEBUG)
+
+    if cookie_header:
+        # Fast path: inject existing browser cookies directly
+        session._apply_cookie_header(cookie_header)  # noqa: SLF001
+        if msd_cookie:
+            session.session.cookies.set("MSD_Cookie", msd_cookie, path="/")
+    elif username and password:
+        ok = session.authenticate(username, password, cookie_header=cookie_header, msd_cookie=msd_cookie)
+        if not ok:
+            print(json.dumps({"error": "Login failed \u2014 check username/password in Settings"}), flush=True)
+            return 1
+    else:
+        print(
+            json.dumps({"error": "No credentials available. Set username + password or cookie header in Settings."}),
+            flush=True,
+        )
+        return 1
+
+    url = f"{base_url}/api/diagnostics/firewall/streamLog"
+    try:
+        response = session.session.get(
+            url,
+            stream=True,
+            timeout=(30, None),
+            headers={
+                "Accept": "text/event-stream, application/json, */*",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{base_url}/ui/diagnostics/firewall/log",
+            },
+        )
+        response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"error": str(exc)}), flush=True)
+        return 1
+
+    for raw_line in response.iter_lines():
+        if not raw_line:
+            continue
+        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        try:
+            entry = json.loads(payload)
+            print(json.dumps(entry), flush=True)
+        except json.JSONDecodeError:
+            pass
+
+    return 0
+
+
 def prompt_update_mode() -> str:
     env_mode = os.environ.get("TFK_UPDATE_MODE", "").strip().lower()
     if env_mode in {"skip", "update"}:
@@ -1029,6 +1099,12 @@ def main() -> int:
     load_delete_csv_path_from_env()
     load_credentials_from_env()
     iface = os.environ.get("TFK_IFACE", DEFAULT_IFACE)
+
+    # firewall_stream is handled before general auth (uses cookie or password directly,
+    # never blocks on a GUI prompt)
+    mode = os.environ.get("TFK_MODE", "").lower()
+    if mode == "firewall_stream":
+        return run_firewall_stream()
 
     username = USERNAME
     password = PASSWORD

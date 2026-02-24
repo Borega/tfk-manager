@@ -968,19 +968,8 @@ async fn update_static_from_dynamic(
 }
 
 fn resolve_firewall_stream_script(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    // The firewall stream script lives next to opnsense_dhcp_ui.py
-    let main_script = resolve_script_path(app)?;
-    let dir = main_script
-        .parent()
-        .ok_or_else(|| "Cannot resolve backend/src directory".to_string())?;
-    let fw_script = dir.join("fetch_firewall_log_stream.py");
-    if fw_script.exists() {
-        return Ok(fw_script);
-    }
-    Err(format!(
-        "Could not locate fetch_firewall_log_stream.py (expected at {})",
-        fw_script.display()
-    ))
+    // Firewall streaming is now a mode of the main script — no separate file needed.
+    resolve_script_path(app)
 }
 
 #[tauri::command]
@@ -1013,6 +1002,7 @@ async fn start_firewall_log_stream(
         .arg("-u")
         .arg(&script_path)
         .env("TFK_SETTINGS_JSON", &config_path)
+        .env("TFK_MODE", "firewall_stream")
         .env("PYTHONUNBUFFERED", "1");
     if !settings.username.trim().is_empty() {
         command.env("TFK_USERNAME", &settings.username);
