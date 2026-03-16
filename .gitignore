@@ -66,3 +66,15 @@ backend/API_ENDPOINTS.md
 # Recommended Python artifacts
 backend/src/__pycache__/
 backend/src/*.py[cod]
+docs/analysis-mockup.md
+docs/sfp4-findings-handover.md
+
+# Local reverse-engineering captures and web snapshots
+docs/*.html
+scripts/sfp4*.js
+
+# Local secret/env files
+.env
+.env.*
+*.pem
+*.key
