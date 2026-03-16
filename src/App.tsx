@@ -1,10 +1,23 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
+import { parseWebfilterStatus, type WebfilterStatusResult } from "./webfilterStatus";
+import { toWebfilterDynamicEnvelope } from "./webfilterDynamicProtocol";
+import {
+  applyPollJitterMs,
+  formatRetryWaitSeconds,
+  getWebfilterPollIntervalMs,
+  isRetryReady,
+  nextRetryDelayMs,
+  SOURCE_POLL_MS,
+  SOURCE_STALE_MS,
+  type SourcePolicyKey,
+} from "./sourcePollingPolicy";
+import { searchTopic, type TopicNode } from "./topicSearch";
 import "./App.css";
 
 type ClientRow = {
@@ -25,6 +38,7 @@ type SettingsState = {
   pythonPath: string;
   dryRun: boolean;
   debug: boolean;
+  msdUsername: string;
 };
 
 type ParseResult = {
@@ -96,6 +110,259 @@ type FirewallLogEntry = {
   error?: string;
 };
 
+type WfLogEntry = {
+  action: string;
+  user: string;
+  ip: string;
+  time: string;
+  url: string;
+  category: string;
+};
+
+type AnalysisDeviceRow = {
+  ip: string;
+  hostname: string;
+  mac: string;
+  user: string;
+  segment: "Static Gruen" | "Static BYOD" | "Dynamic Gruen" | "Dynamic BYOD" | "Unknown";
+  isStatic: boolean;
+  isDynamic: boolean;
+  fwPass: number;
+  fwBlock: number;
+  wfAllow: number;
+  wfBlock: number;
+  hasDualBlock: boolean;
+  riskScore: number;
+  identityConfidence: "high" | "medium" | "low";
+  lastSeen: string;
+};
+
+type AnalysisTopItem = {
+  label: string;
+  count: number;
+};
+
+type AnalysisSegmentSummary = {
+  segment: AnalysisDeviceRow["segment"];
+  knownDevices: number;
+  activeDevices: number;
+  fwBlock: number;
+  wfBlock: number;
+  dualBlockDevices: number;
+  avgRisk: number;
+};
+
+type AnalysisFinding = {
+  severity: "high" | "medium" | "low";
+  title: string;
+  detail: string;
+};
+
+type AnalysisCategoryNode = TopicNode;
+
+type AnalysisDeviceDetail = {
+  row: AnalysisDeviceRow;
+  staticLease: ClientRow | null;
+  dynamicLease: DynamicLease | null;
+  webfilterEvents: WfLogEntry[];
+  firewallEvents: FirewallLogEntry[];
+};
+
+type SourceHealthKey = SourcePolicyKey;
+
+type SourceHealthStatus = "idle" | "healthy" | "stale" | "error";
+
+type SourceHealthEntry = {
+  lastSuccessIso: string | null;
+  lastError: string | null;
+  lastErrorIso: string | null;
+};
+
+type SourceHealthView = {
+  key: SourceHealthKey;
+  status: SourceHealthStatus;
+  label: string;
+  lastSuccessLabel: string;
+  detail: string;
+};
+
+type SourceRetryEntry = {
+  attempt: number;
+  nextRetryAtIso: string | null;
+};
+
+type WebfilterLogsInvokeResult = {
+  ok: boolean;
+  entries?: WfLogEntry[];
+  error?: string;
+  diag?: string;
+  source?: string;
+  actions?: Array<{ type?: string; filter?: string; enabled?: boolean; delayMs?: number }>;
+  warnings?: Array<{ code?: string; message?: string }>;
+  timer?: number;
+  parameter?: {
+    autoRefresh?: boolean;
+    filter?: string;
+  };
+};
+
+type WebfilterFetchResult = {
+  ok: boolean;
+  status: WebfilterStatusResult;
+};
+
+type WfAddressListType = "wl" | "bl";
+
+type WfAddressListEntry = {
+  id: string;
+  name: string;
+};
+
+type WebfilterAddressListsInvokeResult = {
+  ok: boolean;
+  whitelistEntries?: WfAddressListEntry[];
+  blacklistEntries?: WfAddressListEntry[];
+  whitelistTotal?: number;
+  blacklistTotal?: number;
+  error?: string;
+  diag?: string;
+};
+
+type WebfilterAddressListWriteInvokeResult = {
+  ok: boolean;
+  message?: string;
+  error?: string;
+  diag?: string;
+  meta?: string;
+  exportContent?: string;
+  exportFilename?: string;
+  importedLines?: number;
+  warnings?: string[];
+};
+
+const SOURCE_LABELS: Record<SourceHealthKey, string> = {
+  leases: "Leases (81)",
+  "webfilter-ui": "Webfilter UI (80/1920)",
+  "firewall-stream": "Firewall stream (81)",
+};
+
+const INITIAL_SOURCE_HEALTH: Record<SourceHealthKey, SourceHealthEntry> = {
+  leases: { lastSuccessIso: null, lastError: null, lastErrorIso: null },
+  "webfilter-ui": { lastSuccessIso: null, lastError: null, lastErrorIso: null },
+  "firewall-stream": { lastSuccessIso: null, lastError: null, lastErrorIso: null },
+};
+
+const WEBFILTER_FAST_POLL_ERROR_COOLDOWN_MS = 60_000;
+
+const INITIAL_SOURCE_RETRY: Record<SourceHealthKey, SourceRetryEntry> = {
+  leases: { attempt: 0, nextRetryAtIso: null },
+  "webfilter-ui": { attempt: 0, nextRetryAtIso: null },
+  "firewall-stream": { attempt: 0, nextRetryAtIso: null },
+};
+
+function formatHealthTime(value: string | null): string {
+  if (!value) return "never";
+  const ts = Date.parse(value);
+  if (Number.isNaN(ts)) return "unknown";
+  return new Date(ts).toLocaleTimeString();
+}
+
+function toSourceHealthView(
+  key: SourceHealthKey,
+  entry: SourceHealthEntry,
+  retry: SourceRetryEntry,
+  nowMillis: number,
+): SourceHealthView {
+  const label = SOURCE_LABELS[key];
+  const lastSuccessLabel = formatHealthTime(entry.lastSuccessIso);
+  const lastSuccessMillis = entry.lastSuccessIso ? Date.parse(entry.lastSuccessIso) : Number.NaN;
+  const hasSuccess = Number.isFinite(lastSuccessMillis);
+  const isStale = hasSuccess && nowMillis - lastSuccessMillis > SOURCE_STALE_MS[key];
+  const isError = Boolean(entry.lastError);
+  const waitSeconds = formatRetryWaitSeconds(retry.nextRetryAtIso, nowMillis);
+  const retrySuffix = waitSeconds > 0 ? ` Retry in ~${waitSeconds}s.` : "";
+
+  if (isError) {
+    return {
+      key,
+      status: "error",
+      label,
+      lastSuccessLabel,
+      detail: `${entry.lastError ?? "Source error"}${retrySuffix}`,
+    };
+  }
+  if (!hasSuccess) {
+    return {
+      key,
+      status: "idle",
+      label,
+      lastSuccessLabel,
+      detail: "No successful refresh yet",
+    };
+  }
+  if (isStale) {
+    return {
+      key,
+      status: "stale",
+      label,
+      lastSuccessLabel,
+      detail: "Data is stale",
+    };
+  }
+  return {
+    key,
+    status: "healthy",
+    label,
+    lastSuccessLabel,
+    detail: "Healthy",
+  };
+}
+
+function isPrivateIpv4(ip: string): boolean {
+  if (!ip) return false;
+  if (ip.startsWith("10.")) return true;
+  if (ip.startsWith("192.168.")) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(ip)) return true;
+  return false;
+}
+
+function toTimeMillis(value: string): number {
+  if (!value) return 0;
+  const ts = Date.parse(value);
+  return Number.isNaN(ts) ? 0 : ts;
+}
+
+function classifyDynamicSegment(iface: string): "Dynamic Gruen" | "Dynamic BYOD" {
+  const value = iface.trim().toLowerCase();
+  if (value.includes("byod") || value.includes("wlan") || value.includes("opt4")) {
+    return "Dynamic BYOD";
+  }
+  return "Dynamic Gruen";
+}
+
+function clampRisk(value: number): number {
+  if (value < 0) return 0;
+  if (value > 100) return 100;
+  return Math.round(value);
+}
+
+function isGatewayRouterIp(ipRaw: string): boolean {
+  const ip = ipRaw.trim();
+  const match = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!match) return false;
+  const octets = match.slice(1).map((value) => Number(value));
+  if (octets.some((value) => Number.isNaN(value) || value < 0 || value > 255)) return false;
+  return octets[3] === 1;
+}
+
+function normalizeWebfilterUser(userRaw: string): string {
+  const user = userRaw.trim();
+  if (!user) return "";
+  // LBOX-* identities represent the filter appliance itself, not an end user.
+  if (/^LBOX-[A-Z0-9-]+$/i.test(user)) return "";
+  return user;
+}
+
 const MAX_FW_LOG_ENTRIES = 500;
 
 const DEFAULT_SETTINGS: SettingsState = {
@@ -110,6 +377,7 @@ const DEFAULT_SETTINGS: SettingsState = {
   pythonPath: "python",
   dryRun: false,
   debug: false,
+  msdUsername: "",
 };
 
 function normalizeBaseUrl(baseUrl: string): string {
@@ -497,7 +765,7 @@ function fwRowClass(action?: string): string {
 
 function App() {
   const UPDATE_MODE: RunPayload["updateMode"] = "update";
-  const [activeTab, setActiveTab] = useState<"leases" | "settings" | "history" | "help" | "firewall">("leases");
+  const [activeTab, setActiveTab] = useState<"leases" | "settings" | "history" | "help" | "firewall" | "webfilter" | "analysis">("leases");
   const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS);
   const [history, setHistory] = useState<RunRecord[]>([]);
   const [incomingCsv, setIncomingCsv] = useState("");
@@ -509,6 +777,8 @@ function App() {
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [passwordInput, setPasswordInput] = useState("");
   const [hasPassword, setHasPassword] = useState(false);
+  const [msdPasswordInput, setMsdPasswordInput] = useState("");
+  const [hasMsdPassword, setHasMsdPassword] = useState(false);
   const [helpLogs, setHelpLogs] = useState<string[]>([]);
   const [helpBusy, setHelpBusy] = useState(false);
   const [excludedAddKeys, setExcludedAddKeys] = useState<Set<string>>(new Set());
@@ -580,6 +850,506 @@ function App() {
     if (fwFilter === "block") return fwLogs.filter((e) => e.action === "block" || e.action === "drop");
     return fwLogs.filter((e) => e.action === fwFilter);
   }, [fwLogs, fwFilter]);
+
+  const [wfLogs, setWfLogs] = useState<WfLogEntry[]>([]);
+  const [wfLogsBusy, setWfLogsBusy] = useState(false);
+  const [wfLogsError, setWfLogsError] = useState<string | null>(null);
+  const [wfLogFilter, setWfLogFilter] = useState<"all" | "allow" | "block">("all");
+  const [wfView, setWfView] = useState<"logs" | "address-lists">("logs");
+  const [wfAutoRefresh, setWfAutoRefresh] = useState(false);
+  const [wfLastRefresh, setWfLastRefresh] = useState<string | null>(null);
+  const [wfDiag, setWfDiag] = useState<string | null>(null);
+  const [wfProtocolWarnings, setWfProtocolWarnings] = useState<string[]>([]);
+  const [wfAddressListType, setWfAddressListType] = useState<WfAddressListType>("wl");
+  const [wfWhitelistEntries, setWfWhitelistEntries] = useState<WfAddressListEntry[]>([]);
+  const [wfBlacklistEntries, setWfBlacklistEntries] = useState<WfAddressListEntry[]>([]);
+  const [wfWhitelistTotal, setWfWhitelistTotal] = useState(0);
+  const [wfBlacklistTotal, setWfBlacklistTotal] = useState(0);
+  const [wfAddressBusy, setWfAddressBusy] = useState(false);
+  const [wfAddressActionBusy, setWfAddressActionBusy] = useState(false);
+  const [wfAddressError, setWfAddressError] = useState<string | null>(null);
+  const [wfAddressSearch, setWfAddressSearch] = useState("");
+  const [wfAddressNewValue, setWfAddressNewValue] = useState("");
+  const [wfAddressImportText, setWfAddressImportText] = useState("");
+  const [wfAddressEditId, setWfAddressEditId] = useState<string | null>(null);
+  const [wfAddressEditOriginalName, setWfAddressEditOriginalName] = useState("");
+  const [wfAddressEditValue, setWfAddressEditValue] = useState("");
+  const [wfAddressSelectedIds, setWfAddressSelectedIds] = useState<Set<string>>(new Set());
+  const [sourceHealth, setSourceHealth] = useState<Record<SourceHealthKey, SourceHealthEntry>>(INITIAL_SOURCE_HEALTH);
+  const [sourceRetry, setSourceRetry] = useState<Record<SourceHealthKey, SourceRetryEntry>>(INITIAL_SOURCE_RETRY);
+  const [healthTick, setHealthTick] = useState(0);
+  const [topicSearchPattern, setTopicSearchPattern] = useState("");
+  const [selectedRiskDeviceIps, setSelectedRiskDeviceIps] = useState<Set<string>>(new Set());
+  const [selectedAnalysisDeviceIp, setSelectedAnalysisDeviceIp] = useState<string | null>(null);
+  const wfScheduledRefetchRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (wfScheduledRefetchRef.current !== null) {
+        window.clearTimeout(wfScheduledRefetchRef.current);
+        wfScheduledRefetchRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setHealthTick((prev) => prev + 1);
+    }, 15_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    setWfAddressSelectedIds(new Set());
+    setWfAddressEditId(null);
+    setWfAddressEditOriginalName("");
+    setWfAddressEditValue("");
+  }, [wfAddressListType]);
+
+  function markSourceSuccess(key: SourceHealthKey) {
+    setSourceHealth((prev) => ({
+      ...prev,
+      [key]: {
+        lastSuccessIso: new Date().toISOString(),
+        lastError: null,
+      },
+    }));
+    setSourceRetry((prev) => ({
+      ...prev,
+      [key]: {
+        attempt: 0,
+        nextRetryAtIso: null,
+      },
+    }));
+  }
+
+  function markSourceError(key: SourceHealthKey, error: string) {
+    setSourceHealth((prev) => ({
+      ...prev,
+      [key]: {
+        ...prev[key],
+        lastError: error.trim() || "Unknown error",
+        lastErrorIso: new Date().toISOString(),
+      },
+    }));
+  }
+
+  function scheduleSourceRetry(key: SourceHealthKey) {
+    setSourceRetry((prev) => {
+      const delayMs = nextRetryDelayMs(key, prev[key].attempt);
+      return {
+        ...prev,
+        [key]: {
+          attempt: prev[key].attempt + 1,
+          nextRetryAtIso: new Date(Date.now() + delayMs).toISOString(),
+        },
+      };
+    });
+  }
+
+  function canRunSourceNow(key: SourceHealthKey): boolean {
+    return isRetryReady(sourceRetry[key].nextRetryAtIso, Date.now());
+  }
+
+  const sourceHealthViews = useMemo(() => {
+    const nowMillis = Date.now();
+    return (Object.keys(sourceHealth) as SourceHealthKey[]).map((key) =>
+      toSourceHealthView(key, sourceHealth[key], sourceRetry[key], nowMillis));
+  }, [sourceHealth, sourceRetry, healthTick]);
+
+  const wfLogsFiltered = useMemo(() => {
+    if (wfLogFilter === "all") return wfLogs;
+    return wfLogs.filter((e) => e.action.toLowerCase() === wfLogFilter);
+  }, [wfLogs, wfLogFilter]);
+
+  const wfAddressEntries = useMemo(
+    () => (wfAddressListType === "wl" ? wfWhitelistEntries : wfBlacklistEntries),
+    [wfAddressListType, wfWhitelistEntries, wfBlacklistEntries],
+  );
+
+  const wfAddressEntriesFiltered = useMemo(() => {
+    const needle = wfAddressSearch.trim().toLowerCase();
+    if (!needle) return wfAddressEntries;
+    return wfAddressEntries.filter((entry) => entry.name.toLowerCase().includes(needle));
+  }, [wfAddressEntries, wfAddressSearch]);
+
+  const wfAddressTotal = wfAddressListType === "wl" ? wfWhitelistTotal : wfBlacklistTotal;
+
+  const wfSelectedCount = useMemo(
+    () => wfAddressEntries.reduce((sum, entry) => sum + (wfAddressSelectedIds.has(entry.id) ? 1 : 0), 0),
+    [wfAddressEntries, wfAddressSelectedIds],
+  );
+
+  const analysis = useMemo(() => {
+    const byIp = new Map<string, AnalysisDeviceRow>();
+    const knownIps = new Set<string>();
+    const segmentKnownIps = new Map<AnalysisDeviceRow["segment"], Set<string>>([
+      ["Static Gruen", new Set<string>()],
+      ["Static BYOD", new Set<string>()],
+      ["Dynamic Gruen", new Set<string>()],
+      ["Dynamic BYOD", new Set<string>()],
+      ["Unknown", new Set<string>()],
+    ]);
+    const userToIps = new Map<string, Set<string>>();
+
+    const ensure = (ipRaw: string): AnalysisDeviceRow | null => {
+      const ip = ipRaw.trim();
+      if (!ip) return null;
+      const existingRow = byIp.get(ip);
+      if (existingRow) return existingRow;
+      const row: AnalysisDeviceRow = {
+        ip,
+        hostname: isGatewayRouterIp(ip) ? "TFK-Router" : "",
+        mac: "",
+        user: "",
+        segment: "Unknown",
+        isStatic: false,
+        isDynamic: false,
+        fwPass: 0,
+        fwBlock: 0,
+        wfAllow: 0,
+        wfBlock: 0,
+        hasDualBlock: false,
+        riskScore: 0,
+        identityConfidence: "low",
+        lastSeen: "",
+      };
+      byIp.set(ip, row);
+      return row;
+    };
+
+    const markSeen = (row: AnalysisDeviceRow, seenValue: string) => {
+      if (!seenValue) return;
+      if (!row.lastSeen || toTimeMillis(seenValue) >= toTimeMillis(row.lastSeen)) {
+        row.lastSeen = seenValue;
+      }
+    };
+
+    for (const lease of [...existing.rows, ...existingW.rows]) {
+      const row = ensure(lease.ip);
+      if (!row) continue;
+      row.isStatic = true;
+      row.segment = existingW.rows.includes(lease) ? "Static BYOD" : "Static Gruen";
+      if (!row.hostname && lease.name) row.hostname = lease.name;
+      if (!row.mac && lease.mac) row.mac = lease.mac;
+      if (isGatewayRouterIp(row.ip)) row.hostname = "TFK-Router";
+      knownIps.add(row.ip);
+      const segmentSet = segmentKnownIps.get(row.segment);
+      if (segmentSet) segmentSet.add(row.ip);
+    }
+
+    for (const lease of dynamicLeases) {
+      const row = ensure(lease.ip);
+      if (!row) continue;
+      row.isDynamic = true;
+      if (!row.isStatic) {
+        row.segment = classifyDynamicSegment(lease.iface);
+      }
+      if (!row.hostname && lease.hostname) row.hostname = lease.hostname;
+      if (!row.mac && lease.mac) row.mac = lease.mac;
+      if (isGatewayRouterIp(row.ip)) row.hostname = "TFK-Router";
+      knownIps.add(row.ip);
+      const segmentSet = segmentKnownIps.get(row.segment);
+      if (segmentSet) segmentSet.add(row.ip);
+      markSeen(row, lease.end || lease.start);
+    }
+
+    const blockedCategoryMap = new Map<string, number>();
+    const blockedHostMap = new Map<string, number>();
+    const blockedUsers = new Map<string, number>();
+    const categoryHostMap = new Map<string, Map<string, number>>();
+
+    for (const wf of wfLogs) {
+      const row = ensure(wf.ip);
+      if (!row) continue;
+      knownIps.add(row.ip);
+      const action = wf.action.toLowerCase();
+      if (action === "block") {
+        row.wfBlock += 1;
+      } else if (action === "allow") {
+        row.wfAllow += 1;
+      }
+      const normalizedUser = normalizeWebfilterUser(wf.user);
+      if (!row.user && normalizedUser) row.user = normalizedUser;
+      if (normalizedUser) {
+        const key = normalizedUser;
+        const ips = userToIps.get(key) ?? new Set<string>();
+        ips.add(row.ip);
+        userToIps.set(key, ips);
+        if (action === "block") {
+          blockedUsers.set(key, (blockedUsers.get(key) ?? 0) + 1);
+        }
+      }
+      markSeen(row, wf.time);
+
+      if (action === "block") {
+        const cat = wf.category?.trim() || "unknown";
+        blockedCategoryMap.set(cat, (blockedCategoryMap.get(cat) ?? 0) + 1);
+        let host = "unknown";
+        try {
+          host = new URL(wf.url).hostname || "unknown";
+        } catch {
+          host = (wf.url || "").split("/")[0] || "unknown";
+        }
+        blockedHostMap.set(host, (blockedHostMap.get(host) ?? 0) + 1);
+        const hostByCategory = categoryHostMap.get(cat) ?? new Map<string, number>();
+        hostByCategory.set(host, (hostByCategory.get(host) ?? 0) + 1);
+        categoryHostMap.set(cat, hostByCategory);
+      }
+    }
+
+    const unknownFirewallIps = new Map<string, { pass: number; block: number }>();
+    for (const fw of fwLogs) {
+      const action = (fw.action || "").toLowerCase();
+      const isPass = action === "pass";
+      const isBlock = action === "block" || action === "drop";
+      const candidates = Array.from(new Set([fw.src?.trim() ?? "", fw.dst?.trim() ?? ""]))
+        .filter((ip) => ip.length > 0);
+      for (const ip of candidates) {
+        if (knownIps.has(ip)) {
+          const row = ensure(ip);
+          if (!row) continue;
+          if (isPass) row.fwPass += 1;
+          if (isBlock) row.fwBlock += 1;
+          markSeen(row, fw.__timestamp__ || "");
+          continue;
+        }
+        if (!isPrivateIpv4(ip)) continue;
+        const agg = unknownFirewallIps.get(ip) ?? { pass: 0, block: 0 };
+        if (isPass) agg.pass += 1;
+        if (isBlock) agg.block += 1;
+        unknownFirewallIps.set(ip, agg);
+      }
+    }
+
+    const rows = Array.from(byIp.values())
+      .map((row) => {
+        row.hasDualBlock = row.fwBlock > 0 && row.wfBlock > 0;
+        const hasWebActivity = row.wfAllow + row.wfBlock > 0;
+        const hasIdentity = Boolean(row.mac.trim() || row.hostname.trim() || row.user.trim());
+        if (row.isStatic && row.mac.trim() && row.hostname.trim()) {
+          row.identityConfidence = "high";
+        } else if (hasIdentity) {
+          row.identityConfidence = "medium";
+        } else {
+          row.identityConfidence = "low";
+        }
+
+        let risk = row.fwBlock * 6 + row.wfBlock * 4;
+        if (row.hasDualBlock) risk += 8;
+        if (row.segment === "Unknown") risk += 8;
+        if (hasWebActivity && !row.user.trim()) risk += 3;
+        if (row.identityConfidence === "low" && (row.fwBlock > 0 || row.wfBlock > 0)) risk += 2;
+        row.riskScore = clampRisk(risk);
+        return row;
+      })
+      .filter((r) => r.fwPass + r.fwBlock + r.wfAllow + r.wfBlock > 0)
+      .sort((a, b) => {
+        const scoreA = a.riskScore * 10 + a.fwBlock * 3 + a.wfBlock * 2 + a.fwPass + a.wfAllow;
+        const scoreB = b.riskScore * 10 + b.fwBlock * 3 + b.wfBlock * 2 + b.fwPass + b.wfAllow;
+        return scoreB - scoreA;
+      });
+
+    const topBlockedCategories: AnalysisTopItem[] = Array.from(blockedCategoryMap.entries())
+      .map(([label, count]) => ({ label, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8);
+
+    const topBlockedHosts: AnalysisTopItem[] = Array.from(blockedHostMap.entries())
+      .map(([label, count]) => ({ label, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8);
+
+    const unknownActiveIps = Array.from(unknownFirewallIps.entries())
+      .map(([ip, counts]) => ({ ip, ...counts }))
+      .sort((a, b) => b.block + b.pass - (a.block + a.pass))
+      .slice(0, 12);
+
+    const correlatedBlocks = rows.filter((row) => row.fwBlock > 0 && row.wfBlock > 0).length;
+    const highRiskCount = rows.filter((row) => row.riskScore >= 50).length;
+    const fwOnlyBlocked = rows.filter((row) => row.fwBlock > 0 && row.wfBlock === 0).length;
+    const wfOnlyBlocked = rows.filter((row) => row.wfBlock > 0 && row.fwBlock === 0).length;
+
+    const segments: AnalysisDeviceRow["segment"][] = [
+      "Static Gruen",
+      "Static BYOD",
+      "Dynamic Gruen",
+      "Dynamic BYOD",
+      "Unknown",
+    ];
+
+    const segmentSummary: AnalysisSegmentSummary[] = segments.map((segment) => {
+      const active = rows.filter((row) => row.segment === segment);
+      const known = segmentKnownIps.get(segment) ?? new Set<string>();
+      const fwBlock = active.reduce((sum, row) => sum + row.fwBlock, 0);
+      const wfBlock = active.reduce((sum, row) => sum + row.wfBlock, 0);
+      const dual = active.filter((row) => row.hasDualBlock).length;
+      const avgRisk = active.length > 0
+        ? Math.round(active.reduce((sum, row) => sum + row.riskScore, 0) / active.length)
+        : 0;
+      return {
+        segment,
+        knownDevices: known.size,
+        activeDevices: active.length,
+        fwBlock,
+        wfBlock,
+        dualBlockDevices: dual,
+        avgRisk,
+      };
+    });
+
+    const riskyDevices = rows.slice(0, 15);
+
+    const findings: AnalysisFinding[] = [];
+    const topUnknown = unknownActiveIps[0];
+    if (topUnknown && topUnknown.block >= 5) {
+      findings.push({
+        severity: topUnknown.block >= 20 ? "high" : "medium",
+        title: "Unknown private IP with repeated firewall blocks",
+        detail: `${topUnknown.ip} triggered ${topUnknown.block} blocked firewall events.`,
+      });
+    }
+
+    const multiIpUsers = Array.from(userToIps.entries())
+      .filter(([, ips]) => ips.size >= 3)
+      .sort((a, b) => b[1].size - a[1].size);
+    if (multiIpUsers.length > 0) {
+      const [user, ips] = multiIpUsers[0];
+      findings.push({
+        severity: ips.size >= 5 ? "high" : "medium",
+        title: "Single user seen on multiple IPs",
+        detail: `${user} appeared on ${ips.size} distinct IPs in webfilter activity.`,
+      });
+    }
+
+    if (correlatedBlocks > 0) {
+      findings.push({
+        severity: correlatedBlocks >= 5 ? "high" : "medium",
+        title: "Dual-layer blocking detected",
+        detail: `${correlatedBlocks} devices were blocked by both firewall and webfilter.`,
+      });
+    }
+
+    const staleStatic = (segmentKnownIps.get("Static Gruen")?.size ?? 0) + (segmentKnownIps.get("Static BYOD")?.size ?? 0)
+      - rows.filter((row) => row.segment === "Static Gruen" || row.segment === "Static BYOD").length;
+    if (staleStatic > 0) {
+      findings.push({
+        severity: "low",
+        title: "Static devices without observed activity",
+        detail: `${staleStatic} static lease entries are currently inactive in correlated logs.`,
+      });
+    }
+
+    const topBlockedUsers: AnalysisTopItem[] = Array.from(blockedUsers.entries())
+      .map(([label, count]) => ({ label, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8);
+
+    const categoryNodes: AnalysisCategoryNode[] = Array.from(categoryHostMap.entries())
+      .map(([name, hosts]) => {
+        const topHosts = Array.from(hosts.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([host]) => host);
+        const count = Array.from(hosts.values()).reduce((sum, value) => sum + value, 0);
+        return {
+          id: `cat-${name}`,
+          name,
+          description: topHosts.length > 0 ? `Hosts: ${topHosts.join(", ")}` : "Hosts: unknown",
+          count,
+        };
+      })
+      .sort((a, b) => b.count - a.count);
+
+    return {
+      rows,
+      riskyDevices,
+      topBlockedCategories,
+      topBlockedHosts,
+      topBlockedUsers,
+      categoryNodes,
+      unknownActiveIps,
+      segmentSummary,
+      findings,
+      correlatedBlocks,
+      highRiskCount,
+      fwOnlyBlocked,
+      wfOnlyBlocked,
+      knownDeviceCount: byIp.size,
+    };
+  }, [existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
+
+  const filteredCategoryNodes = useMemo(() => {
+    return searchTopic(topicSearchPattern, analysis.categoryNodes).slice(0, 15);
+  }, [topicSearchPattern, analysis.categoryNodes]);
+
+  const selectedAnalysisDeviceDetail = useMemo<AnalysisDeviceDetail | null>(() => {
+    if (!selectedAnalysisDeviceIp) return null;
+    const row = analysis.rows.find((item) => item.ip === selectedAnalysisDeviceIp);
+    if (!row) return null;
+
+    const staticLease = [...existing.rows, ...existingW.rows].find((lease) => lease.ip === row.ip) ?? null;
+    const dynamicLease = dynamicLeases.find(
+      (lease) => lease.ip === row.ip || (row.mac.trim() && lease.mac.toLowerCase() === row.mac.toLowerCase()),
+    ) ?? null;
+
+    const webfilterEvents = wfLogs
+      .filter((event) => event.ip === row.ip)
+      .sort((a, b) => toTimeMillis(b.time) - toTimeMillis(a.time))
+      .slice(0, 60);
+
+    const firewallEvents = fwLogs
+      .filter((event) => (event.src ?? "").trim() === row.ip || (event.dst ?? "").trim() === row.ip)
+      .sort((a, b) => toTimeMillis(b.__timestamp__ ?? "") - toTimeMillis(a.__timestamp__ ?? ""))
+      .slice(0, 80);
+
+    return {
+      row,
+      staticLease,
+      dynamicLease,
+      webfilterEvents,
+      firewallEvents,
+    };
+  }, [selectedAnalysisDeviceIp, analysis.rows, existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
+
+  const allRiskDeviceIps = analysis.riskyDevices.map((row) => row.ip);
+
+  const allRiskDevicesSelected = allRiskDeviceIps.length > 0
+    && allRiskDeviceIps.every((ip) => selectedRiskDeviceIps.has(ip));
+
+  useEffect(() => {
+    setSelectedRiskDeviceIps((prev) => {
+      const allowed = new Set(allRiskDeviceIps);
+      const next = new Set<string>();
+      prev.forEach((ip) => {
+        if (allowed.has(ip)) next.add(ip);
+      });
+      return next;
+    });
+  }, [allRiskDeviceIps.join("|")]);
+
+  function toggleAllRiskDevices() {
+    if (allRiskDeviceIps.length === 0) return;
+    if (allRiskDevicesSelected) {
+      setSelectedRiskDeviceIps(new Set());
+      return;
+    }
+    setSelectedRiskDeviceIps(new Set(allRiskDeviceIps));
+  }
+
+  function toggleRiskDevice(ip: string) {
+    setSelectedRiskDeviceIps((prev) => {
+      const next = new Set(prev);
+      if (next.has(ip)) {
+        next.delete(ip);
+      } else {
+        next.add(ip);
+      }
+      return next;
+    });
+  }
+
+  const showLeaseViews = activeTab !== "firewall" && activeTab !== "webfilter" && activeTab !== "analysis";
 
   const diff = useMemo(() => {
     const exact: ClientRow[] = [];
@@ -857,6 +1627,10 @@ function App() {
       .then((value) => setHasPassword(value))
       .catch(() => setHasPassword(false));
 
+    invoke<boolean>("has_msd_password")
+      .then((value) => setHasMsdPassword(value))
+      .catch(() => setHasMsdPassword(false));
+
     return () => {
       active = false;
       if (unlisten) unlisten();
@@ -901,9 +1675,11 @@ function App() {
         const entry = JSON.parse(event.payload) as FirewallLogEntry;
         if (entry.error) {
           setFwError(entry.error);
+          markSourceError("firewall-stream", entry.error);
           setFwStreaming(false);
           return;
         }
+        markSourceSuccess("firewall-stream");
         setFwLogs((prev) => {
           const next = [...prev, entry];
           return next.length > MAX_FW_LOG_ENTRIES ? next.slice(next.length - MAX_FW_LOG_ENTRIES) : next;
@@ -920,6 +1696,126 @@ function App() {
       void unlistenStopped.then((fn) => fn());
     };
   }, []);
+
+  // Auto-fetch webfilter logs when switching to the tab (if no data yet)
+  useEffect(() => {
+    if (activeTab !== "webfilter") return;
+    if (wfLogs.length > 0) return;
+    if (!settings.msdUsername.trim() || !hasMsdPassword) return;
+    void handleFetchWfLogs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== "webfilter") return;
+    if (wfView !== "address-lists") return;
+    if (!settings.msdUsername.trim() || !hasMsdPassword) return;
+    if (wfWhitelistEntries.length > 0 || wfBlacklistEntries.length > 0) return;
+    void handleFetchWfAddressLists();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, wfView]);
+
+  // Auto-refresh webfilter logs with adaptive near-stream pacing.
+  useEffect(() => {
+    if (!wfAutoRefresh) return;
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const scheduleNext = () => {
+      if (cancelled) return;
+      const isInteractiveView = activeTab === "webfilter" || activeTab === "analysis";
+      const isDocumentVisible = typeof document === "undefined" || document.visibilityState === "visible";
+      const webfilterHealth = sourceHealth["webfilter-ui"];
+      const lastErrorMs = webfilterHealth.lastErrorIso ? Date.parse(webfilterHealth.lastErrorIso) : Number.NaN;
+      const hasCooldownError = Number.isFinite(lastErrorMs)
+        && Date.now() - lastErrorMs <= WEBFILTER_FAST_POLL_ERROR_COOLDOWN_MS;
+      const hasRecentError = Boolean(webfilterHealth.lastError)
+        || hasCooldownError
+        || sourceRetry["webfilter-ui"].attempt > 0;
+      const baseMs = getWebfilterPollIntervalMs({
+        isInteractiveView,
+        isDocumentVisible,
+        hasRecentError,
+      });
+      const delayMs = applyPollJitterMs(baseMs);
+
+      timeoutId = window.setTimeout(async () => {
+        if (cancelled) return;
+        if (!canRunSourceNow("webfilter-ui")) {
+          scheduleNext();
+          return;
+        }
+        if (!settings.msdUsername.trim() || !hasMsdPassword) {
+          scheduleNext();
+          return;
+        }
+        await handleFetchWfLogs();
+        scheduleNext();
+      }, delayMs);
+    };
+
+    scheduleNext();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wfAutoRefresh, activeTab, sourceRetry]);
+
+  // Bootstrap analysis dependencies when the tab becomes active.
+  useEffect(() => {
+    if (activeTab !== "analysis") return;
+
+    void refreshLeasesSilently();
+
+    if (!wfAutoRefresh) {
+      setWfAutoRefresh(true);
+    }
+
+    if (settings.msdUsername.trim() && hasMsdPassword) {
+      if (!canRunSourceNow("webfilter-ui")) return;
+      void handleFetchWfLogs();
+    }
+
+    if (!fwStreaming && canRunSourceNow("firewall-stream")) {
+      void handleStartFwLog();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  // Keep lease data fresh while analysis is open.
+  useEffect(() => {
+    if (activeTab !== "analysis") return;
+    if (!credentialsReady) return;
+    const id = window.setInterval(() => {
+      if (!canRunSourceNow("leases")) return;
+      void refreshLeasesSilently();
+    }, SOURCE_POLL_MS.leases);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, credentialsReady, sourceRetry]);
+
+  // Stream watchdog with fallback restart and retry/backoff.
+  useEffect(() => {
+    if (!fwStreaming) return;
+    if (activeTab !== "analysis" && activeTab !== "firewall") return;
+    const id = window.setInterval(() => {
+      const lastSuccessIso = sourceHealth["firewall-stream"].lastSuccessIso;
+      if (!lastSuccessIso) return;
+      const lastSuccess = Date.parse(lastSuccessIso);
+      if (Number.isNaN(lastSuccess)) return;
+      const isStale = Date.now() - lastSuccess > SOURCE_STALE_MS["firewall-stream"];
+      if (!isStale) return;
+      if (!canRunSourceNow("firewall-stream")) return;
+      setLogs((prev) => [...prev, "Firewall stream stale. Attempting fallback restart..."]);
+      void handleStartFwLog();
+    }, SOURCE_POLL_MS["firewall-stream"]);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fwStreaming, activeTab, sourceHealth, sourceRetry]);
 
   async function handleAutoExportConfirm() {
     if (!autoExportKey) return;
@@ -990,10 +1886,13 @@ function App() {
         await invoke("save_password", { password: passwordInput });
         setPasswordInput("");
         setHasPassword(true);
-        setLogs(["Settings and password saved."]);
-      } else {
-        setLogs(["Settings saved."]);
       }
+      if (msdPasswordInput.trim().length > 0) {
+        await invoke("save_msd_password", { password: msdPasswordInput });
+        setMsdPasswordInput("");
+        setHasMsdPassword(true);
+      }
+      setLogs([hasNewPassword || msdPasswordInput.trim().length > 0 ? "Settings and password(s) saved." : "Settings saved."]);
 
       const missingApiData =
         settings.apiUsername.trim().length === 0 ||
@@ -1311,7 +2210,10 @@ function App() {
         };
         setHistory((prev) => [record, ...prev]);
       }
+      markSourceSuccess("leases");
     } catch (error) {
+      markSourceError("leases", String(error));
+      scheduleSourceRetry("leases");
       if (!silent) setDynamicError(String(error));
     } finally {
       setDynamicBusy(false);
@@ -1346,7 +2248,10 @@ function App() {
         setHistory((prev) => [result, ...prev]);
         setLogs((prev) => [...prev, "Static leases refreshed."]);
       }
+      markSourceSuccess("leases");
     } catch (error) {
+      markSourceError("leases", String(error));
+      scheduleSourceRetry("leases");
       if (!silent) {
         setRunError(String(error));
         setLogs((prev) => [...prev, `Static refresh failed: ${error}`]);
@@ -1405,6 +2310,8 @@ function App() {
       await invoke("start_firewall_log_stream", { settings });
     } catch (err) {
       setFwError(String(err));
+      markSourceError("firewall-stream", String(err));
+      scheduleSourceRetry("firewall-stream");
       setFwStreaming(false);
     }
   }
@@ -1412,6 +2319,295 @@ function App() {
   function handleStopFwLog() {
     void invoke("stop_firewall_log_stream");
     setFwStreaming(false);
+  }
+
+  async function handleFetchWfLogs(): Promise<WebfilterFetchResult> {
+    setWfLogsBusy(true);
+    setWfLogsError(null);
+    setWfDiag(null);
+    setWfProtocolWarnings([]);
+    try {
+      const result = await invoke<WebfilterLogsInvokeResult>(
+        "fetch_webfilter_logs",
+        { payload: { settings } },
+      );
+      const envelope = toWebfilterDynamicEnvelope<WfLogEntry>(result, new Date());
+
+      if (envelope.statePatch.diag !== undefined) {
+        setWfDiag(envelope.statePatch.diag);
+      }
+
+      if (envelope.warnings.length > 0) {
+        const warningMessages = envelope.warnings.map((item) => item.message);
+        setWfProtocolWarnings(warningMessages);
+        setLogs((prev) => [...prev, ...warningMessages.map((item) => `Webfilter protocol warning: ${item}`)]);
+      }
+
+      for (const action of envelope.actions) {
+        if (action.type === "set-filter") {
+          setWfLogFilter(action.filter);
+        } else if (action.type === "set-auto-refresh") {
+          setWfAutoRefresh(action.enabled);
+        } else if (action.type === "schedule-refetch") {
+          if (wfScheduledRefetchRef.current !== null) {
+            window.clearTimeout(wfScheduledRefetchRef.current);
+          }
+          wfScheduledRefetchRef.current = window.setTimeout(() => {
+            if (!canRunSourceNow("webfilter-ui")) return;
+            if (activeTab === "webfilter") {
+              void handleFetchWfLogs();
+            }
+          }, action.delayMs);
+        }
+      }
+
+      if (result.ok && envelope.statePatch.entries) {
+        setWfLogs(envelope.statePatch.entries);
+        setWfLastRefresh(envelope.statePatch.lastRefreshLabel ?? new Date().toLocaleTimeString());
+        markSourceSuccess("webfilter-ui");
+        const status = parseWebfilterStatus("ok", "webfilter-ui", "webfilter-80-1920");
+        return { ok: true, status };
+      } else {
+        const status = parseWebfilterStatus(
+          envelope.statePatch.error ?? "Unknown error",
+          "webfilter-ui",
+          "webfilter-80-1920",
+        );
+        markSourceError("webfilter-ui", status.message);
+        scheduleSourceRetry("webfilter-ui");
+        setWfLogsError(status.message);
+        return { ok: false, status };
+      }
+    } catch (err) {
+      const status = parseWebfilterStatus(String(err), "webfilter-ui", "webfilter-80-1920");
+      markSourceError("webfilter-ui", status.message);
+      scheduleSourceRetry("webfilter-ui");
+      setWfLogsError(status.message);
+      return { ok: false, status };
+    } finally {
+      setWfLogsBusy(false);
+    }
+  }
+
+  async function handleFetchWfAddressLists() {
+    setWfAddressBusy(true);
+    setWfAddressError(null);
+    try {
+      const result = await invoke<WebfilterAddressListsInvokeResult>(
+        "fetch_webfilter_address_lists",
+        { payload: { settings } },
+      );
+      if (!result.ok) {
+        const errorMessage = result.error ?? "Unknown error while loading address lists";
+        setWfAddressError(errorMessage);
+        markSourceError("webfilter-ui", errorMessage);
+        scheduleSourceRetry("webfilter-ui");
+        return;
+      }
+
+      const whitelist = result.whitelistEntries ?? [];
+      const blacklist = result.blacklistEntries ?? [];
+
+      setWfWhitelistEntries(whitelist);
+      setWfBlacklistEntries(blacklist);
+      setWfWhitelistTotal(result.whitelistTotal ?? whitelist.length);
+      setWfBlacklistTotal(result.blacklistTotal ?? blacklist.length);
+      setWfAddressSelectedIds((prev) => {
+        const valid = new Set((wfAddressListType === "wl" ? whitelist : blacklist).map((item) => item.id));
+        return new Set(Array.from(prev).filter((id) => valid.has(id)));
+      });
+      markSourceSuccess("webfilter-ui");
+      setLogs((prev) => [
+        ...prev,
+        `Address lists loaded (WL: ${result.whitelistTotal ?? whitelist.length}, BL: ${result.blacklistTotal ?? blacklist.length}).`,
+      ]);
+    } catch (error) {
+      const message = String(error);
+      setWfAddressError(message);
+      markSourceError("webfilter-ui", message);
+      scheduleSourceRetry("webfilter-ui");
+    } finally {
+      setWfAddressBusy(false);
+    }
+  }
+
+  async function handleWriteWfAddressList(
+    action: "add" | "edit" | "delete" | "import" | "export",
+    options?: {
+      entryId?: string;
+      entryName?: string;
+      currentName?: string;
+      entryIds?: string[];
+      importText?: string;
+      savePath?: string;
+    },
+  ) {
+    setWfAddressActionBusy(true);
+    setWfAddressError(null);
+    try {
+      const payload = {
+        settings,
+        action,
+        listType: wfAddressListType,
+        entryId: options?.entryId,
+        entryName: options?.entryName,
+        currentName: options?.currentName,
+        entryIds: options?.entryIds ?? [],
+        importText: options?.importText,
+        savePath: options?.savePath,
+      };
+
+      const result = await invoke<WebfilterAddressListWriteInvokeResult>(
+        "write_webfilter_address_list",
+        { payload },
+      );
+
+      if (!result.ok) {
+        const errorMessage = result.error ?? "Address list operation failed";
+        setWfAddressError(errorMessage);
+        markSourceError("webfilter-ui", errorMessage);
+        scheduleSourceRetry("webfilter-ui");
+        return false;
+      }
+
+      const warnings = result.warnings ?? [];
+      if (warnings.length > 0) {
+        setLogs((prev) => [...prev, ...warnings.map((item) => `Address-list warning: ${item}`)]);
+      }
+      if (result.message) {
+        setLogs((prev) => [...prev, result.message as string]);
+      }
+
+      markSourceSuccess("webfilter-ui");
+      if (action !== "export") {
+        await handleFetchWfAddressLists();
+      }
+      return true;
+    } catch (error) {
+      const message = String(error);
+      setWfAddressError(message);
+      markSourceError("webfilter-ui", message);
+      scheduleSourceRetry("webfilter-ui");
+      return false;
+    } finally {
+      setWfAddressActionBusy(false);
+    }
+  }
+
+  function toggleWfAddressSelection(entryId: string, checked: boolean) {
+    setWfAddressSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) {
+        next.add(entryId);
+      } else {
+        next.delete(entryId);
+      }
+      return next;
+    });
+  }
+
+  function toggleWfAddressSelectAllVisible(checked: boolean) {
+    setWfAddressSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) {
+        wfAddressEntriesFiltered.forEach((entry) => next.add(entry.id));
+      } else {
+        wfAddressEntriesFiltered.forEach((entry) => next.delete(entry.id));
+      }
+      return next;
+    });
+  }
+
+  async function handleWfAddressAdd() {
+    const value = wfAddressNewValue.trim();
+    if (!value) {
+      setWfAddressError("Address value is empty.");
+      return;
+    }
+    const ok = await handleWriteWfAddressList("add", { entryName: value });
+    if (ok) {
+      setWfAddressNewValue("");
+    }
+  }
+
+  async function handleWfAddressEditSave() {
+    if (!wfAddressEditId) {
+      setWfAddressError("Select an entry to edit first.");
+      return;
+    }
+    const value = wfAddressEditValue.trim();
+    if (!value) {
+      setWfAddressError("Edited value is empty.");
+      return;
+    }
+    const ok = await handleWriteWfAddressList("edit", {
+      entryId: wfAddressEditId,
+      entryName: value,
+      currentName: wfAddressEditOriginalName,
+    });
+    if (ok) {
+      setWfAddressEditId(null);
+      setWfAddressEditOriginalName("");
+      setWfAddressEditValue("");
+    }
+  }
+
+  async function handleWfAddressDeleteSelected() {
+    const ids = wfAddressEntries
+      .map((entry) => entry.id)
+      .filter((id) => wfAddressSelectedIds.has(id));
+
+    if (ids.length === 0) {
+      setWfAddressError("No entries selected for deletion.");
+      return;
+    }
+
+    const ok = await handleWriteWfAddressList("delete", { entryIds: ids });
+    if (ok) {
+      setWfAddressSelectedIds(new Set());
+    }
+  }
+
+  async function handleWfAddressImport() {
+    const importText = wfAddressImportText.trim();
+    if (!importText) {
+      setWfAddressError("Import text is empty.");
+      return;
+    }
+    const ok = await handleWriteWfAddressList("import", { importText });
+    if (ok) {
+      setWfAddressImportText("");
+    }
+  }
+
+  async function handleWfAddressExport() {
+    const defaultPath = wfAddressListType === "wl" ? "webfilter_whitelist_export.txt" : "webfilter_blacklist_export.txt";
+    const savePath = await save({
+      title: "Save webfilter address list export",
+      defaultPath,
+    });
+    if (!savePath) {
+      setLogs((prev) => [...prev, "Address-list export canceled."]);
+      return;
+    }
+    await handleWriteWfAddressList("export", { savePath });
+  }
+
+  async function handleRefreshAnalysis() {
+    setLogs((prev) => [...prev, "Refreshing analysis sources (leases + webfilter)..."]);
+    await refreshLeasesSilently();
+    if (settings.msdUsername.trim() && hasMsdPassword) {
+      const wfResult = await handleFetchWfLogs();
+      if (!wfResult.ok) {
+        const recovery = wfResult.status.recoveryAction !== "None"
+          ? ` Recovery: ${wfResult.status.recoveryAction}.`
+          : "";
+        setLogs((prev) => [
+          ...prev,
+          `Webfilter status (${wfResult.status.status}): ${wfResult.status.message}${recovery}`,
+        ]);
+      }
+    }
   }
 
   async function handleCancelRun() {
@@ -2054,6 +3250,83 @@ function App() {
           </div>
         </div>
       )}
+      {selectedAnalysisDeviceDetail && (
+        <div
+          className="overlay analysis-device-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Device details for ${selectedAnalysisDeviceDetail.row.ip}`}
+          onClick={() => setSelectedAnalysisDeviceIp(null)}
+        >
+          <div className="overlay-card analysis-device-overlay-card" onClick={(e) => e.stopPropagation()}>
+            <div className="analysis-detail-head">
+              <h4>Device Detail: {selectedAnalysisDeviceDetail.row.ip}</h4>
+              <button className="mini-action" type="button" onClick={() => setSelectedAnalysisDeviceIp(null)}>
+                Close
+              </button>
+            </div>
+            <div className="analysis-detail-grid">
+              <div className="analysis-detail-card">
+                <h5>Identity</h5>
+                <p>Hostname: {selectedAnalysisDeviceDetail.row.hostname || "-"}</p>
+                <p>MAC: {selectedAnalysisDeviceDetail.row.mac || "-"}</p>
+                <p>Segment: {selectedAnalysisDeviceDetail.row.segment}</p>
+                <p>Risk: {selectedAnalysisDeviceDetail.row.riskScore}</p>
+                <p>Last seen: {selectedAnalysisDeviceDetail.row.lastSeen || "-"}</p>
+              </div>
+              <div className="analysis-detail-card">
+                <h5>Lease Times</h5>
+                <p>Static lease: {selectedAnalysisDeviceDetail.staticLease ? "Yes" : "No"}</p>
+                <p>Dynamic online: {selectedAnalysisDeviceDetail.dynamicLease ? (selectedAnalysisDeviceDetail.dynamicLease.online ? "Yes" : "No") : "-"}</p>
+                <p>Dynamic start: {selectedAnalysisDeviceDetail.dynamicLease?.start || "-"}</p>
+                <p>Dynamic end: {selectedAnalysisDeviceDetail.dynamicLease?.end || "-"}</p>
+                <p>Dynamic status: {selectedAnalysisDeviceDetail.dynamicLease?.status || "-"}</p>
+              </div>
+              <div className="analysis-detail-card">
+                <h5>Traffic Summary</h5>
+                <p>Firewall pass/block: {selectedAnalysisDeviceDetail.row.fwPass} / {selectedAnalysisDeviceDetail.row.fwBlock}</p>
+                <p>Webfilter allow/block: {selectedAnalysisDeviceDetail.row.wfAllow} / {selectedAnalysisDeviceDetail.row.wfBlock}</p>
+                <p>Dual block: {selectedAnalysisDeviceDetail.row.hasDualBlock ? "Yes" : "No"}</p>
+              </div>
+            </div>
+
+            <div className="analysis-detail-grid">
+              <div className="analysis-detail-card">
+                <h5>Visited Pages (Webfilter)</h5>
+                <ul className="analysis-detail-list">
+                  {selectedAnalysisDeviceDetail.webfilterEvents.map((event, idx) => (
+                    <li key={`detail-wf-${idx}`}>
+                      <span>{event.time || "-"}</span>
+                      <strong>{event.action.toUpperCase()}</strong>
+                      <span>{event.url || "-"}</span>
+                      <span>{event.category || "-"}</span>
+                    </li>
+                  ))}
+                  {selectedAnalysisDeviceDetail.webfilterEvents.length === 0 && (
+                    <li>No webfilter events recorded for this device.</li>
+                  )}
+                </ul>
+              </div>
+              <div className="analysis-detail-card">
+                <h5>Firewall Events</h5>
+                <ul className="analysis-detail-list">
+                  {selectedAnalysisDeviceDetail.firewallEvents.map((event, idx) => (
+                    <li key={`detail-fw-${idx}`}>
+                      <span>{event.__timestamp__ || "-"}</span>
+                      <strong>{event.action || "-"}</strong>
+                      <span>{`${event.src || "-"} -> ${event.dst || "-"}`}</span>
+                      <span>{event.label || "-"}</span>
+                    </li>
+                  ))}
+                  {selectedAnalysisDeviceDetail.firewallEvents.length === 0 && (
+                    <li>No firewall events recorded for this device.</li>
+                  )}
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="app-content">
         <header className="topbar">
         <div>
@@ -2104,6 +3377,20 @@ function App() {
               onClick={() => setActiveTab("firewall")}
             >
               Firewall
+            </button>
+            <button
+              type="button"
+              className={activeTab === "webfilter" ? "active" : ""}
+              onClick={() => setActiveTab("webfilter")}
+            >
+              Webfilter
+            </button>
+            <button
+              type="button"
+              className={activeTab === "analysis" ? "active" : ""}
+              onClick={() => setActiveTab("analysis")}
+            >
+              Analysis
             </button>
           </div>
 
@@ -2337,6 +3624,29 @@ function App() {
                 />
               </div>
               <div className="field">
+                <label htmlFor="msd-username">MSD username (Webfilter, port 80)</label>
+                <input
+                  id="msd-username"
+                  type="text"
+                  value={settings.msdUsername}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, msdUsername: value }));
+                  }}
+                  placeholder="e.g. your.username"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="msd-password">MSD password (Webfilter, port 80)</label>
+                <input
+                  id="msd-password"
+                  type="password"
+                  value={msdPasswordInput}
+                  onChange={(e) => setMsdPasswordInput(e.currentTarget.value)}
+                  placeholder={hasMsdPassword ? "Saved. Enter new to replace." : "Enter to save securely"}
+                />
+              </div>
+              <div className="field">
                 <label htmlFor="debug-toggle">Debug logging</label>
                 <label className="toggle-pill">
                   <input
@@ -2468,6 +3778,234 @@ function App() {
               {fwError && <p className="error-text">{fwError}</p>}
             </div>
           )}
+
+          {activeTab === "webfilter" && (
+            <div className="tab-panel">
+              <h2>Webfilter</h2>
+              <p className="field-hint">
+                Schulfilter Plus filter logs. Configure MSD credentials in Settings first.
+              </p>
+              <div className="wf-filter-tabs" style={{ marginBottom: "8px" }}>
+                <button
+                  type="button"
+                  className={wfView === "logs" ? "active" : ""}
+                  onClick={() => setWfView("logs")}
+                >
+                  Logs
+                </button>
+                <button
+                  type="button"
+                  className={wfView === "address-lists" ? "active" : ""}
+                  onClick={() => setWfView("address-lists")}
+                >
+                  Address Lists
+                </button>
+              </div>
+              {(!settings.msdUsername.trim() || !hasMsdPassword) ? (
+                <p className="error-text" style={{ fontSize: "0.85rem" }}>
+                  {!settings.msdUsername.trim() ? "Set MSD username in Settings." : "Set MSD password in Settings."}
+                </p>
+              ) : (
+                <>
+                  {wfView === "logs" ? (
+                    <>
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={wfLogsBusy}
+                        onClick={() => void handleFetchWfLogs()}
+                        style={{ width: "100%", marginBottom: "8px" }}
+                      >
+                        {wfLogsBusy ? "Loading…" : "Fetch Logs"}
+                      </button>
+                      <label className="field-hint" style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "8px", cursor: "pointer" }}>
+                        <input
+                          type="checkbox"
+                          checked={wfAutoRefresh}
+                          onChange={(e) => setWfAutoRefresh(e.target.checked)}
+                        />
+                        Auto-refresh
+                      </label>
+                      <div className="wf-filter-tabs">
+                        {(["all", "allow", "block"] as const).map((f) => (
+                          <button
+                            key={f}
+                            type="button"
+                            className={wfLogFilter === f ? "active" : ""}
+                            onClick={() => setWfLogFilter(f)}
+                          >
+                            {f.charAt(0).toUpperCase() + f.slice(1)}
+                          </button>
+                        ))}
+                      </div>
+                      {wfLogsError && (
+                        <p className="error-text" style={{ fontSize: "0.82rem" }}>{wfLogsError}</p>
+                      )}
+                      {wfProtocolWarnings.length > 0 && (
+                        <ul className="wf-protocol-warning-list">
+                          {wfProtocolWarnings.map((warning, idx) => (
+                            <li key={`wf-warning-${idx}`}>{warning}</li>
+                          ))}
+                        </ul>
+                      )}
+                      {wfLastRefresh && (
+                        <p className="field-hint">Last: {wfLastRefresh} · {wfLogsFiltered.length} entries</p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <div className="wf-filter-tabs" style={{ marginBottom: "8px" }}>
+                        <button
+                          type="button"
+                          className={wfAddressListType === "wl" ? "active" : ""}
+                          onClick={() => setWfAddressListType("wl")}
+                        >
+                          Whitelist
+                        </button>
+                        <button
+                          type="button"
+                          className={wfAddressListType === "bl" ? "active" : ""}
+                          onClick={() => setWfAddressListType("bl")}
+                        >
+                          Blacklist
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={wfAddressBusy || wfAddressActionBusy}
+                        onClick={() => void handleFetchWfAddressLists()}
+                        style={{ width: "100%", marginBottom: "8px" }}
+                      >
+                        {wfAddressBusy ? "Loading…" : "Refresh Address Lists"}
+                      </button>
+                      <div className="field" style={{ marginBottom: "10px" }}>
+                        <label htmlFor="wf-address-new">Add Entry</label>
+                        <input
+                          id="wf-address-new"
+                          type="text"
+                          value={wfAddressNewValue}
+                          onChange={(e) => setWfAddressNewValue(e.target.value)}
+                          placeholder="example.com or *.example.*"
+                          disabled={wfAddressActionBusy}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={wfAddressActionBusy}
+                        onClick={() => void handleWfAddressAdd()}
+                        style={{ width: "100%", marginBottom: "8px" }}
+                      >
+                        Add to {wfAddressListType === "wl" ? "Whitelist" : "Blacklist"}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={wfAddressActionBusy || wfSelectedCount === 0}
+                        onClick={() => void handleWfAddressDeleteSelected()}
+                        style={{ width: "100%", marginBottom: "8px" }}
+                      >
+                        Delete Selected ({wfSelectedCount})
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={wfAddressActionBusy}
+                        onClick={() => void handleWfAddressExport()}
+                        style={{ width: "100%", marginBottom: "8px" }}
+                      >
+                        Export Current List
+                      </button>
+                      <div className="field" style={{ marginBottom: "8px" }}>
+                        <label htmlFor="wf-address-import">Import Entries (one per line)</label>
+                        <textarea
+                          id="wf-address-import"
+                          value={wfAddressImportText}
+                          onChange={(e) => setWfAddressImportText(e.target.value)}
+                          placeholder="domain1.example&#10;*.domain2.example"
+                          disabled={wfAddressActionBusy}
+                          style={{ minHeight: "90px" }}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={wfAddressActionBusy}
+                        onClick={() => void handleWfAddressImport()}
+                        style={{ width: "100%", marginBottom: "8px" }}
+                      >
+                        Import
+                      </button>
+                      {(wfAddressError || wfAddressEditId) && (
+                        <div style={{ marginTop: "8px" }}>
+                          {wfAddressError && <p className="error-text" style={{ fontSize: "0.82rem" }}>{wfAddressError}</p>}
+                          {wfAddressEditId && (
+                            <div className="field" style={{ marginBottom: "0" }}>
+                              <label htmlFor="wf-address-edit">Edit Selected Entry</label>
+                              <input
+                                id="wf-address-edit"
+                                type="text"
+                                value={wfAddressEditValue}
+                                onChange={(e) => setWfAddressEditValue(e.target.value)}
+                                disabled={wfAddressActionBusy}
+                              />
+                              <button
+                                type="button"
+                                className="secondary"
+                                disabled={wfAddressActionBusy}
+                                onClick={() => void handleWfAddressEditSave()}
+                              >
+                                Save Edit
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <p className="field-hint">Loaded: {wfAddressEntries.length} visible entries · total reported: {wfAddressTotal}</p>
+                    </>
+                  )}
+                  {settings.debug && wfDiag && (
+                    <pre style={{ fontSize: "0.7rem", color: "#7a9e9a", whiteSpace: "pre-wrap", marginTop: "8px", background: "rgba(0,0,0,0.2)", padding: "6px", borderRadius: "4px", maxHeight: "200px", overflowY: "auto" }}>{wfDiag}</pre>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {activeTab === "analysis" && (
+            <div className="tab-panel">
+              <h2>Combined Analysis</h2>
+              <p className="field-hint">
+                Correlates static and dynamic leases with firewall stream and webfilter events.
+              </p>
+              <div className="fw-sidebar-controls">
+                <button className="secondary" type="button" onClick={() => void handleRefreshAnalysis()}>
+                  Refresh analysis sources
+                </button>
+                <button
+                  className={fwStreaming ? "secondary" : "primary"}
+                  type="button"
+                  onClick={fwStreaming ? handleStopFwLog : () => void handleStartFwLog()}
+                >
+                  {fwStreaming ? "Stop firewall stream" : "Start firewall stream"}
+                </button>
+              </div>
+              <p className="lease-meta">
+                Known devices: {analysis.knownDeviceCount} · Correlated active: {analysis.rows.length}
+              </p>
+              <div className="source-health-grid">
+                {sourceHealthViews.map((item) => (
+                  <div key={item.key} className={`source-health-card source-health-${item.status}`}>
+                    <strong>{item.label}</strong>
+                    <span>Status: {item.status}</span>
+                    <span>Last success: {item.lastSuccessLabel}</span>
+                    <span>{item.detail}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </aside>
 
         <section className="panel main">
@@ -2540,7 +4078,441 @@ function App() {
             </div>
           )}
 
-          {activeTab !== "firewall" && leaseView === "dynamic" && (
+          {activeTab === "webfilter" && (
+            <div className="card full">
+              <div className="preview-header">
+                <h3>
+                  {wfView === "logs"
+                    ? "Schulfilter Plus — Filter Log"
+                    : `Schulfilter Plus — ${wfAddressListType === "wl" ? "Whitelist" : "Blacklist"}`}
+                </h3>
+                <span className="lease-meta">
+                  {wfView === "logs"
+                    ? (
+                      wfLogsBusy
+                        ? "Loading…"
+                        : wfLogs.length > 0
+                        ? `${wfLogsFiltered.length} of ${wfLogs.length} entries`
+                        : "No data"
+                    )
+                    : (
+                      wfAddressBusy
+                        ? "Loading…"
+                        : `${wfAddressEntriesFiltered.length} filtered of ${wfAddressEntries.length} loaded (${wfAddressTotal} reported)`
+                    )}
+                </span>
+              </div>
+              {wfView === "logs" ? (
+                <div className="fw-table-wrap">
+                  <table className="fw-table">
+                    <thead>
+                      <tr>
+                        <th>Action</th>
+                        <th>User</th>
+                        <th>IP</th>
+                        <th>Time</th>
+                        <th>URL</th>
+                        <th>Category</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {wfLogsFiltered.map((entry, idx) => {
+                        const isBlock = entry.action.toLowerCase() === "block";
+                        const isAllow = entry.action.toLowerCase() === "allow";
+                        const normalizedUser = normalizeWebfilterUser(entry.user);
+                        const rowClass = isBlock ? "fw-row-block" : "";
+                        const badgeClass = isBlock ? "fw-badge-block" : isAllow ? "fw-badge-pass" : "fw-badge-other";
+                        return (
+                          <tr key={idx} className={rowClass}>
+                            <td>
+                              <span className={`fw-badge ${badgeClass}`}>{entry.action}</span>
+                            </td>
+                            <td>{normalizedUser || "-"}</td>
+                            <td className="fw-cell-iface">{entry.ip || "-"}</td>
+                            <td className="fw-cell-time">{entry.time || "-"}</td>
+                            <td className="wf-cell-url" title={entry.url}>{entry.url || "-"}</td>
+                            <td className="fw-cell-label">{entry.category || "-"}</td>
+                          </tr>
+                        );
+                      })}
+                      {wfLogsFiltered.length === 0 && (
+                        <tr>
+                          <td colSpan={6} className="fw-empty">
+                            {wfLogsBusy
+                              ? "Fetching log entries…"
+                              : !settings.msdUsername.trim() || !hasMsdPassword
+                              ? "Configure MSD credentials in Settings, then press Fetch Logs."
+                              : "Press Fetch Logs in the sidebar to load filter log entries."}
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <>
+                  <div className="wf-address-toolbar">
+                    <input
+                      type="text"
+                      value={wfAddressSearch}
+                      onChange={(e) => setWfAddressSearch(e.target.value)}
+                      placeholder="Filter entries..."
+                      disabled={wfAddressBusy || wfAddressActionBusy}
+                    />
+                    <label className="field-hint" style={{ display: "flex", alignItems: "center", gap: "6px", margin: 0 }}>
+                      <input
+                        type="checkbox"
+                        checked={wfAddressEntriesFiltered.length > 0 && wfAddressEntriesFiltered.every((entry) => wfAddressSelectedIds.has(entry.id))}
+                        onChange={(e) => toggleWfAddressSelectAllVisible(e.target.checked)}
+                        disabled={wfAddressEntriesFiltered.length === 0}
+                      />
+                      Select visible
+                    </label>
+                  </div>
+                  <div className="fw-table-wrap">
+                    <table className="fw-table">
+                      <thead>
+                        <tr>
+                          <th style={{ width: "42px" }} />
+                          <th>ID</th>
+                          <th>Name</th>
+                          <th style={{ width: "120px" }}>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {wfAddressEntriesFiltered.map((entry) => (
+                          <tr key={`${wfAddressListType}-${entry.id}`}>
+                            <td>
+                              <input
+                                type="checkbox"
+                                checked={wfAddressSelectedIds.has(entry.id)}
+                                onChange={(e) => toggleWfAddressSelection(entry.id, e.target.checked)}
+                              />
+                            </td>
+                            <td className="fw-cell-time">{entry.id}</td>
+                            <td className="wf-cell-url" title={entry.name}>{entry.name || "-"}</td>
+                            <td>
+                              <button
+                                className="secondary"
+                                type="button"
+                                disabled={wfAddressActionBusy}
+                                onClick={() => {
+                                  setWfAddressEditId(entry.id);
+                                  setWfAddressEditOriginalName(entry.name);
+                                  setWfAddressEditValue(entry.name);
+                                }}
+                              >
+                                Edit
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                        {wfAddressEntriesFiltered.length === 0 && (
+                          <tr>
+                            <td colSpan={4} className="fw-empty">
+                              {wfAddressBusy
+                                ? "Loading address list entries…"
+                                : "No entries match the current filter."}
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {activeTab === "analysis" && (
+            <div className="card full">
+              <div className="preview-header">
+                <h3>Correlated Security Intelligence</h3>
+                <span className="lease-meta">
+                  {analysis.rows.length} active IPs · {analysis.correlatedBlocks} overlap blocks
+                </span>
+              </div>
+
+              <div className="source-health-grid">
+                {sourceHealthViews.map((item) => (
+                  <div key={`main-${item.key}`} className={`source-health-card source-health-${item.status}`}>
+                    <strong>{item.label}</strong>
+                    <span>Status: {item.status}</span>
+                    <span>Last success: {item.lastSuccessLabel}</span>
+                    <span>{item.detail}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="analysis-metrics">
+                <div className="analysis-metric-card">
+                  <span>Known Devices</span>
+                  <strong>{analysis.knownDeviceCount}</strong>
+                </div>
+                <div className="analysis-metric-card">
+                  <span>Active Correlated IPs</span>
+                  <strong>{analysis.rows.length}</strong>
+                </div>
+                <div className="analysis-metric-card">
+                  <span>High Risk Devices</span>
+                  <strong>{analysis.highRiskCount}</strong>
+                </div>
+                <div className="analysis-metric-card">
+                  <span>Dual-Layer Blocks</span>
+                  <strong>{analysis.correlatedBlocks}</strong>
+                </div>
+                <div className="analysis-metric-card">
+                  <span>Firewall-Only Blocked Devices</span>
+                  <strong>{analysis.fwOnlyBlocked}</strong>
+                </div>
+                <div className="analysis-metric-card">
+                  <span>Webfilter-Only Blocked Devices</span>
+                  <strong>{analysis.wfOnlyBlocked}</strong>
+                </div>
+                <div className="analysis-metric-card">
+                  <span>Unknown Private Firewall IPs</span>
+                  <strong>{analysis.unknownActiveIps.length}</strong>
+                </div>
+              </div>
+
+              <div className="analysis-section analysis-section-card">
+                <h4>Top Findings</h4>
+                <ul className="analysis-findings">
+                  {analysis.findings.map((finding, idx) => (
+                    <li key={`finding-${idx}`} className={`analysis-finding-${finding.severity}`}>
+                      <div className="analysis-finding-head">
+                        <span className="analysis-finding-severity">{finding.severity.toUpperCase()}</span>
+                        <strong>{finding.title}</strong>
+                      </div>
+                      <p>{finding.detail}</p>
+                    </li>
+                  ))}
+                  {analysis.findings.length === 0 && <li>No significant findings yet.</li>}
+                </ul>
+              </div>
+
+              <div className="analysis-section analysis-section-card">
+                <h4>Segment Health</h4>
+                <div className="fw-table-wrap">
+                  <table className="fw-table">
+                    <thead>
+                      <tr>
+                        <th>Segment</th>
+                        <th>Known</th>
+                        <th>Active</th>
+                        <th>FW Block</th>
+                        <th>WF Block</th>
+                        <th>Dual Block</th>
+                        <th>Avg Risk</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analysis.segmentSummary.map((row) => (
+                        <tr key={`seg-${row.segment}`}>
+                          <td>{row.segment}</td>
+                          <td>{row.knownDevices}</td>
+                          <td>{row.activeDevices}</td>
+                          <td>{row.fwBlock}</td>
+                          <td>{row.wfBlock}</td>
+                          <td>{row.dualBlockDevices}</td>
+                          <td>{row.avgRisk}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="analysis-grid">
+                <div className="analysis-section analysis-section-card">
+                  <h4>Category Drill-down</h4>
+                  <input
+                    className="analysis-topic-search"
+                    type="text"
+                    value={topicSearchPattern}
+                    onChange={(e) => setTopicSearchPattern(e.currentTarget.value)}
+                    placeholder="Search categories and host context..."
+                  />
+                  <ul className="analysis-list">
+                    {filteredCategoryNodes.map((item) => (
+                      <li key={item.id} className="analysis-topic-item">
+                        <div>
+                          <strong>{item.name}</strong>
+                          <p>{item.description}</p>
+                        </div>
+                        <strong>{item.count}</strong>
+                      </li>
+                    ))}
+                    {filteredCategoryNodes.length === 0 && <li>No matching category data.</li>}
+                  </ul>
+                </div>
+                <div className="analysis-section analysis-section-card">
+                  <h4>Top Blocked Destinations</h4>
+                  <ul className="analysis-list">
+                    {analysis.topBlockedHosts.map((item) => (
+                      <li key={`host-${item.label}`}>
+                        <span>{item.label}</span>
+                        <strong>{item.count}</strong>
+                      </li>
+                    ))}
+                    {analysis.topBlockedHosts.length === 0 && <li>No blocked destination data yet.</li>}
+                  </ul>
+                </div>
+              </div>
+
+              <div className="analysis-section analysis-section-card">
+                <div className="analysis-selection-head">
+                  <h4>Top Risky Devices</h4>
+                  <label className="analysis-selection-toggle">
+                    <input
+                      type="checkbox"
+                      checked={allRiskDevicesSelected}
+                      onChange={toggleAllRiskDevices}
+                    />
+                    Select all
+                  </label>
+                </div>
+                <div className="analysis-bulk-toolbar">
+                  <span>{selectedRiskDeviceIps.size} devices selected</span>
+                </div>
+                <div className="fw-table-wrap">
+                  <table className="fw-table">
+                    <thead>
+                      <tr>
+                        <th>Select</th>
+                        <th>Risk</th>
+                        <th>IP</th>
+                        <th>Hostname</th>
+                        <th>Segment</th>
+                        <th>User</th>
+                        <th>FW Block</th>
+                        <th>WF Block</th>
+                        <th>Dual</th>
+                        <th>Identity</th>
+                        <th>Last Seen</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analysis.riskyDevices.map((row) => (
+                        <tr key={`risk-${row.ip}`} className={row.riskScore >= 50 ? "fw-row-block" : ""}>
+                          <td>
+                            <input
+                              type="checkbox"
+                              checked={selectedRiskDeviceIps.has(row.ip)}
+                              onChange={() => toggleRiskDevice(row.ip)}
+                            />
+                          </td>
+                          <td>{row.riskScore}</td>
+                          <td className="fw-cell-addr">
+                            <button className="analysis-link-button" type="button" onClick={() => setSelectedAnalysisDeviceIp(row.ip)}>
+                              {row.ip}
+                            </button>
+                          </td>
+                          <td>{row.hostname || "-"}</td>
+                          <td>{row.segment}</td>
+                          <td>{row.user || "-"}</td>
+                          <td>{row.fwBlock}</td>
+                          <td>{row.wfBlock}</td>
+                          <td>{row.hasDualBlock ? "Yes" : "No"}</td>
+                          <td>{row.identityConfidence}</td>
+                          <td className="fw-cell-time">{row.lastSeen || "-"}</td>
+                        </tr>
+                      ))}
+                      {analysis.riskyDevices.length === 0 && (
+                        <tr>
+                          <td colSpan={11} className="fw-empty">No risky device data available yet.</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <details className="analysis-section analysis-section-card analysis-collapsible">
+                <summary>All Correlated Devices</summary>
+                <div className="fw-table-wrap">
+                  <table className="fw-table">
+                    <thead>
+                      <tr>
+                        <th>IP</th>
+                        <th>Hostname</th>
+                        <th>MAC</th>
+                        <th>User</th>
+                        <th>Segment</th>
+                        <th>Risk</th>
+                        <th>FW Pass</th>
+                        <th>FW Block</th>
+                        <th>WF Allow</th>
+                        <th>WF Block</th>
+                        <th>Identity</th>
+                        <th>Last Seen</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analysis.rows.map((row) => (
+                        <tr key={`analysis-${row.ip}`} className={row.fwBlock > 0 || row.wfBlock > 0 ? "fw-row-block" : ""}>
+                          <td className="fw-cell-addr">
+                            <button className="analysis-link-button" type="button" onClick={() => setSelectedAnalysisDeviceIp(row.ip)}>
+                              {row.ip}
+                            </button>
+                          </td>
+                          <td>{row.hostname || "-"}</td>
+                          <td className="fw-cell-addr">{row.mac || "-"}</td>
+                          <td>{row.user || "-"}</td>
+                          <td>{row.segment}</td>
+                          <td>{row.riskScore}</td>
+                          <td>{row.fwPass}</td>
+                          <td>{row.fwBlock}</td>
+                          <td>{row.wfAllow}</td>
+                          <td>{row.wfBlock}</td>
+                          <td>{row.identityConfidence}</td>
+                          <td className="fw-cell-time">{row.lastSeen || "-"}</td>
+                        </tr>
+                      ))}
+                      {analysis.rows.length === 0 && (
+                        <tr>
+                          <td colSpan={12} className="fw-empty">
+                            No correlated activity yet. Start firewall stream and load webfilter logs.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+
+              <div className="analysis-section analysis-section-card">
+                <h4>Unknown Private IPs Seen in Firewall</h4>
+                <div className="fw-table-wrap">
+                  <table className="fw-table">
+                    <thead>
+                      <tr>
+                        <th>IP</th>
+                        <th>FW Pass</th>
+                        <th>FW Block</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analysis.unknownActiveIps.map((row) => (
+                        <tr key={`unknown-${row.ip}`} className={row.block > 0 ? "fw-row-block" : ""}>
+                          <td className="fw-cell-addr">{row.ip}</td>
+                          <td>{row.pass}</td>
+                          <td>{row.block}</td>
+                        </tr>
+                      ))}
+                      {analysis.unknownActiveIps.length === 0 && (
+                        <tr>
+                          <td colSpan={3} className="fw-empty">No unknown private IP activity detected.</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {showLeaseViews && leaseView === "dynamic" && (
             <div className="card full">
               <div className="preview-header">
                 <h3>Dynamic Leases</h3>
@@ -2623,7 +4595,7 @@ function App() {
             </div>
           )}
 
-          {activeTab !== "firewall" && leaseView === "review" && (
+          {showLeaseViews && leaseView === "review" && (
             <div className="card full">
               <h3>Review</h3>
               <p className="lease-meta">Final check before export or apply.</p>
@@ -2698,7 +4670,7 @@ function App() {
             </div>
           )}
 
-          {activeTab !== "firewall" && leaseView === "runlog" && (
+          {showLeaseViews && leaseView === "runlog" && (
             <div className="card full logs">
               <h3>Run Log</h3>
               {runError && <p className="error-text">{runError}</p>}
@@ -2706,7 +4678,7 @@ function App() {
             </div>
           )}
 
-          {activeTab !== "firewall" && leaseView === "static" && (
+          {showLeaseViews && leaseView === "static" && (
             <>
           <div className="card full">
             <div className="preview-header">
@@ -3065,7 +5037,7 @@ function App() {
           </>
           )}
 
-          {activeTab !== "firewall" && leaseView === "staticWlanbyod" && (
+          {showLeaseViews && leaseView === "staticWlanbyod" && (
             <>
           <div className="card full">
             <div className="preview-header">

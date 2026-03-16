@@ -1,6 +1,6 @@
-# DHCP Lease Manager (Tauri + React)
+# TFK Manager (Tauri + React)
 
-A desktop UI for managing OPNsense static and dynamic DHCP leases with validation, conflict checks, and guided apply flows.
+A desktop application for OPNsense lease operations and MSD webfilter operations, including static and dynamic DHCP workflows, firewall log streaming, and webfilter log/address-list management.
 
 ## License
 - This project is licensed under PolyForm Noncommercial License 1.0.0.
@@ -17,6 +17,13 @@ A desktop UI for managing OPNsense static and dynamic DHCP leases with validatio
 - Lease views: `Static Gruen`, `Static WLANBYOD`, `Dynamic`, `Review`, and `Run Log`
 - Collapsible review sections (Add, Conflicts, Deletes) per interface panel
 - Static lease export fetches both Gruen (`export_static.csv`) and WLANBYOD (`export_static_wlanbyod.csv`) in a single API call
+- Firewall stream view with live event ingestion and source health state
+- Webfilter log view (MSD/Schulfilter Plus on port `80/1920`) with resilient polling and dynamic UI actions
+- Webfilter address-list management for whitelist and blacklist entries:
+	- Fetch lists and entry totals
+	- Add, edit, and delete entries
+	- Import and export list entries
+- Source polling policy with per-source stale thresholds, retry backoff, and poll jitter helpers
 - Settings persistence, run history, and in-app updater support
 
 ## Setup
@@ -58,8 +65,19 @@ the `/api/tfk/dhcp/*` endpoints directly.
 Running `npm run build` automatically copies `backend/` into `src-tauri/resources/backend/` via `scripts/copy-backend.mjs` before compiling — no manual sync needed for production or CI builds.
 
 ## Tests
+- Frontend/unit tests (Vitest):
+	- `npm run test`
 - Dynamic lease backend slice tests:
 	- `python -m unittest -v backend/src/test_dynamic_leases_slice.py`
+
+## Core architecture
+- Frontend: `src/App.tsx` (single-file React app) with helper modules for parsing/protocol/polling logic.
+- Tauri bridge: `src-tauri/src/lib.rs` commands invoke Python backend modes and return typed JSON payloads.
+- Backend: `backend/src/opnsense_dhcp_ui.py`, `backend/src/fetch_firewall_log_stream.py`, and `backend/src/fetch_webfilter.py`.
+
+## Security notes
+- Passwords are stored in OS keyring via Tauri commands; avoid committing local capture artifacts or endpoint dumps.
+- Keep OPNsense (`:81`) and MSD webfilter (`:80`/`:1920`) flows separated in implementation and diagnostics.
 
 ## Releases
 Compiled binaries are available on the GitHub releases page:

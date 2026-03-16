@@ -39,6 +39,8 @@ struct UiSettings {
     dry_run: bool,
     #[serde(default)]
     debug: bool,
+    #[serde(default)]
+    msd_username: String,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -422,6 +424,141 @@ fn save_password(password: String) -> Result<(), String> {
 #[tauri::command]
 fn has_password() -> Result<bool, String> {
     Ok(get_password()?.is_some())
+}
+
+fn msd_credential_entry() -> Result<Entry, String> {
+    Entry::new("tfk-manager", "msd").map_err(|err| err.to_string())
+}
+
+fn get_msd_password() -> Result<Option<String>, String> {
+    let entry = msd_credential_entry()?;
+    match entry.get_password() {
+        Ok(password) => Ok(Some(password)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+#[tauri::command]
+fn save_msd_password(password: String) -> Result<(), String> {
+    if password.trim().is_empty() {
+        return Err("MSD password is empty".to_string());
+    }
+    let entry = msd_credential_entry()?;
+    entry.set_password(&password).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn has_msd_password() -> Result<bool, String> {
+    Ok(get_msd_password()?.is_some())
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WebfilterPayload {
+    settings: UiSettings,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WebfilterResult {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diag: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WebfilterLogEntry {
+    action: String,
+    user: String,
+    ip: String,
+    time: String,
+    url: String,
+    category: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WebfilterLogsResult {
+    ok: bool,
+    #[serde(default)]
+    entries: Vec<WebfilterLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diag: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WebfilterAddressListEntry {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WebfilterAddressListsResult {
+    ok: bool,
+    #[serde(default)]
+    whitelist_entries: Vec<WebfilterAddressListEntry>,
+    #[serde(default)]
+    blacklist_entries: Vec<WebfilterAddressListEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    whitelist_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blacklist_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diag: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WebfilterAddressListWritePayload {
+    settings: UiSettings,
+    action: String,
+    list_type: String,
+    #[serde(default)]
+    entry_id: Option<String>,
+    #[serde(default)]
+    entry_name: Option<String>,
+    #[serde(default)]
+    current_name: Option<String>,
+    #[serde(default)]
+    entry_ids: Vec<String>,
+    #[serde(default)]
+    import_text: Option<String>,
+    #[serde(default)]
+    save_path: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WebfilterAddressListWriteResult {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export_filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imported_lines: Option<usize>,
+    #[serde(default)]
+    warnings: Vec<String>,
 }
 
 #[tauri::command]
@@ -972,6 +1109,302 @@ fn resolve_firewall_stream_script(app: &tauri::AppHandle) -> Result<PathBuf, Str
     resolve_script_path(app)
 }
 
+fn resolve_webfilter_script_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(current) = std::env::current_dir() {
+        candidates.push(current.join("backend").join("src").join("fetch_webfilter.py"));
+        candidates.push(current.join("..").join("backend").join("src").join("fetch_webfilter.py"));
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("backend").join("src").join("fetch_webfilter.py"));
+        candidates.push(resource_dir.join("backend").join("fetch_webfilter.py"));
+        candidates.push(
+            resource_dir
+                .join("resources")
+                .join("backend")
+                .join("src")
+                .join("fetch_webfilter.py"),
+        );
+        candidates.push(
+            resource_dir
+                .join("resources")
+                .join("backend")
+                .join("fetch_webfilter.py"),
+        );
+    }
+
+    for path in candidates {
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    Err("Could not locate backend/src/fetch_webfilter.py".to_string())
+}
+
+#[tauri::command]
+fn test_webfilter_login(app: tauri::AppHandle, payload: WebfilterPayload) -> Result<WebfilterResult, String> {
+    let script_path = resolve_webfilter_script_path(&app)?;
+    let msd_password = get_msd_password().unwrap_or(None);
+
+    let mut command = Command::new(&payload.settings.python_path);
+    command
+        .arg("-u")
+        .arg(&script_path)
+        .env("TFK_MODE", "webfilter_test")
+        .env("TFK_BASE_URL", &payload.settings.base_url)
+        .env("PYTHONUNBUFFERED", "1");
+
+    if !payload.settings.msd_username.trim().is_empty() {
+        command.env("TFK_MSD_USERNAME", &payload.settings.msd_username);
+    }
+    if let Some(pw) = msd_password {
+        command.env("TFK_MSD_PASSWORD", pw);
+    }
+    if payload.settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
+
+    let output = command.output().map_err(|err| err.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Try to parse the last non-empty JSON line from stdout
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(result) = serde_json::from_str::<WebfilterResult>(trimmed) {
+            return Ok(result);
+        }
+    }
+
+    // No parseable JSON — return stderr as error message
+    let err_msg = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        "No output from webfilter script".to_string()
+    };
+    Ok(WebfilterResult {
+        ok: false,
+        message: None,
+        error: Some(err_msg),
+        diag: None,
+    })
+}
+
+#[tauri::command]
+fn fetch_webfilter_logs(app: tauri::AppHandle, payload: WebfilterPayload) -> Result<WebfilterLogsResult, String> {
+    let script_path = resolve_webfilter_script_path(&app)?;
+    let msd_password = get_msd_password().unwrap_or(None);
+
+    let mut command = Command::new(&payload.settings.python_path);
+    command
+        .arg("-u")
+        .arg(&script_path)
+        .env("TFK_MODE", "webfilter_logs")
+        .env("TFK_BASE_URL", &payload.settings.base_url)
+        .env("PYTHONUNBUFFERED", "1");
+
+    if !payload.settings.msd_username.trim().is_empty() {
+        command.env("TFK_MSD_USERNAME", &payload.settings.msd_username);
+    }
+    if let Some(pw) = msd_password {
+        command.env("TFK_MSD_PASSWORD", pw);
+    }
+    if payload.settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
+
+    let output = command.output().map_err(|err| err.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let debug_diag = if payload.settings.debug && !stderr.trim().is_empty() {
+        Some(stderr.trim().to_string())
+    } else {
+        None
+    };
+
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(mut result) = serde_json::from_str::<WebfilterLogsResult>(trimmed) {
+            if result.diag.is_none() {
+                result.diag = debug_diag;
+            }
+            return Ok(result);
+        }
+    }
+
+    let err_msg = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        "No output from webfilter logs script".to_string()
+    };
+    Ok(WebfilterLogsResult {
+        ok: false,
+        entries: vec![],
+        error: Some(err_msg),
+        diag: None,
+    })
+}
+
+#[tauri::command]
+fn fetch_webfilter_address_lists(
+    app: tauri::AppHandle,
+    payload: WebfilterPayload,
+) -> Result<WebfilterAddressListsResult, String> {
+    let script_path = resolve_webfilter_script_path(&app)?;
+    let msd_password = get_msd_password().unwrap_or(None);
+
+    let mut command = Command::new(&payload.settings.python_path);
+    command
+        .arg("-u")
+        .arg(&script_path)
+        .env("TFK_MODE", "webfilter_address_lists")
+        .env("TFK_BASE_URL", &payload.settings.base_url)
+        .env("PYTHONUNBUFFERED", "1");
+
+    if !payload.settings.msd_username.trim().is_empty() {
+        command.env("TFK_MSD_USERNAME", &payload.settings.msd_username);
+    }
+    if let Some(pw) = msd_password {
+        command.env("TFK_MSD_PASSWORD", pw);
+    }
+    if payload.settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
+
+    let output = command.output().map_err(|err| err.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let debug_diag = if payload.settings.debug && !stderr.trim().is_empty() {
+        Some(stderr.trim().to_string())
+    } else {
+        None
+    };
+
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(mut result) = serde_json::from_str::<WebfilterAddressListsResult>(trimmed) {
+            if result.diag.is_none() {
+                result.diag = debug_diag;
+            }
+            return Ok(result);
+        }
+    }
+
+    let err_msg = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        "No output from webfilter address-lists script".to_string()
+    };
+
+    Ok(WebfilterAddressListsResult {
+        ok: false,
+        whitelist_entries: vec![],
+        blacklist_entries: vec![],
+        whitelist_total: None,
+        blacklist_total: None,
+        error: Some(err_msg),
+        diag: None,
+    })
+}
+
+#[tauri::command]
+fn write_webfilter_address_list(
+    app: tauri::AppHandle,
+    payload: WebfilterAddressListWritePayload,
+) -> Result<WebfilterAddressListWriteResult, String> {
+    let script_path = resolve_webfilter_script_path(&app)?;
+    let msd_password = get_msd_password().unwrap_or(None);
+
+    let mut command = Command::new(&payload.settings.python_path);
+    command
+        .arg("-u")
+        .arg(&script_path)
+        .env("TFK_MODE", "webfilter_address_list_write")
+        .env("TFK_BASE_URL", &payload.settings.base_url)
+        .env("TFK_WF_ACTION", &payload.action)
+        .env("TFK_WF_LIST", &payload.list_type)
+        .env("TFK_WF_ENTRY_ID", payload.entry_id.unwrap_or_default())
+        .env("TFK_WF_ENTRY_NAME", payload.entry_name.unwrap_or_default())
+        .env("TFK_WF_CURRENT_NAME", payload.current_name.unwrap_or_default())
+        .env("TFK_WF_IDS", payload.entry_ids.join(","))
+        .env("TFK_WF_IMPORT_TEXT", payload.import_text.unwrap_or_default())
+        .env("PYTHONUNBUFFERED", "1");
+
+    if !payload.settings.msd_username.trim().is_empty() {
+        command.env("TFK_MSD_USERNAME", &payload.settings.msd_username);
+    }
+    if let Some(pw) = msd_password {
+        command.env("TFK_MSD_PASSWORD", pw);
+    }
+    if payload.settings.debug {
+        command.env("TFK_DEBUG", "1");
+    }
+
+    let output = command.output().map_err(|err| err.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let debug_diag = if payload.settings.debug && !stderr.trim().is_empty() {
+        Some(stderr.trim().to_string())
+    } else {
+        None
+    };
+
+    let requested_save_path = payload.save_path.clone();
+
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(mut result) = serde_json::from_str::<WebfilterAddressListWriteResult>(trimmed) {
+            if result.ok {
+                if let (Some(path), Some(content)) = (requested_save_path.as_ref(), result.export_content.as_ref()) {
+                    fs::write(path, content).map_err(|err| err.to_string())?;
+                    result.message = Some(format!(
+                        "{} Saved to {}",
+                        result.message.unwrap_or_else(|| "Export completed.".to_string()),
+                        path
+                    ));
+                }
+            }
+            if result.diag.is_none() {
+                result.diag = debug_diag;
+            }
+            return Ok(result);
+        }
+    }
+
+    let err_msg = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        "No output from webfilter address-list write script".to_string()
+    };
+
+    Ok(WebfilterAddressListWriteResult {
+        ok: false,
+        message: None,
+        error: Some(err_msg),
+        diag: None,
+        meta: None,
+        export_content: None,
+        export_filename: None,
+        imported_lines: None,
+        warnings: vec![],
+    })
+}
+
 #[tauri::command]
 async fn start_firewall_log_stream(
     app: tauri::AppHandle,
@@ -1111,6 +1544,8 @@ pub fn run() {
             load_history,
             save_password,
             has_password,
+            save_msd_password,
+            has_msd_password,
             read_text_file,
             find_python,
             install_backend_deps,
@@ -1119,7 +1554,11 @@ pub fn run() {
             move_dynamic_to_static,
             update_static_from_dynamic,
             start_firewall_log_stream,
-            stop_firewall_log_stream
+            stop_firewall_log_stream,
+            test_webfilter_login,
+            fetch_webfilter_logs,
+            fetch_webfilter_address_lists,
+            write_webfilter_address_list
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
