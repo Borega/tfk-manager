@@ -209,9 +209,9 @@ fn resolve_script_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         );
     }
 
-    for path in candidates {
+    for path in &candidates {
         if path.exists() {
-            return Ok(path);
+            return Ok(path.clone());
         }
     }
 
@@ -1148,9 +1148,9 @@ fn resolve_webfilter_script_path(app: &tauri::AppHandle) -> Result<PathBuf, Stri
         );
     }
 
-    for path in candidates {
+    for path in &candidates {
         if path.exists() {
-            return Ok(path);
+            return Ok(path.clone());
         }
     }
 
