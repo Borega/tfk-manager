@@ -8,6 +8,8 @@ on:
 
 jobs:
   build:
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
       contents: write
     strategy:
@@ -18,10 +20,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm
@@ -45,6 +47,9 @@ jobs:
           VERSION: 0.0.${{ github.run_number }}
         run: node scripts/set-version.mjs
 
+      - name: Copy backend resources
+        run: node scripts/copy-backend.mjs
+
       - name: Build and release
         uses: tauri-apps/tauri-action@action-v0.6.1
         id: tauri
@@ -62,7 +67,7 @@ jobs:
           updaterJsonPreferNsis: true
 
       - name: Verify updater assets
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
         with:
