@@ -1112,8 +1112,21 @@ fn resolve_firewall_stream_script(app: &tauri::AppHandle) -> Result<PathBuf, Str
 fn resolve_webfilter_script_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
+    // Prefer locating fetch_webfilter.py next to the resolved main backend script.
+    // If opnsense_dhcp_ui.py is found, this keeps all script lookups in the same backend copy.
+    if let Ok(main_script) = resolve_script_path(app) {
+        if let Some(src_dir) = main_script.parent() {
+            candidates.push(src_dir.join("fetch_webfilter.py"));
+        }
+        if let Some(backend_dir) = main_script.parent().and_then(|p| p.parent()) {
+            candidates.push(backend_dir.join("src").join("fetch_webfilter.py"));
+            candidates.push(backend_dir.join("fetch_webfilter.py"));
+        }
+    }
+
     if let Ok(current) = std::env::current_dir() {
         candidates.push(current.join("backend").join("src").join("fetch_webfilter.py"));
+        candidates.push(current.join("src-tauri").join("resources").join("backend").join("src").join("fetch_webfilter.py"));
         candidates.push(current.join("..").join("backend").join("src").join("fetch_webfilter.py"));
     }
 
@@ -1141,7 +1154,16 @@ fn resolve_webfilter_script_path(app: &tauri::AppHandle) -> Result<PathBuf, Stri
         }
     }
 
-    Err("Could not locate backend/src/fetch_webfilter.py".to_string())
+    let tried = candidates
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect::<Vec<String>>()
+        .join(" | ");
+
+    Err(format!(
+        "Could not locate backend/src/fetch_webfilter.py. Tried: {}",
+        tried
+    ))
 }
 
 #[tauri::command]
