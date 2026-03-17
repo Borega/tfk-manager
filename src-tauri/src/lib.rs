@@ -1141,7 +1141,9 @@ fn resolve_webfilter_script_path(app: &tauri::AppHandle) -> Result<PathBuf, Stri
         }
     }
 
-    Err("Could not locate backend/src/fetch_webfilter.py".to_string())
+    // Webfilter actions now run through the main backend script. Keep the legacy
+    // filename lookup above so older unpacked layouts still work.
+    resolve_script_path(app)
 }
 
 #[tauri::command]

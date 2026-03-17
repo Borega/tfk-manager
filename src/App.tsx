@@ -3633,7 +3633,6 @@ function App() {
                     const value = e.currentTarget.value;
                     setSettings((prev) => ({ ...prev, msdUsername: value }));
                   }}
-                  placeholder="e.g. soeren.schroeder"
                 />
               </div>
               <div className="field">

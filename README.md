@@ -73,7 +73,7 @@ Running `npm run build` automatically copies `backend/` into `src-tauri/resource
 ## Core architecture
 - Frontend: `src/App.tsx` (single-file React app) with helper modules for parsing/protocol/polling logic.
 - Tauri bridge: `src-tauri/src/lib.rs` commands invoke Python backend modes and return typed JSON payloads.
-- Backend: `backend/src/opnsense_dhcp_ui.py`, `backend/src/fetch_firewall_log_stream.py`, and `backend/src/fetch_webfilter.py`.
+- Backend: `backend/src/opnsense_dhcp_ui.py` and `backend/src/fetch_firewall_log_stream.py`.
 
 ## Security notes
 - Passwords are stored in OS keyring via Tauri commands; avoid committing local capture artifacts or endpoint dumps.
