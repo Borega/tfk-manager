@@ -11,7 +11,7 @@ use tauri::{Emitter, Manager};
 use keyring::Entry;
 
 const EMBEDDED_FETCH_WEBFILTER_PY: &str =
-    include_str!("../../backend/src/fetch_webfilter.py");
+    include_str!("fetch_webfilter_embedded.py");
 
 #[derive(Default)]
 struct ProcessState {
