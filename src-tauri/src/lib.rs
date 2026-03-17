@@ -10,6 +10,9 @@ use std::thread;
 use tauri::{Emitter, Manager};
 use keyring::Entry;
 
+const EMBEDDED_FETCH_WEBFILTER_PY: &str =
+    include_str!("../resources/backend/src/fetch_webfilter.py");
+
 #[derive(Default)]
 struct ProcessState {
     child: Mutex<Option<std::process::Child>>,
@@ -1151,6 +1154,31 @@ fn resolve_webfilter_script_path(app: &tauri::AppHandle) -> Result<PathBuf, Stri
     for path in &candidates {
         if path.exists() {
             return Ok(path.clone());
+        }
+    }
+
+    // Last-resort recovery for installer/updater layouts that miss this single script.
+    // We persist the embedded copy under app data and execute it from there.
+    if let Ok(data_dir) = app_data_dir_path(app) {
+        let embedded_path = data_dir
+            .join("embedded-backend")
+            .join("src")
+            .join("fetch_webfilter.py");
+        if let Some(parent) = embedded_path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                let tried = candidates
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect::<Vec<String>>()
+                    .join(" | ");
+                return Err(format!(
+                    "Could not locate backend/src/fetch_webfilter.py and failed to prepare embedded fallback ({}). Tried: {}",
+                    err, tried
+                ));
+            }
+        }
+        if fs::write(&embedded_path, EMBEDDED_FETCH_WEBFILTER_PY).is_ok() {
+            return Ok(embedded_path);
         }
     }
 
