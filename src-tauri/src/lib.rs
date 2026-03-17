@@ -231,6 +231,7 @@ fn resolve_backend_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn capture_output(command: &mut Command) -> HelpResult {
+    configure_command_for_desktop(command);
     let mut lines: Vec<String> = Vec::new();
     let output = command.output();
     match output {
@@ -259,6 +260,15 @@ fn capture_output(command: &mut Command) -> HelpResult {
 
 fn try_python_path(path: &Path) -> bool {
     path.exists()
+}
+
+fn configure_command_for_desktop(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 #[tauri::command]
@@ -333,6 +343,7 @@ fn install_backend_deps(app: tauri::AppHandle, python_path: String) -> Result<He
     let backend_dir = resolve_backend_dir(&app)?;
     let requirements = backend_dir.join("requirements.txt");
     let mut cmd = Command::new(python_path);
+    configure_command_for_desktop(&mut cmd);
     cmd.arg("-m")
         .arg("pip")
         .arg("install")
@@ -355,6 +366,7 @@ fn run_with_live_logs(
     mut command: Command,
     lines: &mut Vec<String>,
 ) -> Result<std::process::ExitStatus, String> {
+    configure_command_for_desktop(&mut command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|err| err.to_string())?;
 
@@ -886,6 +898,7 @@ fn load_dynamic_leases_sync(
     let password = get_password().unwrap_or(None);
 
     let mut command = Command::new(&settings.python_path);
+    configure_command_for_desktop(&mut command);
     command
         .arg("-u")
         .arg(&script_path)
@@ -964,6 +977,7 @@ fn move_dynamic_to_static_sync(
     let password = get_password().unwrap_or(None);
 
     let mut command = Command::new(&payload.settings.python_path);
+    configure_command_for_desktop(&mut command);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1041,6 +1055,7 @@ fn update_static_from_dynamic_sync(
     let password = get_password().unwrap_or(None);
 
     let mut command = Command::new(&payload.settings.python_path);
+    configure_command_for_desktop(&mut command);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1200,6 +1215,7 @@ fn test_webfilter_login(app: tauri::AppHandle, payload: WebfilterPayload) -> Res
     let msd_password = get_msd_password().unwrap_or(None);
 
     let mut command = Command::new(&payload.settings.python_path);
+    configure_command_for_desktop(&mut command);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1252,6 +1268,7 @@ fn fetch_webfilter_logs(app: tauri::AppHandle, payload: WebfilterPayload) -> Res
     let msd_password = get_msd_password().unwrap_or(None);
 
     let mut command = Command::new(&payload.settings.python_path);
+    configure_command_for_desktop(&mut command);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1313,6 +1330,7 @@ fn fetch_webfilter_address_lists(
     let msd_password = get_msd_password().unwrap_or(None);
 
     let mut command = Command::new(&payload.settings.python_path);
+    configure_command_for_desktop(&mut command);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1378,6 +1396,7 @@ fn write_webfilter_address_list(
     let msd_password = get_msd_password().unwrap_or(None);
 
     let mut command = Command::new(&payload.settings.python_path);
+    configure_command_for_desktop(&mut command);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1481,6 +1500,7 @@ async fn start_firewall_log_stream(
     let password = get_password().unwrap_or(None);
 
     let mut command = Command::new(&settings.python_path);
+    configure_command_for_desktop(&mut command);
     command
         .arg("-u")
         .arg(&script_path)

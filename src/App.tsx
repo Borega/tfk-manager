@@ -853,6 +853,7 @@ function App() {
 
   const [wfLogs, setWfLogs] = useState<WfLogEntry[]>([]);
   const [wfLogsBusy, setWfLogsBusy] = useState(false);
+  const [analysisRefreshBusy, setAnalysisRefreshBusy] = useState(false);
   const [wfLogsError, setWfLogsError] = useState<string | null>(null);
   const [wfLogFilter, setWfLogFilter] = useState<"all" | "allow" | "block">("all");
   const [wfView, setWfView] = useState<"logs" | "address-lists">("logs");
@@ -2594,19 +2595,29 @@ function App() {
   }
 
   async function handleRefreshAnalysis() {
+    if (analysisRefreshBusy || dynamicBusy || staticRefreshBusy || wfLogsBusy) {
+      setLogs((prev) => [...prev, "Analysis refresh already running. Please wait..."]);
+      return;
+    }
+
+    setAnalysisRefreshBusy(true);
     setLogs((prev) => [...prev, "Refreshing analysis sources (leases + webfilter)..."]);
-    await refreshLeasesSilently();
-    if (settings.msdUsername.trim() && hasMsdPassword) {
-      const wfResult = await handleFetchWfLogs();
-      if (!wfResult.ok) {
-        const recovery = wfResult.status.recoveryAction !== "None"
-          ? ` Recovery: ${wfResult.status.recoveryAction}.`
-          : "";
-        setLogs((prev) => [
-          ...prev,
-          `Webfilter status (${wfResult.status.status}): ${wfResult.status.message}${recovery}`,
-        ]);
+    try {
+      await refreshLeasesSilently();
+      if (settings.msdUsername.trim() && hasMsdPassword) {
+        const wfResult = await handleFetchWfLogs();
+        if (!wfResult.ok) {
+          const recovery = wfResult.status.recoveryAction !== "None"
+            ? ` Recovery: ${wfResult.status.recoveryAction}.`
+            : "";
+          setLogs((prev) => [
+            ...prev,
+            `Webfilter status (${wfResult.status.status}): ${wfResult.status.message}${recovery}`,
+          ]);
+        }
       }
+    } finally {
+      setAnalysisRefreshBusy(false);
     }
   }
 
@@ -3980,8 +3991,13 @@ function App() {
                 Correlates static and dynamic leases with firewall stream and webfilter events.
               </p>
               <div className="fw-sidebar-controls">
-                <button className="secondary" type="button" onClick={() => void handleRefreshAnalysis()}>
-                  Refresh analysis sources
+                <button
+                  className="secondary"
+                  type="button"
+                  onClick={() => void handleRefreshAnalysis()}
+                  disabled={analysisRefreshBusy || dynamicBusy || staticRefreshBusy || wfLogsBusy}
+                >
+                  {analysisRefreshBusy ? "Refreshing analysis sources..." : "Refresh analysis sources"}
                 </button>
                 <button
                   className={fwStreaming ? "secondary" : "primary"}
