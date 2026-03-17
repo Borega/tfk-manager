@@ -8,6 +8,8 @@
     "dev": "vite",
     "build": "node scripts/copy-backend.mjs && tsc && vite build",
     "test": "vitest run",
+    "audit:prod": "npm audit --omit=dev",
+    "audit:all": "npm audit",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -28,5 +30,8 @@
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
     "vitest": "^3.2.4"
+  },
+  "overrides": {
+    "rollup": "4.59.0"
   }
 }
