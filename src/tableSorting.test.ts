@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compareByColumn, compareNullable, ipToNumber, toggleSort, type SortConfig } from "./tableSorting";
+import { applySortToRows, compareByColumn, compareNullable, ipToNumber, toggleSort, type SortConfig } from "./tableSorting";
 
 describe("ipToNumber", () => {
   it("converts valid IPv4 address 10.0.0.2 to 167772162", () => {
@@ -165,5 +165,99 @@ describe("toggleSort", () => {
   it("handles empty string column name", () => {
     const result = toggleSort(null, "");
     expect(result).toEqual({ column: "", direction: "asc" });
+  });
+});
+
+describe("applySortToRows", () => {
+  interface TestRow {
+    id: number;
+    name: string;
+    value: number;
+  }
+
+  const rows: TestRow[] = [
+    { id: 1, name: "Charlie", value: 30 },
+    { id: 2, name: "Alice", value: 20 },
+    { id: 3, name: "Bob", value: 10 },
+  ];
+
+  it("returns original array unchanged when sortConfig is null (preserves default)", () => {
+    const result = applySortToRows(rows, null);
+    expect(result).toEqual(rows);
+    // Should preserve order
+    expect(result[0].name).toBe("Charlie");
+    expect(result[1].name).toBe("Alice");
+    expect(result[2].name).toBe("Bob");
+  });
+
+  it("sorts by numeric column ascending", () => {
+    const sortConfig: SortConfig = { column: "value", direction: "asc" };
+    const result = applySortToRows(rows, sortConfig);
+    expect(result[0].value).toBe(10);
+    expect(result[1].value).toBe(20);
+    expect(result[2].value).toBe(30);
+  });
+
+  it("sorts by numeric column descending", () => {
+    const sortConfig: SortConfig = { column: "value", direction: "desc" };
+    const result = applySortToRows(rows, sortConfig);
+    expect(result[0].value).toBe(30);
+    expect(result[1].value).toBe(20);
+    expect(result[2].value).toBe(10);
+  });
+
+  it("sorts by string column ascending", () => {
+    const sortConfig: SortConfig = { column: "name", direction: "asc" };
+    const result = applySortToRows(rows, sortConfig);
+    expect(result[0].name).toBe("Alice");
+    expect(result[1].name).toBe("Bob");
+    expect(result[2].name).toBe("Charlie");
+  });
+
+  it("sorts by string column descending", () => {
+    const sortConfig: SortConfig = { column: "name", direction: "desc" };
+    const result = applySortToRows(rows, sortConfig);
+    expect(result[0].name).toBe("Charlie");
+    expect(result[1].name).toBe("Bob");
+    expect(result[2].name).toBe("Alice");
+  });
+
+  it("does NOT mutate original array (immutability check)", () => {
+    const originalFirst = rows[0];
+    const sortConfig: SortConfig = { column: "name", direction: "asc" };
+    
+    const result = applySortToRows(rows, sortConfig);
+    
+    // Original array should still have same order
+    expect(rows[0]).toBe(originalFirst);
+    expect(rows[0].name).toBe("Charlie");
+    
+    // Result should be sorted
+    expect(result[0].name).toBe("Alice");
+  });
+
+  it("integration test with realistic AnalysisDeviceRow-like data", () => {
+    interface DeviceRow {
+      ip: string;
+      hostname: string;
+      riskScore: number;
+    }
+    
+    const devices: DeviceRow[] = [
+      { ip: "10.0.0.3", hostname: "device-c", riskScore: 5 },
+      { ip: "10.0.0.1", hostname: "device-a", riskScore: 10 },
+      { ip: "10.0.0.2", hostname: "device-b", riskScore: 3 },
+    ];
+    
+    // Sort by riskScore descending
+    const sortConfig: SortConfig = { column: "riskScore", direction: "desc" };
+    const result = applySortToRows(devices, sortConfig);
+    
+    expect(result[0].riskScore).toBe(10);
+    expect(result[1].riskScore).toBe(5);
+    expect(result[2].riskScore).toBe(3);
+    
+    // Original should be unchanged
+    expect(devices[0].hostname).toBe("device-c");
   });
 });

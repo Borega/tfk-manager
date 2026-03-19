@@ -173,3 +173,35 @@ export function toggleSort(
     direction: currentSort.direction === 'asc' ? 'desc' : 'asc'
   };
 }
+
+/**
+ * Applies a sort configuration to an array of rows.
+ * Returns a new sorted array without mutating the original.
+ * 
+ * @param rows - Array of row objects to sort
+ * @param sortConfig - Sort configuration (column and direction), or null to preserve order
+ * @returns New sorted array if sortConfig is present, otherwise returns original array unchanged
+ * 
+ * @example
+ * const rows = [{ name: "Bob", age: 25 }, { name: "Alice", age: 30 }];
+ * applySortToRows(rows, { column: "name", direction: "asc" })
+ * // Returns: [{ name: "Alice", age: 30 }, { name: "Bob", age: 25 }]
+ * 
+ * applySortToRows(rows, null)
+ * // Returns: [{ name: "Bob", age: 25 }, { name: "Alice", age: 30 }] (original order preserved)
+ */
+export function applySortToRows<T>(
+  rows: T[],
+  sortConfig: SortConfig | null
+): T[] {
+  // If no sort config, return rows unchanged (preserve default order)
+  if (sortConfig === null) {
+    return rows;
+  }
+
+  // Create a shallow copy to avoid mutating the original array
+  // Then sort using compareByColumn with the configured column and direction
+  return rows.slice().sort((a, b) =>
+    compareByColumn(a, b, sortConfig.column as keyof T, sortConfig.direction)
+  );
+}

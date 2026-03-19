@@ -18,7 +18,7 @@ import {
   type SourcePolicyKey,
 } from "./sourcePollingPolicy";
 import { searchTopic, type TopicNode } from "./topicSearch";
-import { toggleSort, type SortConfig } from "./tableSorting";
+import { applySortToRows, toggleSort, type SortConfig } from "./tableSorting";
 import "./App.css";
 
 type ClientRow = {
@@ -1283,6 +1283,21 @@ function App() {
       knownDeviceCount: byIp.size,
     };
   }, [existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
+
+  const sortedRiskyDevices = useMemo(
+    () => applySortToRows(analysis.riskyDevices, riskyDeviceSort),
+    [analysis.riskyDevices, riskyDeviceSort]
+  );
+
+  const sortedAllDevices = useMemo(
+    () => applySortToRows(analysis.rows, allDevicesSort),
+    [analysis.rows, allDevicesSort]
+  );
+
+  const sortedUnknownIps = useMemo(
+    () => applySortToRows(analysis.unknownActiveIps, unknownIpsSort),
+    [analysis.unknownActiveIps, unknownIpsSort]
+  );
 
   const filteredCategoryNodes = useMemo(() => {
     return searchTopic(topicSearchPattern, analysis.categoryNodes).slice(0, 15);
@@ -4423,7 +4438,7 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {analysis.riskyDevices.map((row) => (
+                      {sortedRiskyDevices.map((row) => (
                         <tr key={`risk-${row.ip}`} className={row.riskScore >= 50 ? "fw-row-block" : ""}>
                           <td>
                             <input
@@ -4479,7 +4494,7 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {analysis.rows.map((row) => (
+                      {sortedAllDevices.map((row) => (
                         <tr key={`analysis-${row.ip}`} className={row.fwBlock > 0 || row.wfBlock > 0 ? "fw-row-block" : ""}>
                           <td className="fw-cell-addr">
                             <button className="analysis-link-button" type="button" onClick={() => setSelectedAnalysisDeviceIp(row.ip)}>
@@ -4523,7 +4538,7 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {analysis.unknownActiveIps.map((row) => (
+                      {sortedUnknownIps.map((row) => (
                         <tr key={`unknown-${row.ip}`} className={row.block > 0 ? "fw-row-block" : ""}>
                           <td className="fw-cell-addr">{row.ip}</td>
                           <td>{row.pass}</td>
