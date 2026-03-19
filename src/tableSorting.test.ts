@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applySortToRows, compareByColumn, compareNullable, getSortIndicator, ipToNumber, toggleSort, type SortConfig } from "./tableSorting";
+import { applySortToRows, compareBoolean, compareByColumn, compareIp, compareNullable, compareSegment, compareTimestamp, getSortIndicator, ipToNumber, toggleSort, type SortConfig } from "./tableSorting";
 
 describe("ipToNumber", () => {
   it("converts valid IPv4 address 10.0.0.2 to 167772162", () => {
@@ -280,5 +280,227 @@ describe("getSortIndicator", () => {
   it("returns ' ↓' for descending sort on active column", () => {
     const sortConfig: SortConfig = { column: "riskScore", direction: "desc" };
     expect(getSortIndicator(sortConfig, "riskScore")).toBe(" ↓");
+  });
+});
+
+describe("compareIp", () => {
+  it("sorts IPs in numeric order (10.0.0.2 before 10.0.0.10)", () => {
+    // Numeric comparison: 10.0.0.2 (167772162) < 10.0.0.10 (167772170)
+    const result = compareIp("10.0.0.2", "10.0.0.10");
+    expect(result).toBeLessThan(0);
+  });
+
+  it("sorts large and small IPs correctly (10.0.0.10 before 192.168.1.1)", () => {
+    // 167772170 < 3232235777
+    const result = compareIp("10.0.0.10", "192.168.1.1");
+    expect(result).toBeLessThan(0);
+  });
+
+  it("handles invalid IPs by treating them as 0", () => {
+    // compareIp("invalid", "10.0.0.1") should be negative (0 < valid IP)
+    const result = compareIp("invalid", "10.0.0.1");
+    expect(result).toBeLessThan(0);
+  });
+
+  it("sorts multiple IPs in correct numeric order", () => {
+    // Array: ["10.0.0.10", "10.0.0.2", "192.168.1.1"]
+    // Sort to: ["10.0.0.2", "10.0.0.10", "192.168.1.1"]
+    const ips = ["10.0.0.10", "10.0.0.2", "192.168.1.1"];
+    const sorted = ips.slice().sort((a, b) => compareIp(a, b));
+    expect(sorted[0]).toBe("10.0.0.2");
+    expect(sorted[1]).toBe("10.0.0.10");
+    expect(sorted[2]).toBe("192.168.1.1");
+  });
+});
+
+describe("compareTimestamp", () => {
+  const mockToTimeMillis = (value: string): number => {
+    if (!value) return 0;
+    const ts = Date.parse(value);
+    return Number.isNaN(ts) ? 0 : ts;
+  };
+
+  it("sorts ISO timestamps correctly (earlier date before later)", () => {
+    // Earlier time: 09:00, Later time: 10:00
+    const earlierTime = "2024-01-01T09:00:00Z";
+    const laterTime = "2024-01-01T10:00:00Z";
+    const result = compareTimestamp(earlierTime, laterTime, mockToTimeMillis);
+    expect(result).toBeLessThan(0);
+  });
+
+  it("places empty strings last", () => {
+    // Valid time > empty time (0)
+    const result = compareTimestamp("2024-01-01T10:00:00Z", "", mockToTimeMillis);
+    expect(result).toBeGreaterThan(0);
+  });
+
+  it("handles identical timestamps (returns 0)", () => {
+    const ts = "2024-01-01T10:00:00Z";
+    const result = compareTimestamp(ts, ts, mockToTimeMillis);
+    expect(result).toBe(0);
+  });
+});
+
+describe("compareBoolean", () => {
+  it("sorts true before false (descending default)", () => {
+    // compareBoolean(true, false) should return < 0
+    const result = compareBoolean(true, false);
+    expect(result).toBeLessThan(0);
+  });
+
+  it("sorts false after true", () => {
+    // compareBoolean(false, true) should return > 0
+    const result = compareBoolean(false, true);
+    expect(result).toBeGreaterThan(0);
+  });
+
+  it("returns 0 for identical values", () => {
+    // compareBoolean(true, true) and compareBoolean(false, false)
+    expect(compareBoolean(true, true)).toBe(0);
+    expect(compareBoolean(false, false)).toBe(0);
+  });
+});
+
+describe("compareSegment", () => {
+  it("orders Static Gruen first", () => {
+    // compareSegment("Static Gruen", "Static BYOD") should return < 0
+    const result = compareSegment("Static Gruen", "Static BYOD");
+    expect(result).toBeLessThan(0);
+  });
+
+  it("orders Static BYOD second", () => {
+    // compareSegment("Static BYOD", "Dynamic Gruen") should return < 0
+    const result = compareSegment("Static BYOD", "Dynamic Gruen");
+    expect(result).toBeLessThan(0);
+  });
+
+  it("orders Dynamic Gruen third", () => {
+    // compareSegment("Dynamic Gruen", "Dynamic BYOD") should return < 0
+    const result = compareSegment("Dynamic Gruen", "Dynamic BYOD");
+    expect(result).toBeLessThan(0);
+  });
+
+  it("orders Dynamic BYOD fourth", () => {
+    // compareSegment("Dynamic BYOD", "Unknown") should return < 0
+    const result = compareSegment("Dynamic BYOD", "Unknown");
+    expect(result).toBeLessThan(0);
+  });
+
+  it("orders Unknown last", () => {
+    // compareSegment("Static Gruen", "Unknown") should return < 0
+    // compareSegment("Unknown", "Static Gruen") should return > 0
+    expect(compareSegment("Static Gruen", "Unknown")).toBeLessThan(0);
+    expect(compareSegment("Unknown", "Static Gruen")).toBeGreaterThan(0);
+  });
+
+  it("handles all segments in business order", () => {
+    const segments = ["Unknown", "Dynamic BYOD", "Static Gruen", "Dynamic Gruen", "Static BYOD"];
+    // After sorting with compareSegment, should be in business order:
+    const sorted = segments.slice().sort((a, b) => compareSegment(a, b));
+    expect(sorted[0]).toBe("Static Gruen");
+    expect(sorted[1]).toBe("Static BYOD");
+    expect(sorted[2]).toBe("Dynamic Gruen");
+    expect(sorted[3]).toBe("Dynamic BYOD");
+    expect(sorted[4]).toBe("Unknown");
+  });
+});
+
+describe("applySortToRows with special comparators", () => {
+  interface DeviceRow {
+    ip: string;
+    hostname: string;
+    lastSeen: string;
+    hasDualBlock: boolean;
+    segment: string;
+    riskScore: number;
+  }
+
+  const mockToTimeMillis = (value: string): number => {
+    if (!value) return 0;
+    const ts = Date.parse(value);
+    return Number.isNaN(ts) ? 0 : ts;
+  };
+
+  const devices: DeviceRow[] = [
+    {
+      ip: "192.168.1.1",
+      hostname: "host-1",
+      lastSeen: "2024-01-01T10:00:00Z",
+      hasDualBlock: true,
+      segment: "Dynamic BYOD",
+      riskScore: 5,
+    },
+    {
+      ip: "10.0.0.2",
+      hostname: "host-2",
+      lastSeen: "2024-01-01T09:00:00Z",
+      hasDualBlock: false,
+      segment: "Static Gruen",
+      riskScore: 10,
+    },
+    {
+      ip: "10.0.0.10",
+      hostname: "host-3",
+      lastSeen: "2024-01-01T11:00:00Z",
+      hasDualBlock: true,
+      segment: "Unknown",
+      riskScore: 3,
+    },
+  ];
+
+  it("uses IP comparator for 'ip' column (numeric sort)", () => {
+    const sortConfig: SortConfig = { column: "ip", direction: "asc" };
+    const result = applySortToRows(devices, sortConfig, mockToTimeMillis);
+    // Should be numeric order: 10.0.0.2, 10.0.0.10, 192.168.1.1
+    expect(result[0].ip).toBe("10.0.0.2");
+    expect(result[1].ip).toBe("10.0.0.10");
+    expect(result[2].ip).toBe("192.168.1.1");
+  });
+
+  it("uses IP comparator descending for 'ip' column", () => {
+    const sortConfig: SortConfig = { column: "ip", direction: "desc" };
+    const result = applySortToRows(devices, sortConfig, mockToTimeMillis);
+    // Should be reverse numeric order: 192.168.1.1, 10.0.0.10, 10.0.0.2
+    expect(result[0].ip).toBe("192.168.1.1");
+    expect(result[1].ip).toBe("10.0.0.10");
+    expect(result[2].ip).toBe("10.0.0.2");
+  });
+
+  it("uses timestamp comparator for 'lastSeen' column", () => {
+    const sortConfig: SortConfig = { column: "lastSeen", direction: "asc" };
+    const result = applySortToRows(devices, sortConfig, mockToTimeMillis);
+    // Should be chronological: 09:00, 10:00, 11:00
+    expect(result[0].hostname).toBe("host-2");
+    expect(result[1].hostname).toBe("host-1");
+    expect(result[2].hostname).toBe("host-3");
+  });
+
+  it("uses boolean comparator for 'hasDualBlock' column", () => {
+    const sortConfig: SortConfig = { column: "hasDualBlock", direction: "asc" };
+    const result = applySortToRows(devices, sortConfig, mockToTimeMillis);
+    // For boolean, asc should still sort true before false
+    // host-1 (true), host-3 (true) come before host-2 (false)
+    expect(result[0].hasDualBlock).toBe(true);
+    expect(result[1].hasDualBlock).toBe(true);
+    expect(result[2].hasDualBlock).toBe(false);
+  });
+
+  it("uses segment comparator for 'segment' column", () => {
+    const sortConfig: SortConfig = { column: "segment", direction: "asc" };
+    const result = applySortToRows(devices, sortConfig, mockToTimeMillis);
+    // Business order: Static Gruen, Static BYOD, Dynamic Gruen, Dynamic BYOD, Unknown
+    // Our devices: Dynamic BYOD (0), Static Gruen (1), Unknown (2)
+    expect(result[0].segment).toBe("Static Gruen");
+    expect(result[1].segment).toBe("Dynamic BYOD");
+    expect(result[2].segment).toBe("Unknown");
+  });
+
+  it("falls back to default comparison for other columns", () => {
+    const sortConfig: SortConfig = { column: "riskScore", direction: "asc" };
+    const result = applySortToRows(devices, sortConfig, mockToTimeMillis);
+    // Should sort numerically: 3, 5, 10
+    expect(result[0].riskScore).toBe(3);
+    expect(result[1].riskScore).toBe(5);
+    expect(result[2].riskScore).toBe(10);
   });
 });

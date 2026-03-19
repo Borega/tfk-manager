@@ -78,3 +78,6 @@ scripts/sfp4*.js
 .env.*
 *.pem
 *.key
+
+# Plan documentation (internal conductor agent artifacts)
+plans/
