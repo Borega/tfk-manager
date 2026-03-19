@@ -18,7 +18,7 @@ import {
   type SourcePolicyKey,
 } from "./sourcePollingPolicy";
 import { searchTopic, type TopicNode } from "./topicSearch";
-import { applySortToRows, toggleSort, type SortConfig } from "./tableSorting";
+import { applySortToRows, getSortIndicator, toggleSort, type SortConfig } from "./tableSorting";
 import "./App.css";
 
 type ClientRow = {
@@ -1372,9 +1372,9 @@ function App() {
   const handleSort = useCallback((tableId: string, column: string) => {
     if (tableId === 'risky') {
       setRiskyDeviceSort(prev => toggleSort(prev, column));
-    } else if (tableId === 'all') {
+    } else if (tableId === 'allDevices') {
       setAllDevicesSort(prev => toggleSort(prev, column));
-    } else if (tableId === 'unknown') {
+    } else if (tableId === 'unknownIps') {
       setUnknownIpsSort(prev => toggleSort(prev, column));
     }
   }, []);
@@ -4425,16 +4425,36 @@ function App() {
                     <thead>
                       <tr>
                         <th>Select</th>
-                        <th>Risk</th>
-                        <th>IP</th>
-                        <th>Hostname</th>
-                        <th>Segment</th>
-                        <th>User</th>
-                        <th>FW Block</th>
-                        <th>WF Block</th>
-                        <th>Dual</th>
-                        <th>Identity</th>
-                        <th>Last Seen</th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'riskScore')} style={{ cursor: 'pointer' }}>
+                          Risk{getSortIndicator(riskyDeviceSort, 'riskScore')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'ip')} style={{ cursor: 'pointer' }}>
+                          IP{getSortIndicator(riskyDeviceSort, 'ip')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'hostname')} style={{ cursor: 'pointer' }}>
+                          Hostname{getSortIndicator(riskyDeviceSort, 'hostname')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'segment')} style={{ cursor: 'pointer' }}>
+                          Segment{getSortIndicator(riskyDeviceSort, 'segment')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'user')} style={{ cursor: 'pointer' }}>
+                          User{getSortIndicator(riskyDeviceSort, 'user')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'fwBlock')} style={{ cursor: 'pointer' }}>
+                          FW Block{getSortIndicator(riskyDeviceSort, 'fwBlock')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'wfBlock')} style={{ cursor: 'pointer' }}>
+                          WF Block{getSortIndicator(riskyDeviceSort, 'wfBlock')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'hasDualBlock')} style={{ cursor: 'pointer' }}>
+                          Dual{getSortIndicator(riskyDeviceSort, 'hasDualBlock')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'identityConfidence')} style={{ cursor: 'pointer' }}>
+                          Identity{getSortIndicator(riskyDeviceSort, 'identityConfidence')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('risky', 'lastSeen')} style={{ cursor: 'pointer' }}>
+                          Last Seen{getSortIndicator(riskyDeviceSort, 'lastSeen')}
+                        </th>
                       </tr>
                     </thead>
                     <tbody>
@@ -4479,18 +4499,42 @@ function App() {
                   <table className="fw-table">
                     <thead>
                       <tr>
-                        <th>IP</th>
-                        <th>Hostname</th>
-                        <th>MAC</th>
-                        <th>User</th>
-                        <th>Segment</th>
-                        <th>Risk</th>
-                        <th>FW Pass</th>
-                        <th>FW Block</th>
-                        <th>WF Allow</th>
-                        <th>WF Block</th>
-                        <th>Identity</th>
-                        <th>Last Seen</th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'ip')} style={{ cursor: 'pointer' }}>
+                          IP{getSortIndicator(allDevicesSort, 'ip')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'hostname')} style={{ cursor: 'pointer' }}>
+                          Hostname{getSortIndicator(allDevicesSort, 'hostname')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'mac')} style={{ cursor: 'pointer' }}>
+                          MAC{getSortIndicator(allDevicesSort, 'mac')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'user')} style={{ cursor: 'pointer' }}>
+                          User{getSortIndicator(allDevicesSort, 'user')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'segment')} style={{ cursor: 'pointer' }}>
+                          Segment{getSortIndicator(allDevicesSort, 'segment')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'riskScore')} style={{ cursor: 'pointer' }}>
+                          Risk{getSortIndicator(allDevicesSort, 'riskScore')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'fwPass')} style={{ cursor: 'pointer' }}>
+                          FW Pass{getSortIndicator(allDevicesSort, 'fwPass')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'fwBlock')} style={{ cursor: 'pointer' }}>
+                          FW Block{getSortIndicator(allDevicesSort, 'fwBlock')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'wfAllow')} style={{ cursor: 'pointer' }}>
+                          WF Allow{getSortIndicator(allDevicesSort, 'wfAllow')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'wfBlock')} style={{ cursor: 'pointer' }}>
+                          WF Block{getSortIndicator(allDevicesSort, 'wfBlock')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'identityConfidence')} style={{ cursor: 'pointer' }}>
+                          Identity{getSortIndicator(allDevicesSort, 'identityConfidence')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('allDevices', 'lastSeen')} style={{ cursor: 'pointer' }}>
+                          Last Seen{getSortIndicator(allDevicesSort, 'lastSeen')}
+                        </th>
                       </tr>
                     </thead>
                     <tbody>
@@ -4532,9 +4576,15 @@ function App() {
                   <table className="fw-table">
                     <thead>
                       <tr>
-                        <th>IP</th>
-                        <th>FW Pass</th>
-                        <th>FW Block</th>
+                        <th className="sortable" onClick={() => handleSort('unknownIps', 'ip')} style={{ cursor: 'pointer' }}>
+                          IP{getSortIndicator(unknownIpsSort, 'ip')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('unknownIps', 'pass')} style={{ cursor: 'pointer' }}>
+                          FW Pass{getSortIndicator(unknownIpsSort, 'pass')}
+                        </th>
+                        <th className="sortable" onClick={() => handleSort('unknownIps', 'block')} style={{ cursor: 'pointer' }}>
+                          FW Block{getSortIndicator(unknownIpsSort, 'block')}
+                        </th>
                       </tr>
                     </thead>
                     <tbody>

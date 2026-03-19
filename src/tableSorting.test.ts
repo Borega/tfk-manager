@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applySortToRows, compareByColumn, compareNullable, ipToNumber, toggleSort, type SortConfig } from "./tableSorting";
+import { applySortToRows, compareByColumn, compareNullable, getSortIndicator, ipToNumber, toggleSort, type SortConfig } from "./tableSorting";
 
 describe("ipToNumber", () => {
   it("converts valid IPv4 address 10.0.0.2 to 167772162", () => {
@@ -259,5 +259,26 @@ describe("applySortToRows", () => {
     
     // Original should be unchanged
     expect(devices[0].hostname).toBe("device-c");
+  });
+});
+
+describe("getSortIndicator", () => {
+  it("returns empty string when sortConfig is null", () => {
+    expect(getSortIndicator(null, "riskScore")).toBe("");
+  });
+
+  it("returns empty string when different column is active", () => {
+    const sortConfig: SortConfig = { column: "hostname", direction: "asc" };
+    expect(getSortIndicator(sortConfig, "riskScore")).toBe("");
+  });
+
+  it("returns ' ↑' for ascending sort on active column", () => {
+    const sortConfig: SortConfig = { column: "riskScore", direction: "asc" };
+    expect(getSortIndicator(sortConfig, "riskScore")).toBe(" ↑");
+  });
+
+  it("returns ' ↓' for descending sort on active column", () => {
+    const sortConfig: SortConfig = { column: "riskScore", direction: "desc" };
+    expect(getSortIndicator(sortConfig, "riskScore")).toBe(" ↓");
   });
 });

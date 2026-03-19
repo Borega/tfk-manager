@@ -205,3 +205,35 @@ export function applySortToRows<T>(
     compareByColumn(a, b, sortConfig.column as keyof T, sortConfig.direction)
   );
 }
+
+/**
+ * Returns a visual sort indicator (arrow) for a column in the table header.
+ * Used to show users which column is currently sorted and in which direction.
+ * 
+ * @param sortConfig - Current sort configuration (null if no sort active)
+ * @param columnName - Name of the column to check
+ * @returns "" if no sort or different column is active, " ↑" for ascending, " ↓" for descending
+ * 
+ * @example
+ * getSortIndicator(null, "name") // ""
+ * getSortIndicator({ column: "name", direction: "asc" }, "name") // " ↑"
+ * getSortIndicator({ column: "name", direction: "desc" }, "name") // " ↓"
+ * getSortIndicator({ column: "name", direction: "asc" }, "age") // "" (different column)
+ */
+export function getSortIndicator(
+  sortConfig: SortConfig | null,
+  columnName: string
+): string {
+  // No sort active
+  if (sortConfig === null) {
+    return "";
+  }
+
+  // Different column is sorted
+  if (sortConfig.column !== columnName) {
+    return "";
+  }
+
+  // Same column - return indicator based on direction
+  return sortConfig.direction === 'asc' ? " ↑" : " ↓";
+}
