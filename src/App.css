@@ -1198,6 +1198,21 @@ input[type="checkbox"]:disabled {
   white-space: nowrap;
 }
 
+.fw-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.fw-table th.sortable:hover {
+  background: rgba(109, 173, 167, 0.15);
+}
+
+.sort-indicator {
+  font-size: 0.8em;
+  color: #8fd0ff;
+  margin-left: 4px;
+}
+
 .fw-table tbody tr:hover {
   background: rgba(255, 255, 255, 0.03);
 }
