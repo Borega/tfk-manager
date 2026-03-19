@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -18,6 +18,7 @@ import {
   type SourcePolicyKey,
 } from "./sourcePollingPolicy";
 import { searchTopic, type TopicNode } from "./topicSearch";
+import { toggleSort, type SortConfig } from "./tableSorting";
 import "./App.css";
 
 type ClientRow = {
@@ -882,6 +883,9 @@ function App() {
   const [topicSearchPattern, setTopicSearchPattern] = useState("");
   const [selectedRiskDeviceIps, setSelectedRiskDeviceIps] = useState<Set<string>>(new Set());
   const [selectedAnalysisDeviceIp, setSelectedAnalysisDeviceIp] = useState<string | null>(null);
+  const [riskyDeviceSort, setRiskyDeviceSort] = useState<SortConfig>(null);
+  const [allDevicesSort, setAllDevicesSort] = useState<SortConfig>(null);
+  const [unknownIpsSort, setUnknownIpsSort] = useState<SortConfig>(null);
   const wfScheduledRefetchRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -1349,6 +1353,16 @@ function App() {
       return next;
     });
   }
+
+  const handleSort = useCallback((tableId: string, column: string) => {
+    if (tableId === 'risky') {
+      setRiskyDeviceSort(prev => toggleSort(prev, column));
+    } else if (tableId === 'all') {
+      setAllDevicesSort(prev => toggleSort(prev, column));
+    } else if (tableId === 'unknown') {
+      setUnknownIpsSort(prev => toggleSort(prev, column));
+    }
+  }, []);
 
   const showLeaseViews = activeTab !== "firewall" && activeTab !== "webfilter" && activeTab !== "analysis";
 
