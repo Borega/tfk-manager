@@ -5,7 +5,19 @@
  * - IPv4 address ordering
  * - Generic column sorting with direction
  * - Nullable value handling
+ * - Sort state toggling for UI interactions
  */
+
+/**
+ * Sort direction for ascending or descending order
+ */
+export type SortDirection = 'asc' | 'desc';
+
+/**
+ * Configuration object for active column sort.
+ * null means no sort is active
+ */
+export type SortConfig = { column: string; direction: SortDirection } | null;
 
 /**
  * Converts an IPv4 address string to a 32-bit unsigned integer
@@ -129,4 +141,35 @@ export function compareByColumn<T>(
 
   // Reverse result if descending
   return direction === "desc" ? -result : result;
+}
+
+/**
+ * Toggles sort state when a column header is clicked.
+ * Implements a two-state cycle (asc ↔ desc) for the same column,
+ * and resets to asc when clicking a different column.
+ * 
+ * @param currentSort - Current sort configuration (null if no sort active)
+ * @param clickedColumn - Column name that was clicked
+ * @returns New sort configuration after the toggle
+ * 
+ * @example
+ * toggleSort(null, "hostname") // { column: "hostname", direction: "asc" }
+ * toggleSort({ column: "hostname", direction: "asc" }, "hostname") // { column: "hostname", direction: "desc" }
+ * toggleSort({ column: "hostname", direction: "desc" }, "hostname") // { column: "hostname", direction: "asc" }
+ * toggleSort({ column: "hostname", direction: "desc" }, "ip") // { column: "ip", direction: "asc" }
+ */
+export function toggleSort(
+  currentSort: SortConfig,
+  clickedColumn: string
+): SortConfig {
+  // No current sort or clicking a new column: start with asc
+  if (currentSort === null || currentSort.column !== clickedColumn) {
+    return { column: clickedColumn, direction: 'asc' };
+  }
+
+  // Same column: toggle direction (asc → desc, desc → asc)
+  return {
+    column: clickedColumn,
+    direction: currentSort.direction === 'asc' ? 'desc' : 'asc'
+  };
 }

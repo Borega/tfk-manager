@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compareByColumn, compareNullable, ipToNumber } from "./tableSorting";
+import { compareByColumn, compareNullable, ipToNumber, toggleSort, type SortConfig } from "./tableSorting";
 
 describe("ipToNumber", () => {
   it("converts valid IPv4 address 10.0.0.2 to 167772162", () => {
@@ -135,5 +135,35 @@ describe("compareByColumn", () => {
       expect(sorted[1].age).toBe(30);
       expect(sorted[2].age).toBe(35);
     });
+  });
+});
+
+describe("toggleSort", () => {
+  it("returns asc for a new column when currentSort is null", () => {
+    const result = toggleSort(null, "hostname");
+    expect(result).toEqual({ column: "hostname", direction: "asc" });
+  });
+
+  it("toggles from asc to desc for the same column", () => {
+    const currentSort: SortConfig = { column: "hostname", direction: "asc" };
+    const result = toggleSort(currentSort, "hostname");
+    expect(result).toEqual({ column: "hostname", direction: "desc" });
+  });
+
+  it("toggles from desc to asc for the same column (two-state cycle)", () => {
+    const currentSort: SortConfig = { column: "hostname", direction: "desc" };
+    const result = toggleSort(currentSort, "hostname");
+    expect(result).toEqual({ column: "hostname", direction: "asc" });
+  });
+
+  it("resets to asc when clicking a different column", () => {
+    const currentSort: SortConfig = { column: "hostname", direction: "desc" };
+    const result = toggleSort(currentSort, "ip");
+    expect(result).toEqual({ column: "ip", direction: "asc" });
+  });
+
+  it("handles empty string column name", () => {
+    const result = toggleSort(null, "");
+    expect(result).toEqual({ column: "", direction: "asc" });
   });
 });
