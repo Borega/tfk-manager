@@ -175,11 +175,104 @@ export function toggleSort(
 }
 
 /**
+ * Compares two IPv4 addresses numerically.
+ * Uses ipToNumber() to convert IPs to 32-bit integers for proper numeric comparison.
+ * 
+ * @param a - First IPv4 address string
+ * @param b - Second IPv4 address string
+ * @returns Standard comparator result: negative if a < b, 0 if equal, positive if a > b
+ * 
+ * @example
+ * compareIp("10.0.0.2", "10.0.0.10") // -8 (2 < 10 numerically)
+ * compareIp("10.0.0.10", "192.168.1.1") // negative (smaller IP)
+ */
+export function compareIp(a: string, b: string): number {
+  return ipToNumber(a) - ipToNumber(b);
+}
+
+/**
+ * Compares two ISO 8601 timestamp strings numerically by converting to milliseconds.
+ * Empty or invalid strings are treated as 0 and sort last.
+ * 
+ * @param a - First ISO timestamp string
+ * @param b - Second ISO timestamp string
+ * @param toTimeMillis - Function to convert ISO timestamp string to milliseconds
+ * @returns Standard comparator result: negative if a < b, 0 if equal, positive if a > b
+ * 
+ * @example
+ * const toTimeMillis = (s: string) => Date.parse(s);
+ * compareTimestamp("2024-01-01T10:00:00Z", "2024-01-01T09:00:00Z", toTimeMillis) // > 0
+ */
+export function compareTimestamp(
+  a: string,
+  b: string,
+  toTimeMillis: (value: string) => number
+): number {
+  return toTimeMillis(a) - toTimeMillis(b);
+}
+
+/**
+ * Compares two boolean values.
+ * True sorts before false (natural descending order for booleans).
+ * 
+ * @param a - First boolean value
+ * @param b - Second boolean value
+ * @returns -1 if a is true and b is false, 1 if a is false and b is true, 0 if equal
+ * 
+ * @example
+ * compareBoolean(true, false) // -1 (true comes first)
+ * compareBoolean(false, true) // 1 (false comes after)
+ * compareBoolean(true, true) // 0
+ */
+export function compareBoolean(a: boolean, b: boolean): number {
+  // For descending (natural order): true comes before false
+  // a === b ? 0 : a ? -1 : 1
+  // If a == b, return 0
+  // If a is true (and b is false), return -1 (a comes first)
+  // If a is false (and b is true), return 1 (a comes after)
+  return a === b ? 0 : a ? -1 : 1;
+}
+
+/**
+ * Business-order comparison for network segment types.
+ * Order: Static Gruen → Static BYOD → Dynamic Gruen → Dynamic BYOD → Unknown
+ * 
+ * @param a - First segment name
+ * @param b - Second segment name
+ * @returns Standard comparator result based on business order
+ * 
+ * @example
+ * compareSegment("Static Gruen", "Static BYOD") // -1 (Static Gruen comes first)
+ * compareSegment("Dynamic BYOD", "Unknown") // -1
+ * compareSegment("Unknown", "Static Gruen") // 1 (Unknown comes last)
+ */
+export function compareSegment(a: string, b: string): number {
+  const SEGMENT_ORDER = [
+    "Static Gruen",
+    "Static BYOD",
+    "Dynamic Gruen",
+    "Dynamic BYOD",
+    "Unknown",
+  ];
+
+  const aIndex = SEGMENT_ORDER.indexOf(a);
+  const bIndex = SEGMENT_ORDER.indexOf(b);
+
+  // If either segment is not recognized, treat as Unknown (last position)
+  const aPos = aIndex >= 0 ? aIndex : SEGMENT_ORDER.length - 1;
+  const bPos = bIndex >= 0 ? bIndex : SEGMENT_ORDER.length - 1;
+
+  return aPos - bPos;
+}
+
+/**
  * Applies a sort configuration to an array of rows.
  * Returns a new sorted array without mutating the original.
+ * Uses specialized comparators for specific columns (ip, lastSeen, hasDualBlock, segment).
  * 
  * @param rows - Array of row objects to sort
  * @param sortConfig - Sort configuration (column and direction), or null to preserve order
+ * @param toTimeMillis - Optional function to convert timestamp strings to milliseconds (required for 'lastSeen' sorting)
  * @returns New sorted array if sortConfig is present, otherwise returns original array unchanged
  * 
  * @example
@@ -187,23 +280,58 @@ export function toggleSort(
  * applySortToRows(rows, { column: "name", direction: "asc" })
  * // Returns: [{ name: "Alice", age: 30 }, { name: "Bob", age: 25 }]
  * 
- * applySortToRows(rows, null)
- * // Returns: [{ name: "Bob", age: 25 }, { name: "Alice", age: 30 }] (original order preserved)
+ * // With special comparators
+ * const toTimeMillis = (s: string) => Date.parse(s);
+ * applySortToRows(devices, { column: "ip", direction: "asc" }, toTimeMillis)
+ * // Uses compareIp for numeric IP sorting
  */
 export function applySortToRows<T>(
   rows: T[],
-  sortConfig: SortConfig | null
+  sortConfig: SortConfig | null,
+  toTimeMillis?: (value: string) => number
 ): T[] {
   // If no sort config, return rows unchanged (preserve default order)
   if (sortConfig === null) {
     return rows;
   }
 
+  const column = sortConfig.column;
+  const direction = sortConfig.direction;
+
   // Create a shallow copy to avoid mutating the original array
-  // Then sort using compareByColumn with the configured column and direction
-  return rows.slice().sort((a, b) =>
-    compareByColumn(a, b, sortConfig.column as keyof T, sortConfig.direction)
-  );
+  return rows.slice().sort((a, b) => {
+    let result = 0;
+
+    // Use specialized comparators for specific columns
+    if (column === "ip") {
+      const aVal = (a as Record<string, unknown>)[column] as string;
+      const bVal = (b as Record<string, unknown>)[column] as string;
+      result = compareIp(aVal, bVal);
+    } else if (column === "lastSeen") {
+      const aVal = (a as Record<string, unknown>)[column] as string;
+      const bVal = (b as Record<string, unknown>)[column] as string;
+      if (toTimeMillis) {
+        result = compareTimestamp(aVal, bVal, toTimeMillis);
+      } else {
+        // Fallback to default comparison if no toTimeMillis provided
+        result = compareByColumn(a, b, column as keyof T, "asc");
+      }
+    } else if (column === "hasDualBlock") {
+      const aVal = (a as Record<string, unknown>)[column] as boolean;
+      const bVal = (b as Record<string, unknown>)[column] as boolean;
+      result = compareBoolean(aVal, bVal);
+    } else if (column === "segment") {
+      const aVal = (a as Record<string, unknown>)[column] as string;
+      const bVal = (b as Record<string, unknown>)[column] as string;
+      result = compareSegment(aVal, bVal);
+    } else {
+      // Default behavior for all other columns
+      result = compareByColumn(a, b, column as keyof T, "asc");
+    }
+
+    // Apply direction (reverse result if descending)
+    return direction === "desc" ? -result : result;
+  });
 }
 
 /**

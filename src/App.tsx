@@ -1285,17 +1285,17 @@ function App() {
   }, [existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
 
   const sortedRiskyDevices = useMemo(
-    () => applySortToRows(analysis.riskyDevices, riskyDeviceSort),
+    () => applySortToRows(analysis.riskyDevices, riskyDeviceSort, toTimeMillis),
     [analysis.riskyDevices, riskyDeviceSort]
   );
 
   const sortedAllDevices = useMemo(
-    () => applySortToRows(analysis.rows, allDevicesSort),
+    () => applySortToRows(analysis.rows, allDevicesSort, toTimeMillis),
     [analysis.rows, allDevicesSort]
   );
 
   const sortedUnknownIps = useMemo(
-    () => applySortToRows(analysis.unknownActiveIps, unknownIpsSort),
+    () => applySortToRows(analysis.unknownActiveIps, unknownIpsSort, toTimeMillis),
     [analysis.unknownActiveIps, unknownIpsSort]
   );
 
@@ -2645,6 +2645,10 @@ function App() {
           ]);
         }
       }
+      // Reset sort states after refresh
+      setRiskyDeviceSort(null);
+      setAllDevicesSort(null);
+      setUnknownIpsSort(null);
     } finally {
       setAnalysisRefreshBusy(false);
     }
