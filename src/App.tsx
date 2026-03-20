@@ -7,6 +7,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 import { parseWebfilterStatus, type WebfilterStatusResult } from "./webfilterStatus";
 import { toWebfilterDynamicEnvelope } from "./webfilterDynamicProtocol";
+import { runWithInFlightGuard } from "./webfilterInFlightGuard";
 import {
   applyPollJitterMs,
   formatRetryWaitSeconds,
@@ -883,6 +884,7 @@ function App() {
   const [selectedRiskDeviceIps, setSelectedRiskDeviceIps] = useState<Set<string>>(new Set());
   const [selectedAnalysisDeviceIp, setSelectedAnalysisDeviceIp] = useState<string | null>(null);
   const wfScheduledRefetchRef = useRef<number | null>(null);
+  const wfLogsInFlightRef = useRef<Promise<WebfilterFetchResult> | null>(null);
 
   useEffect(() => {
     return () => {
@@ -2332,52 +2334,54 @@ function App() {
   }
 
   async function handleFetchWfLogs(): Promise<WebfilterFetchResult> {
-    setWfLogsBusy(true);
-    setWfLogsError(null);
-    setWfDiag(null);
-    setWfProtocolWarnings([]);
-    try {
-      const result = await invoke<WebfilterLogsInvokeResult>(
-        "fetch_webfilter_logs",
-        { payload: { settings, webfilterLogSearch: wfLogSearch.trim() } },
-      );
-      const envelope = toWebfilterDynamicEnvelope<WfLogEntry>(result, new Date());
+    return runWithInFlightGuard(wfLogsInFlightRef, async () => {
+      setWfLogsBusy(true);
+      setWfLogsError(null);
+      setWfDiag(null);
+      setWfProtocolWarnings([]);
+      try {
+        const result = await invoke<WebfilterLogsInvokeResult>(
+          "fetch_webfilter_logs",
+          { payload: { settings, webfilterLogSearch: wfLogSearch.trim() } },
+        );
+        const envelope = toWebfilterDynamicEnvelope<WfLogEntry>(result, new Date());
 
-      if (envelope.statePatch.diag !== undefined) {
-        setWfDiag(envelope.statePatch.diag);
-      }
-
-      if (envelope.warnings.length > 0) {
-        const warningMessages = envelope.warnings.map((item) => item.message);
-        setWfProtocolWarnings(warningMessages);
-        setLogs((prev) => [...prev, ...warningMessages.map((item) => `Webfilter protocol warning: ${item}`)]);
-      }
-
-      for (const action of envelope.actions) {
-        if (action.type === "set-filter") {
-          setWfLogFilter(action.filter);
-        } else if (action.type === "set-auto-refresh") {
-          setWfAutoRefresh(action.enabled);
-        } else if (action.type === "schedule-refetch") {
-          if (wfScheduledRefetchRef.current !== null) {
-            window.clearTimeout(wfScheduledRefetchRef.current);
-          }
-          wfScheduledRefetchRef.current = window.setTimeout(() => {
-            if (!canRunSourceNow("webfilter-ui")) return;
-            if (activeTab === "webfilter") {
-              void handleFetchWfLogs();
-            }
-          }, action.delayMs);
+        if (envelope.statePatch.diag !== undefined) {
+          setWfDiag(envelope.statePatch.diag);
         }
-      }
 
-      if (result.ok && envelope.statePatch.entries) {
-        setWfLogs(envelope.statePatch.entries);
-        setWfLastRefresh(envelope.statePatch.lastRefreshLabel ?? new Date().toLocaleTimeString());
-        markSourceSuccess("webfilter-ui");
-        const status = parseWebfilterStatus("ok", "webfilter-ui", "webfilter-80-1920");
-        return { ok: true, status };
-      } else {
+        if (envelope.warnings.length > 0) {
+          const warningMessages = envelope.warnings.map((item) => item.message);
+          setWfProtocolWarnings(warningMessages);
+          setLogs((prev) => [...prev, ...warningMessages.map((item) => `Webfilter protocol warning: ${item}`)]);
+        }
+
+        for (const action of envelope.actions) {
+          if (action.type === "set-filter") {
+            setWfLogFilter(action.filter);
+          } else if (action.type === "set-auto-refresh") {
+            setWfAutoRefresh(action.enabled);
+          } else if (action.type === "schedule-refetch") {
+            if (wfScheduledRefetchRef.current !== null) {
+              window.clearTimeout(wfScheduledRefetchRef.current);
+            }
+            wfScheduledRefetchRef.current = window.setTimeout(() => {
+              if (!canRunSourceNow("webfilter-ui")) return;
+              if (activeTab === "webfilter") {
+                void handleFetchWfLogs();
+              }
+            }, action.delayMs);
+          }
+        }
+
+        if (result.ok && envelope.statePatch.entries) {
+          setWfLogs(envelope.statePatch.entries);
+          setWfLastRefresh(envelope.statePatch.lastRefreshLabel ?? new Date().toLocaleTimeString());
+          markSourceSuccess("webfilter-ui");
+          const status = parseWebfilterStatus("ok", "webfilter-ui", "webfilter-80-1920");
+          return { ok: true, status };
+        }
+
         const status = parseWebfilterStatus(
           envelope.statePatch.error ?? "Unknown error",
           "webfilter-ui",
@@ -2387,16 +2391,16 @@ function App() {
         scheduleSourceRetry("webfilter-ui");
         setWfLogsError(status.message);
         return { ok: false, status };
+      } catch (err) {
+        const status = parseWebfilterStatus(String(err), "webfilter-ui", "webfilter-80-1920");
+        markSourceError("webfilter-ui", status.message);
+        scheduleSourceRetry("webfilter-ui");
+        setWfLogsError(status.message);
+        return { ok: false, status };
+      } finally {
+        setWfLogsBusy(false);
       }
-    } catch (err) {
-      const status = parseWebfilterStatus(String(err), "webfilter-ui", "webfilter-80-1920");
-      markSourceError("webfilter-ui", status.message);
-      scheduleSourceRetry("webfilter-ui");
-      setWfLogsError(status.message);
-      return { ok: false, status };
-    } finally {
-      setWfLogsBusy(false);
-    }
+    });
   }
 
   async function handleFetchWfAddressLists() {
