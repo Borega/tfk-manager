@@ -365,6 +365,7 @@ function normalizeWebfilterUser(userRaw: string): string {
 }
 
 const MAX_FW_LOG_ENTRIES = 500;
+const MAX_WF_LOG_ENTRIES = 1000;
 
 const DEFAULT_SETTINGS: SettingsState = {
   baseUrl: "https://your-opnsense-host:81",
@@ -1284,20 +1285,20 @@ function App() {
     };
   }, [existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
 
-  const sortedRiskyDevices = useMemo(
-    () => applySortToRows(analysis.riskyDevices, riskyDeviceSort, toTimeMillis),
-    [analysis.riskyDevices, riskyDeviceSort]
-  );
+  const sortedRiskyDevices = useMemo(() => {
+    if (riskyDeviceSort === null) return analysis.riskyDevices;
+    return applySortToRows(analysis.riskyDevices, riskyDeviceSort, toTimeMillis);
+  }, [analysis.riskyDevices, riskyDeviceSort]);
 
-  const sortedAllDevices = useMemo(
-    () => applySortToRows(analysis.rows, allDevicesSort, toTimeMillis),
-    [analysis.rows, allDevicesSort]
-  );
+  const sortedAllDevices = useMemo(() => {
+    if (allDevicesSort === null) return analysis.rows;
+    return applySortToRows(analysis.rows, allDevicesSort, toTimeMillis);
+  }, [analysis.rows, allDevicesSort]);
 
-  const sortedUnknownIps = useMemo(
-    () => applySortToRows(analysis.unknownActiveIps, unknownIpsSort, toTimeMillis),
-    [analysis.unknownActiveIps, unknownIpsSort]
-  );
+  const sortedUnknownIps = useMemo(() => {
+    if (unknownIpsSort === null) return analysis.unknownActiveIps;
+    return applySortToRows(analysis.unknownActiveIps, unknownIpsSort, toTimeMillis);
+  }, [analysis.unknownActiveIps, unknownIpsSort]);
 
   const filteredCategoryNodes = useMemo(() => {
     return searchTopic(topicSearchPattern, analysis.categoryNodes).slice(0, 15);
@@ -1332,7 +1333,10 @@ function App() {
     };
   }, [selectedAnalysisDeviceIp, analysis.rows, existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
 
-  const allRiskDeviceIps = analysis.riskyDevices.map((row) => row.ip);
+  const allRiskDeviceIps = useMemo(
+    () => analysis.riskyDevices.map((row) => row.ip),
+    [analysis.riskyDevices]
+  );
 
   const allRiskDevicesSelected = allRiskDeviceIps.length > 0
     && allRiskDeviceIps.every((ip) => selectedRiskDeviceIps.has(ip));
@@ -1347,6 +1351,8 @@ function App() {
       return next;
     });
   }, [allRiskDeviceIps.join("|")]);
+
+  // Stable reference for allRiskDeviceIps avoids triggering effect on unrelated changes
 
   function toggleAllRiskDevices() {
     if (allRiskDeviceIps.length === 0) return;
@@ -1700,20 +1706,37 @@ function App() {
 
   // Firewall log stream event listeners
   useEffect(() => {
+    const fwBatchRef: FirewallLogEntry[] = [];
+    let fwBatchTimerRef: number | null = null;
+
+    const flushBatch = () => {
+      if (fwBatchRef.length === 0) return;
+      setFwLogs((prev) => {
+        const next = [...prev, ...fwBatchRef];
+        fwBatchRef.length = 0; // Clear batch
+        return next.length > MAX_FW_LOG_ENTRIES ? next.slice(next.length - MAX_FW_LOG_ENTRIES) : next;
+      });
+      fwBatchTimerRef = null;
+    };
+
     const unlistenEntry = listen<string>("firewall-log-entry", (event) => {
       try {
         const entry = JSON.parse(event.payload) as FirewallLogEntry;
         if (entry.error) {
+          // Handle errors immediately (don't batch)
           setFwError(entry.error);
           markSourceError("firewall-stream", entry.error);
           setFwStreaming(false);
           return;
         }
         markSourceSuccess("firewall-stream");
-        setFwLogs((prev) => {
-          const next = [...prev, entry];
-          return next.length > MAX_FW_LOG_ENTRIES ? next.slice(next.length - MAX_FW_LOG_ENTRIES) : next;
-        });
+        
+        // Batch normal entries
+        fwBatchRef.push(entry);
+        
+        if (fwBatchTimerRef === null) {
+          fwBatchTimerRef = window.setTimeout(flushBatch, 300);
+        }
       } catch (_) {
         // ignore parse failures
       }
@@ -1722,6 +1745,10 @@ function App() {
       setFwStreaming(false);
     });
     return () => {
+      if (fwBatchTimerRef !== null) {
+        window.clearTimeout(fwBatchTimerRef);
+        flushBatch(); // Flush remaining entries on cleanup
+      }
       void unlistenEntry.then((fn) => fn());
       void unlistenStopped.then((fn) => fn());
     };
@@ -2392,7 +2419,8 @@ function App() {
       }
 
       if (result.ok && envelope.statePatch.entries) {
-        setWfLogs(envelope.statePatch.entries);
+        const entries = envelope.statePatch.entries;
+        setWfLogs(entries.length > MAX_WF_LOG_ENTRIES ? entries.slice(entries.length - MAX_WF_LOG_ENTRIES) : entries);
         setWfLastRefresh(envelope.statePatch.lastRefreshLabel ?? new Date().toLocaleTimeString());
         markSourceSuccess("webfilter-ui");
         const status = parseWebfilterStatus("ok", "webfilter-ui", "webfilter-80-1920");
