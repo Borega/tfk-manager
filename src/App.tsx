@@ -888,6 +888,8 @@ function App() {
   const [allDevicesSort, setAllDevicesSort] = useState<SortConfig>(null);
   const [unknownIpsSort, setUnknownIpsSort] = useState<SortConfig>(null);
   const wfScheduledRefetchRef = useRef<number | null>(null);
+  const fwBatchRef = useRef<FirewallLogEntry[]>([]);
+  const fwBatchTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
@@ -986,7 +988,8 @@ function App() {
     [wfAddressEntries, wfAddressSelectedIds],
   );
 
-  const analysis = useMemo(() => {
+  // Phase 3 optimization: Extract device identity map (depends only on leases, rarely changes)
+  const deviceIdentityMap = useMemo(() => {
     const byIp = new Map<string, AnalysisDeviceRow>();
     const knownIps = new Set<string>();
     const segmentKnownIps = new Map<AnalysisDeviceRow["segment"], Set<string>>([
@@ -996,7 +999,6 @@ function App() {
       ["Dynamic BYOD", new Set<string>()],
       ["Unknown", new Set<string>()],
     ]);
-    const userToIps = new Map<string, Set<string>>();
 
     const ensure = (ipRaw: string): AnalysisDeviceRow | null => {
       const ip = ipRaw.trim();
@@ -1059,6 +1061,49 @@ function App() {
       if (segmentSet) segmentSet.add(row.ip);
       markSeen(row, lease.end || lease.start);
     }
+
+    return { byIp, knownIps, segmentKnownIps, markSeen };
+  }, [existing.rows, existingW.rows, dynamicLeases]);
+
+  const analysis = useMemo(() => {
+    // Clone device identity map to allow mutation during log processing
+    const byIp = new Map<string, AnalysisDeviceRow>();
+    for (const [ip, row] of deviceIdentityMap.byIp) {
+      byIp.set(ip, { ...row }); // Shallow clone each row
+    }
+    const knownIps = new Set(deviceIdentityMap.knownIps);
+    const segmentKnownIps = new Map<AnalysisDeviceRow["segment"], Set<string>>();
+    for (const [segment, ips] of deviceIdentityMap.segmentKnownIps) {
+      segmentKnownIps.set(segment, new Set(ips));
+    }
+    const userToIps = new Map<string, Set<string>>();
+    const markSeen = deviceIdentityMap.markSeen;
+
+    const ensure = (ipRaw: string): AnalysisDeviceRow | null => {
+      const ip = ipRaw.trim();
+      if (!ip) return null;
+      const existingRow = byIp.get(ip);
+      if (existingRow) return existingRow;
+      const row: AnalysisDeviceRow = {
+        ip,
+        hostname: isGatewayRouterIp(ip) ? "TFK-Router" : "",
+        mac: "",
+        user: "",
+        segment: "Unknown",
+        isStatic: false,
+        isDynamic: false,
+        fwPass: 0,
+        fwBlock: 0,
+        wfAllow: 0,
+        wfBlock: 0,
+        hasDualBlock: false,
+        riskScore: 0,
+        identityConfidence: "low",
+        lastSeen: "",
+      };
+      byIp.set(ip, row);
+      return row;
+    };
 
     const blockedCategoryMap = new Map<string, number>();
     const blockedHostMap = new Map<string, number>();
@@ -1283,7 +1328,7 @@ function App() {
       wfOnlyBlocked,
       knownDeviceCount: byIp.size,
     };
-  }, [existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
+  }, [deviceIdentityMap, wfLogs, fwLogs]);
 
   const sortedRiskyDevices = useMemo(() => {
     if (riskyDeviceSort === null) return analysis.riskyDevices;
@@ -1706,17 +1751,16 @@ function App() {
 
   // Firewall log stream event listeners
   useEffect(() => {
-    const fwBatchRef: FirewallLogEntry[] = [];
-    let fwBatchTimerRef: number | null = null;
-
     const flushBatch = () => {
-      if (fwBatchRef.length === 0) return;
+      if (fwBatchRef.current.length === 0) return;
+      const batch = [...fwBatchRef.current]; // Capture batch before clearing
+      fwBatchRef.current = []; // Clear batch NOW, before setState
       setFwLogs((prev) => {
-        const next = [...prev, ...fwBatchRef];
-        fwBatchRef.length = 0; // Clear batch
-        return next.length > MAX_FW_LOG_ENTRIES ? next.slice(next.length - MAX_FW_LOG_ENTRIES) : next;
+        const next = [...prev, ...batch];
+        const result = next.length > MAX_FW_LOG_ENTRIES ? next.slice(next.length - MAX_FW_LOG_ENTRIES) : next;
+        return result;
       });
-      fwBatchTimerRef = null;
+      fwBatchTimerRef.current = null;
     };
 
     const unlistenEntry = listen<string>("firewall-log-entry", (event) => {
@@ -1732,12 +1776,12 @@ function App() {
         markSourceSuccess("firewall-stream");
         
         // Batch normal entries
-        fwBatchRef.push(entry);
+        fwBatchRef.current.push(entry);
         
-        if (fwBatchTimerRef === null) {
-          fwBatchTimerRef = window.setTimeout(flushBatch, 300);
+        if (fwBatchTimerRef.current === null) {
+          fwBatchTimerRef.current = window.setTimeout(flushBatch, 300);
         }
-      } catch (_) {
+      } catch (err) {
         // ignore parse failures
       }
     });
@@ -1745,8 +1789,8 @@ function App() {
       setFwStreaming(false);
     });
     return () => {
-      if (fwBatchTimerRef !== null) {
-        window.clearTimeout(fwBatchTimerRef);
+      if (fwBatchTimerRef.current !== null) {
+        window.clearTimeout(fwBatchTimerRef.current);
         flushBatch(); // Flush remaining entries on cleanup
       }
       void unlistenEntry.then((fn) => fn());
