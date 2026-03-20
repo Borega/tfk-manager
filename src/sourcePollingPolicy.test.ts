@@ -14,6 +14,10 @@ describe("sourcePollingPolicy", () => {
     expect(nextRetryDelayMs("webfilter-ui", 10)).toBe(120000);
   });
 
+  it("uses base delay when retry attempt is invalid", () => {
+    expect(nextRetryDelayMs("webfilter-ui", Number.NaN)).toBe(8000);
+  });
+
   it("marks retry ready when no retry timestamp exists", () => {
     expect(isRetryReady(null, Date.now())).toBe(true);
   });
@@ -32,14 +36,14 @@ describe("sourcePollingPolicy", () => {
     expect(formatRetryWaitSeconds(next, base + 4500)).toBe(0);
   });
 
-  it("uses faster interval in visible interactive view", () => {
+  it("uses approved 5s interval in visible interactive view", () => {
     expect(
       getWebfilterPollIntervalMs({
         isInteractiveView: true,
         isDocumentVisible: true,
         hasRecentError: false,
       }),
-    ).toBe(3000);
+    ).toBe(5000);
   });
 
   it("falls back to safer visible interval after recent errors", () => {
@@ -67,5 +71,21 @@ describe("sourcePollingPolicy", () => {
     const high = applyPollJitterMs(5000, 0.1, () => 1);
     expect(low).toBe(4500);
     expect(high).toBe(5500);
+  });
+
+  it("clamps jitter fraction outside the supported range", () => {
+    expect(applyPollJitterMs(5000, -1, () => 0)).toBe(5000);
+    expect(applyPollJitterMs(5000, 2, () => 1)).toBe(7500);
+  });
+
+  it("returns a finite minimum delay when baseMs is non-finite", () => {
+    expect(applyPollJitterMs(Number.NaN, 0.15, () => 0.5)).toBe(2000);
+    expect(applyPollJitterMs(Number.POSITIVE_INFINITY, 0.15, () => 0.5)).toBe(2000);
+  });
+
+  it("ignores non-finite jitter and random values", () => {
+    expect(applyPollJitterMs(5000, Number.NaN, () => 0)).toBe(5000);
+    expect(applyPollJitterMs(5000, 0.15, () => Number.NaN)).toBe(5000);
+    expect(applyPollJitterMs(5000, 0.15, () => Number.POSITIVE_INFINITY)).toBe(5000);
   });
 });

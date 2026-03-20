@@ -31,7 +31,8 @@ const SOURCE_RETRY_POLICY: Record<SourcePolicyKey, RetryPolicy> = {
 
 export function nextRetryDelayMs(source: SourcePolicyKey, attempt: number): number {
   const policy = SOURCE_RETRY_POLICY[source];
-  const exponent = Math.max(0, Math.floor(attempt));
+  const normalizedAttempt = Number.isFinite(attempt) ? attempt : 0;
+  const exponent = Math.max(0, Math.floor(normalizedAttempt));
   const raw = policy.baseMs * (2 ** exponent);
   return Math.min(policy.maxMs, raw);
 }
@@ -53,7 +54,7 @@ export function formatRetryWaitSeconds(nextRetryAtIso: string | null, nowMillis:
 }
 
 export function getWebfilterPollIntervalMs(context: WebfilterPollContext): number {
-  if (context.isInteractiveView && context.isDocumentVisible && !context.hasRecentError) return 3_000;
+  if (context.isInteractiveView && context.isDocumentVisible && !context.hasRecentError) return 5_000;
   if (context.isInteractiveView && context.isDocumentVisible) return 5_000;
   if (context.isInteractiveView && !context.isDocumentVisible) return 12_000;
   if (!context.isInteractiveView && context.isDocumentVisible) return 20_000;
@@ -65,10 +66,16 @@ export function applyPollJitterMs(
   jitterFraction: number = 0.15,
   random: () => number = Math.random,
 ): number {
-  const safeBase = Math.max(2_000, Math.floor(baseMs));
-  const fraction = Math.min(0.5, Math.max(0, jitterFraction));
+  const normalizedBase = Number.isFinite(baseMs) ? baseMs : 2_000;
+  const safeBase = Math.max(2_000, Math.floor(normalizedBase));
+  const normalizedJitter = Number.isFinite(jitterFraction) ? jitterFraction : 0;
+  const fraction = Math.min(0.5, Math.max(0, normalizedJitter));
   const delta = safeBase * fraction;
-  const factor = random() * 2 - 1;
+  const randomSample = random();
+  const normalizedRandom = Number.isFinite(randomSample) ? Math.min(1, Math.max(0, randomSample)) : 0.5;
+  const factor = normalizedRandom * 2 - 1;
   const jittered = safeBase + delta * factor;
-  return Math.max(2_000, Math.round(jittered));
+  const rounded = Math.round(jittered);
+  if (!Number.isFinite(rounded)) return 2_000;
+  return Math.max(2_000, rounded);
 }
