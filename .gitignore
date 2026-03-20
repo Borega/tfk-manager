@@ -42,6 +42,7 @@ src-tauri/data/
 
 # Local API tooling/scripts (not part of app runtime)
 backend/src/fetch*.py
+!backend/src/fetch_webfilter.py
 backend/src/test*.py
 
 # Generated lease/API output files
@@ -79,5 +80,5 @@ scripts/sfp4*.js
 *.pem
 *.key
 
-# Plan documentation (internal conductor agent artifacts)
+# Project planning documents
 plans/

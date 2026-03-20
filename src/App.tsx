@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -18,7 +18,6 @@ import {
   type SourcePolicyKey,
 } from "./sourcePollingPolicy";
 import { searchTopic, type TopicNode } from "./topicSearch";
-import { applySortToRows, getSortIndicator, toggleSort, type SortConfig } from "./tableSorting";
 import "./App.css";
 
 type ClientRow = {
@@ -365,7 +364,6 @@ function normalizeWebfilterUser(userRaw: string): string {
 }
 
 const MAX_FW_LOG_ENTRIES = 500;
-const MAX_WF_LOG_ENTRIES = 1000;
 
 const DEFAULT_SETTINGS: SettingsState = {
   baseUrl: "https://your-opnsense-host:81",
@@ -855,9 +853,9 @@ function App() {
 
   const [wfLogs, setWfLogs] = useState<WfLogEntry[]>([]);
   const [wfLogsBusy, setWfLogsBusy] = useState(false);
-  const [analysisRefreshBusy, setAnalysisRefreshBusy] = useState(false);
   const [wfLogsError, setWfLogsError] = useState<string | null>(null);
   const [wfLogFilter, setWfLogFilter] = useState<"all" | "allow" | "block">("all");
+  const [wfLogSearch, setWfLogSearch] = useState("");
   const [wfView, setWfView] = useState<"logs" | "address-lists">("logs");
   const [wfAutoRefresh, setWfAutoRefresh] = useState(false);
   const [wfLastRefresh, setWfLastRefresh] = useState<string | null>(null);
@@ -884,12 +882,7 @@ function App() {
   const [topicSearchPattern, setTopicSearchPattern] = useState("");
   const [selectedRiskDeviceIps, setSelectedRiskDeviceIps] = useState<Set<string>>(new Set());
   const [selectedAnalysisDeviceIp, setSelectedAnalysisDeviceIp] = useState<string | null>(null);
-  const [riskyDeviceSort, setRiskyDeviceSort] = useState<SortConfig>(null);
-  const [allDevicesSort, setAllDevicesSort] = useState<SortConfig>(null);
-  const [unknownIpsSort, setUnknownIpsSort] = useState<SortConfig>(null);
   const wfScheduledRefetchRef = useRef<number | null>(null);
-  const fwBatchRef = useRef<FirewallLogEntry[]>([]);
-  const fwBatchTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
@@ -966,9 +959,18 @@ function App() {
   }, [sourceHealth, sourceRetry, healthTick]);
 
   const wfLogsFiltered = useMemo(() => {
-    if (wfLogFilter === "all") return wfLogs;
-    return wfLogs.filter((e) => e.action.toLowerCase() === wfLogFilter);
-  }, [wfLogs, wfLogFilter]);
+    const byAction = wfLogFilter === "all"
+      ? wfLogs
+      : wfLogs.filter((e) => e.action.toLowerCase() === wfLogFilter);
+    const needle = wfLogSearch.trim().toLowerCase();
+    if (!needle) return byAction;
+    return byAction.filter((entry) => {
+      const haystack = [entry.action, entry.user, entry.ip, entry.time, entry.url, entry.category]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(needle);
+    });
+  }, [wfLogs, wfLogFilter, wfLogSearch]);
 
   const wfAddressEntries = useMemo(
     () => (wfAddressListType === "wl" ? wfWhitelistEntries : wfBlacklistEntries),
@@ -988,8 +990,7 @@ function App() {
     [wfAddressEntries, wfAddressSelectedIds],
   );
 
-  // Phase 3 optimization: Extract device identity map (depends only on leases, rarely changes)
-  const deviceIdentityMap = useMemo(() => {
+  const analysis = useMemo(() => {
     const byIp = new Map<string, AnalysisDeviceRow>();
     const knownIps = new Set<string>();
     const segmentKnownIps = new Map<AnalysisDeviceRow["segment"], Set<string>>([
@@ -999,6 +1000,7 @@ function App() {
       ["Dynamic BYOD", new Set<string>()],
       ["Unknown", new Set<string>()],
     ]);
+    const userToIps = new Map<string, Set<string>>();
 
     const ensure = (ipRaw: string): AnalysisDeviceRow | null => {
       const ip = ipRaw.trim();
@@ -1061,49 +1063,6 @@ function App() {
       if (segmentSet) segmentSet.add(row.ip);
       markSeen(row, lease.end || lease.start);
     }
-
-    return { byIp, knownIps, segmentKnownIps, markSeen };
-  }, [existing.rows, existingW.rows, dynamicLeases]);
-
-  const analysis = useMemo(() => {
-    // Clone device identity map to allow mutation during log processing
-    const byIp = new Map<string, AnalysisDeviceRow>();
-    for (const [ip, row] of deviceIdentityMap.byIp) {
-      byIp.set(ip, { ...row }); // Shallow clone each row
-    }
-    const knownIps = new Set(deviceIdentityMap.knownIps);
-    const segmentKnownIps = new Map<AnalysisDeviceRow["segment"], Set<string>>();
-    for (const [segment, ips] of deviceIdentityMap.segmentKnownIps) {
-      segmentKnownIps.set(segment, new Set(ips));
-    }
-    const userToIps = new Map<string, Set<string>>();
-    const markSeen = deviceIdentityMap.markSeen;
-
-    const ensure = (ipRaw: string): AnalysisDeviceRow | null => {
-      const ip = ipRaw.trim();
-      if (!ip) return null;
-      const existingRow = byIp.get(ip);
-      if (existingRow) return existingRow;
-      const row: AnalysisDeviceRow = {
-        ip,
-        hostname: isGatewayRouterIp(ip) ? "TFK-Router" : "",
-        mac: "",
-        user: "",
-        segment: "Unknown",
-        isStatic: false,
-        isDynamic: false,
-        fwPass: 0,
-        fwBlock: 0,
-        wfAllow: 0,
-        wfBlock: 0,
-        hasDualBlock: false,
-        riskScore: 0,
-        identityConfidence: "low",
-        lastSeen: "",
-      };
-      byIp.set(ip, row);
-      return row;
-    };
 
     const blockedCategoryMap = new Map<string, number>();
     const blockedHostMap = new Map<string, number>();
@@ -1328,22 +1287,7 @@ function App() {
       wfOnlyBlocked,
       knownDeviceCount: byIp.size,
     };
-  }, [deviceIdentityMap, wfLogs, fwLogs]);
-
-  const sortedRiskyDevices = useMemo(() => {
-    if (riskyDeviceSort === null) return analysis.riskyDevices;
-    return applySortToRows(analysis.riskyDevices, riskyDeviceSort, toTimeMillis);
-  }, [analysis.riskyDevices, riskyDeviceSort]);
-
-  const sortedAllDevices = useMemo(() => {
-    if (allDevicesSort === null) return analysis.rows;
-    return applySortToRows(analysis.rows, allDevicesSort, toTimeMillis);
-  }, [analysis.rows, allDevicesSort]);
-
-  const sortedUnknownIps = useMemo(() => {
-    if (unknownIpsSort === null) return analysis.unknownActiveIps;
-    return applySortToRows(analysis.unknownActiveIps, unknownIpsSort, toTimeMillis);
-  }, [analysis.unknownActiveIps, unknownIpsSort]);
+  }, [existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
 
   const filteredCategoryNodes = useMemo(() => {
     return searchTopic(topicSearchPattern, analysis.categoryNodes).slice(0, 15);
@@ -1378,10 +1322,7 @@ function App() {
     };
   }, [selectedAnalysisDeviceIp, analysis.rows, existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
 
-  const allRiskDeviceIps = useMemo(
-    () => analysis.riskyDevices.map((row) => row.ip),
-    [analysis.riskyDevices]
-  );
+  const allRiskDeviceIps = analysis.riskyDevices.map((row) => row.ip);
 
   const allRiskDevicesSelected = allRiskDeviceIps.length > 0
     && allRiskDeviceIps.every((ip) => selectedRiskDeviceIps.has(ip));
@@ -1396,8 +1337,6 @@ function App() {
       return next;
     });
   }, [allRiskDeviceIps.join("|")]);
-
-  // Stable reference for allRiskDeviceIps avoids triggering effect on unrelated changes
 
   function toggleAllRiskDevices() {
     if (allRiskDeviceIps.length === 0) return;
@@ -1419,16 +1358,6 @@ function App() {
       return next;
     });
   }
-
-  const handleSort = useCallback((tableId: string, column: string) => {
-    if (tableId === 'risky') {
-      setRiskyDeviceSort(prev => toggleSort(prev, column));
-    } else if (tableId === 'allDevices') {
-      setAllDevicesSort(prev => toggleSort(prev, column));
-    } else if (tableId === 'unknownIps') {
-      setUnknownIpsSort(prev => toggleSort(prev, column));
-    }
-  }, []);
 
   const showLeaseViews = activeTab !== "firewall" && activeTab !== "webfilter" && activeTab !== "analysis";
 
@@ -1751,37 +1680,21 @@ function App() {
 
   // Firewall log stream event listeners
   useEffect(() => {
-    const flushBatch = () => {
-      if (fwBatchRef.current.length === 0) return;
-      const batch = [...fwBatchRef.current]; // Capture batch before clearing
-      fwBatchRef.current = []; // Clear batch NOW, before setState
-      setFwLogs((prev) => {
-        const next = [...prev, ...batch];
-        const result = next.length > MAX_FW_LOG_ENTRIES ? next.slice(next.length - MAX_FW_LOG_ENTRIES) : next;
-        return result;
-      });
-      fwBatchTimerRef.current = null;
-    };
-
     const unlistenEntry = listen<string>("firewall-log-entry", (event) => {
       try {
         const entry = JSON.parse(event.payload) as FirewallLogEntry;
         if (entry.error) {
-          // Handle errors immediately (don't batch)
           setFwError(entry.error);
           markSourceError("firewall-stream", entry.error);
           setFwStreaming(false);
           return;
         }
         markSourceSuccess("firewall-stream");
-        
-        // Batch normal entries
-        fwBatchRef.current.push(entry);
-        
-        if (fwBatchTimerRef.current === null) {
-          fwBatchTimerRef.current = window.setTimeout(flushBatch, 300);
-        }
-      } catch (err) {
+        setFwLogs((prev) => {
+          const next = [...prev, entry];
+          return next.length > MAX_FW_LOG_ENTRIES ? next.slice(next.length - MAX_FW_LOG_ENTRIES) : next;
+        });
+      } catch (_) {
         // ignore parse failures
       }
     });
@@ -1789,10 +1702,6 @@ function App() {
       setFwStreaming(false);
     });
     return () => {
-      if (fwBatchTimerRef.current !== null) {
-        window.clearTimeout(fwBatchTimerRef.current);
-        flushBatch(); // Flush remaining entries on cleanup
-      }
       void unlistenEntry.then((fn) => fn());
       void unlistenStopped.then((fn) => fn());
     };
@@ -2430,7 +2339,7 @@ function App() {
     try {
       const result = await invoke<WebfilterLogsInvokeResult>(
         "fetch_webfilter_logs",
-        { payload: { settings } },
+        { payload: { settings, webfilterLogSearch: wfLogSearch.trim() } },
       );
       const envelope = toWebfilterDynamicEnvelope<WfLogEntry>(result, new Date());
 
@@ -2463,8 +2372,7 @@ function App() {
       }
 
       if (result.ok && envelope.statePatch.entries) {
-        const entries = envelope.statePatch.entries;
-        setWfLogs(entries.length > MAX_WF_LOG_ENTRIES ? entries.slice(entries.length - MAX_WF_LOG_ENTRIES) : entries);
+        setWfLogs(envelope.statePatch.entries);
         setWfLastRefresh(envelope.statePatch.lastRefreshLabel ?? new Date().toLocaleTimeString());
         markSourceSuccess("webfilter-ui");
         const status = parseWebfilterStatus("ok", "webfilter-ui", "webfilter-80-1920");
@@ -2696,33 +2604,19 @@ function App() {
   }
 
   async function handleRefreshAnalysis() {
-    if (analysisRefreshBusy || dynamicBusy || staticRefreshBusy || wfLogsBusy) {
-      setLogs((prev) => [...prev, "Analysis refresh already running. Please wait..."]);
-      return;
-    }
-
-    setAnalysisRefreshBusy(true);
     setLogs((prev) => [...prev, "Refreshing analysis sources (leases + webfilter)..."]);
-    try {
-      await refreshLeasesSilently();
-      if (settings.msdUsername.trim() && hasMsdPassword) {
-        const wfResult = await handleFetchWfLogs();
-        if (!wfResult.ok) {
-          const recovery = wfResult.status.recoveryAction !== "None"
-            ? ` Recovery: ${wfResult.status.recoveryAction}.`
-            : "";
-          setLogs((prev) => [
-            ...prev,
-            `Webfilter status (${wfResult.status.status}): ${wfResult.status.message}${recovery}`,
-          ]);
-        }
+    await refreshLeasesSilently();
+    if (settings.msdUsername.trim() && hasMsdPassword) {
+      const wfResult = await handleFetchWfLogs();
+      if (!wfResult.ok) {
+        const recovery = wfResult.status.recoveryAction !== "None"
+          ? ` Recovery: ${wfResult.status.recoveryAction}.`
+          : "";
+        setLogs((prev) => [
+          ...prev,
+          `Webfilter status (${wfResult.status.status}): ${wfResult.status.message}${recovery}`,
+        ]);
       }
-      // Reset sort states after refresh
-      setRiskyDeviceSort(null);
-      setAllDevicesSort(null);
-      setUnknownIpsSort(null);
-    } finally {
-      setAnalysisRefreshBusy(false);
     }
   }
 
@@ -3749,7 +3643,6 @@ function App() {
                     const value = e.currentTarget.value;
                     setSettings((prev) => ({ ...prev, msdUsername: value }));
                   }}
-                  placeholder="e.g. soeren.schroeder"
                 />
               </div>
               <div className="field">
@@ -3954,6 +3847,17 @@ function App() {
                           </button>
                         ))}
                       </div>
+                      <div className="field" style={{ marginTop: "8px", marginBottom: "8px" }}>
+                        <label htmlFor="wf-log-search">Search</label>
+                        <input
+                          id="wf-log-search"
+                          type="text"
+                          value={wfLogSearch}
+                          onChange={(e) => setWfLogSearch(e.target.value)}
+                          placeholder="Search text in logs"
+                          disabled={wfLogsBusy}
+                        />
+                      </div>
                       {wfLogsError && (
                         <p className="error-text" style={{ fontSize: "0.82rem" }}>{wfLogsError}</p>
                       )}
@@ -4096,13 +4000,8 @@ function App() {
                 Correlates static and dynamic leases with firewall stream and webfilter events.
               </p>
               <div className="fw-sidebar-controls">
-                <button
-                  className="secondary"
-                  type="button"
-                  onClick={() => void handleRefreshAnalysis()}
-                  disabled={analysisRefreshBusy || dynamicBusy || staticRefreshBusy || wfLogsBusy}
-                >
-                  {analysisRefreshBusy ? "Refreshing analysis sources..." : "Refresh analysis sources"}
+                <button className="secondary" type="button" onClick={() => void handleRefreshAnalysis()}>
+                  Refresh analysis sources
                 </button>
                 <button
                   className={fwStreaming ? "secondary" : "primary"}
@@ -4501,40 +4400,20 @@ function App() {
                     <thead>
                       <tr>
                         <th>Select</th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'riskScore')} style={{ cursor: 'pointer' }}>
-                          Risk{getSortIndicator(riskyDeviceSort, 'riskScore')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'ip')} style={{ cursor: 'pointer' }}>
-                          IP{getSortIndicator(riskyDeviceSort, 'ip')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'hostname')} style={{ cursor: 'pointer' }}>
-                          Hostname{getSortIndicator(riskyDeviceSort, 'hostname')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'segment')} style={{ cursor: 'pointer' }}>
-                          Segment{getSortIndicator(riskyDeviceSort, 'segment')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'user')} style={{ cursor: 'pointer' }}>
-                          User{getSortIndicator(riskyDeviceSort, 'user')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'fwBlock')} style={{ cursor: 'pointer' }}>
-                          FW Block{getSortIndicator(riskyDeviceSort, 'fwBlock')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'wfBlock')} style={{ cursor: 'pointer' }}>
-                          WF Block{getSortIndicator(riskyDeviceSort, 'wfBlock')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'hasDualBlock')} style={{ cursor: 'pointer' }}>
-                          Dual{getSortIndicator(riskyDeviceSort, 'hasDualBlock')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'identityConfidence')} style={{ cursor: 'pointer' }}>
-                          Identity{getSortIndicator(riskyDeviceSort, 'identityConfidence')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('risky', 'lastSeen')} style={{ cursor: 'pointer' }}>
-                          Last Seen{getSortIndicator(riskyDeviceSort, 'lastSeen')}
-                        </th>
+                        <th>Risk</th>
+                        <th>IP</th>
+                        <th>Hostname</th>
+                        <th>Segment</th>
+                        <th>User</th>
+                        <th>FW Block</th>
+                        <th>WF Block</th>
+                        <th>Dual</th>
+                        <th>Identity</th>
+                        <th>Last Seen</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {sortedRiskyDevices.map((row) => (
+                      {analysis.riskyDevices.map((row) => (
                         <tr key={`risk-${row.ip}`} className={row.riskScore >= 50 ? "fw-row-block" : ""}>
                           <td>
                             <input
@@ -4575,46 +4454,22 @@ function App() {
                   <table className="fw-table">
                     <thead>
                       <tr>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'ip')} style={{ cursor: 'pointer' }}>
-                          IP{getSortIndicator(allDevicesSort, 'ip')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'hostname')} style={{ cursor: 'pointer' }}>
-                          Hostname{getSortIndicator(allDevicesSort, 'hostname')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'mac')} style={{ cursor: 'pointer' }}>
-                          MAC{getSortIndicator(allDevicesSort, 'mac')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'user')} style={{ cursor: 'pointer' }}>
-                          User{getSortIndicator(allDevicesSort, 'user')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'segment')} style={{ cursor: 'pointer' }}>
-                          Segment{getSortIndicator(allDevicesSort, 'segment')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'riskScore')} style={{ cursor: 'pointer' }}>
-                          Risk{getSortIndicator(allDevicesSort, 'riskScore')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'fwPass')} style={{ cursor: 'pointer' }}>
-                          FW Pass{getSortIndicator(allDevicesSort, 'fwPass')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'fwBlock')} style={{ cursor: 'pointer' }}>
-                          FW Block{getSortIndicator(allDevicesSort, 'fwBlock')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'wfAllow')} style={{ cursor: 'pointer' }}>
-                          WF Allow{getSortIndicator(allDevicesSort, 'wfAllow')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'wfBlock')} style={{ cursor: 'pointer' }}>
-                          WF Block{getSortIndicator(allDevicesSort, 'wfBlock')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'identityConfidence')} style={{ cursor: 'pointer' }}>
-                          Identity{getSortIndicator(allDevicesSort, 'identityConfidence')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('allDevices', 'lastSeen')} style={{ cursor: 'pointer' }}>
-                          Last Seen{getSortIndicator(allDevicesSort, 'lastSeen')}
-                        </th>
+                        <th>IP</th>
+                        <th>Hostname</th>
+                        <th>MAC</th>
+                        <th>User</th>
+                        <th>Segment</th>
+                        <th>Risk</th>
+                        <th>FW Pass</th>
+                        <th>FW Block</th>
+                        <th>WF Allow</th>
+                        <th>WF Block</th>
+                        <th>Identity</th>
+                        <th>Last Seen</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {sortedAllDevices.map((row) => (
+                      {analysis.rows.map((row) => (
                         <tr key={`analysis-${row.ip}`} className={row.fwBlock > 0 || row.wfBlock > 0 ? "fw-row-block" : ""}>
                           <td className="fw-cell-addr">
                             <button className="analysis-link-button" type="button" onClick={() => setSelectedAnalysisDeviceIp(row.ip)}>
@@ -4652,19 +4507,13 @@ function App() {
                   <table className="fw-table">
                     <thead>
                       <tr>
-                        <th className="sortable" onClick={() => handleSort('unknownIps', 'ip')} style={{ cursor: 'pointer' }}>
-                          IP{getSortIndicator(unknownIpsSort, 'ip')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('unknownIps', 'pass')} style={{ cursor: 'pointer' }}>
-                          FW Pass{getSortIndicator(unknownIpsSort, 'pass')}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('unknownIps', 'block')} style={{ cursor: 'pointer' }}>
-                          FW Block{getSortIndicator(unknownIpsSort, 'block')}
-                        </th>
+                        <th>IP</th>
+                        <th>FW Pass</th>
+                        <th>FW Block</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {sortedUnknownIps.map((row) => (
+                      {analysis.unknownActiveIps.map((row) => (
                         <tr key={`unknown-${row.ip}`} className={row.block > 0 ? "fw-row-block" : ""}>
                           <td className="fw-cell-addr">{row.ip}</td>
                           <td>{row.pass}</td>
