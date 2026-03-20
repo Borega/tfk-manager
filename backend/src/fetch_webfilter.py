@@ -86,18 +86,21 @@ def apply_cookie_header(session: requests.Session, cookie_header: str) -> int:
 
 
 def extract_inputs(html: str) -> Dict[str, str]:
-    fields: Dict[str, str] = {}
-    input_pattern = re.compile(
-        r"<input[^>]*name=[\"']([^\"']+)[\"'][^>]*>",
+    fields: Dict[str, str] = {
+        name: html_lib.unescape(value)
+        for name, value in re.findall(
+            r'<input[^>]*type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']',
+            html,
+            flags=re.IGNORECASE,
+        )
+    }
+    for raw_value, name in re.findall(
+        r'<input[^>]*type=["\']hidden["\'][^>]*value=["\']([^"\']*)["\'][^>]*name=["\']([^"\']+)["\']',
+        html,
         flags=re.IGNORECASE,
-    )
-    value_pattern = re.compile(r"value=[\"']([^\"']*)[\"']", flags=re.IGNORECASE)
-    for match in input_pattern.finditer(html):
-        full_tag = match.group(0)
-        name = match.group(1)
-        value_match = value_pattern.search(full_tag)
-        value = value_match.group(1) if value_match else ""
-        fields[name] = value
+    ):
+        if name not in fields:
+            fields[name] = html_lib.unescape(raw_value)
     return fields
 
 
@@ -127,48 +130,96 @@ def discover_logs_path(html: str, fallback_path: str = "") -> str:
     return "/?action=logs"
 
 
-def try_form_login(session: requests.Session, base_url: str, html: str, username: str, password: str) -> None:
-    if not username or not password:
-        return
+def discover_proxy_probe_path(html: str) -> str:
+    # Prefer links that reference the Schulfilter handoff iframe/dashboard endpoint.
+    for pattern in [
+        r'href=["\']([^"\']*myiframe[^"\']*)["\']',
+        r'href=["\']([^"\']*1920[^"\']*)["\']',
+        r'href=["\']([^"\']*schulfilter[^"\']*)["\']',
+        r'href=["\']([^"\']*sfp[^"\']*)["\']',
+        r'href=["\']([^"\']*proxy[^"\']*)["\']',
+    ]:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if match:
+            return html_lib.unescape(match.group(1).strip())
+    return ""
 
-    fields = extract_inputs(html)
-    if not fields:
-        return
 
-    user_field: Optional[str] = None
-    pass_field: Optional[str] = None
-    for name in fields.keys():
-        lowered = name.lower()
-        if user_field is None and ("user" in lowered or "login" in lowered):
-            user_field = name
-        if pass_field is None and "pass" in lowered:
-            pass_field = name
-
-    if not user_field or not pass_field:
-        return
-
-    fields[user_field] = username
-    fields[pass_field] = password
-    fields.setdefault("login", "1")
-
-    action_match = re.search(r"<form[^>]*action=[\"']([^\"']+)[\"']", html, flags=re.IGNORECASE)
-    action = action_match.group(1).strip() if action_match else "/"
-    login_url = urljoin(f"{base_url}/", action)
-    debug_log(f"Submitting login form to {login_url}")
-
-    response = session.post(
-        login_url,
-        data=fields,
-        timeout=(30, 60),
-        allow_redirects=True,
-        headers={
-            "Referer": f"{base_url}/",
-            "Origin": base_url,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
+def discover_redirect_bridge_path(html: str) -> str:
+    # SSO bridge is usually rendered as an iframe src=...redirect.php?&sID=...
+    match = re.search(
+        r'<iframe[^>]+src=["\']([^"\']*redirect\.php[^"\']*)["\']',
+        html,
+        flags=re.IGNORECASE,
     )
-    debug_log(f"Login form response status={response.status_code} url={response.url}")
+    if not match:
+        return ""
+    return html_lib.unescape(match.group(1).strip())
+
+
+def msd_form_login(session: requests.Session, base_url: str, username: str, password: str) -> bool:
+    """MSD-specific login flow: GET login page, scrape fields, POST authenticate."""
+    if not username or not password:
+        return False
+    
+    # Step 1: GET login page with username
+    login_get_url = f"{base_url}/tfk.msd/login/login?username={username}"
+    debug_log(f"GET {login_get_url}")
+    try:
+        login_page = session.get(login_get_url, timeout=(30, 60), allow_redirects=True)
+        debug_log(f"GET status: {login_page.status_code}")
+        if _debug_enabled():
+            cookies_dict = {c.name: c.value for c in session.cookies}
+            debug_log(f"Cookies after GET: {cookies_dict}")
+    except requests.RequestException as exc:
+        debug_log(f"Login GET failed: {exc}")
+        return False
+    
+    # Step 2: Scrape hidden form fields with HTML-unescaped values.
+    fields = extract_inputs(login_page.text)
+    if not fields:
+        debug_log("No form fields found in login page")
+        return False
+    
+    hidden_fields = [name for name, val in fields.items() if name and not any(x in name.lower() for x in ['username', 'password'])]
+    debug_log(f"Scraped hidden fields: {hidden_fields}")
+    
+    # Step 3: Add credentials and normalize ssoSession like the known-good flow.
+    fields['username'] = username
+    fields['password'] = password
+    fields['ssoSession'] = ""
+    
+    # Step 4: POST to authenticate endpoint
+    auth_url = f"{base_url}/tfk.msd/login/authenticate"
+    debug_log(f"POST {auth_url}")
+    try:
+        auth_resp = session.post(
+            auth_url,
+            data=fields,
+            timeout=(30, 60),
+            allow_redirects=False,  # Handle redirect manually to track it
+            headers={
+                "Referer": login_get_url,
+                "Origin": base_url,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        location = auth_resp.headers.get("Location", "")
+        debug_log(f"POST status: {auth_resp.status_code}, Location: {location!r}")
+        
+        # Step 5: Follow redirect to dashboard
+        if location:
+            dashboard_url = urljoin(f"{base_url}/", location)
+            debug_log(f"GET dashboard: {dashboard_url}")
+            dashboard_resp = session.get(dashboard_url, timeout=(30, 60), allow_redirects=True)
+            debug_log(f"Dashboard status: {dashboard_resp.status_code}, length: {len(dashboard_resp.text)}")
+            return dashboard_resp.status_code == 200
+        
+        return auth_resp.status_code in (301, 302, 303, 307, 308)
+    except requests.RequestException as exc:
+        debug_log(f"Login POST failed: {exc}")
+        return False
 
 
 def parse_log_entries(html: str) -> List[Dict[str, str]]:
@@ -230,31 +281,143 @@ def fetch_webfilter_logs(search_text: str) -> Dict[str, Any]:
     username = os.environ.get("TFK_MSD_USERNAME", "").strip()
     password = os.environ.get("TFK_MSD_PASSWORD", "").strip()
 
-    try:
-        landing = session.get(f"{base_url}/", timeout=(30, 60), allow_redirects=True)
-    except requests.RequestException as exc:
-        return {"ok": False, "entries": [], "error": f"Webfilter connection failed: {exc}"}
+    landing = None  # Will be set by parent domain flow or direct connection
+    dashboard_html = ""
+    
+    # Visit parent domain first to collect MSD_Cookie and MSD_Frontend
+    # The proxy at :1920 requires cookies from the main MSD system
+    parsed = urlsplit(base_url)
+    if parsed.hostname:
+        parent_url = f"{parsed.scheme}://{parsed.hostname}/"
+        try:
+            # Authenticate on parent domain if credentials provided
+            if username and password:
+                login_success = msd_form_login(session, parent_url.rstrip('/'), username, password)
+                if not login_success:
+                    return {
+                        "ok": False,
+                        "entries": [],
+                        "error": "MSD login failed (authenticate did not return redirect)",
+                    }
+            
+            # After login, get dashboard to find myiframe link
+            dashboard_url = f"{parent_url.rstrip('/')}/tfk.msd/dashboard/index"
+            debug_log(f"GET dashboard: {dashboard_url}")
+            dashboard_resp = session.get(dashboard_url, timeout=(30, 60), allow_redirects=True)
+            debug_log(f"Dashboard status: {dashboard_resp.status_code}, length: {len(dashboard_resp.text)}")
+            dashboard_html = dashboard_resp.text
+
+            dashboard_html = dashboard_resp.text
+
+            # Follow browser bridge flow:
+            # dashboard/myiframe -> iframe redirect.php?sID=... -> Location to :1920/dsh...sid...
+            probe_path = discover_proxy_probe_path(dashboard_html)
+            if not probe_path:
+                # Fallback to default myiframe endpoint
+                probe_path = "/tfk.msd/dashboard/myiframe?product_string=sfp"
+            
+            probe_url = urljoin(parent_url, probe_path)
+            debug_log(f"Found Schulfilter Plus link: {probe_path}")
+            debug_log(f"Probing Schulfilter Plus proxy at: {probe_url}")
+
+            proxy_resp = session.get(
+                probe_url,
+                timeout=(30, 60),
+                allow_redirects=True,
+                headers={
+                    "Referer": dashboard_url,
+                    "DNT": "1",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+            )
+            debug_log(f"Proxy probe response ({len(proxy_resp.text)} bytes): {proxy_resp.text[:300]!r}")
+
+            redirect_path = discover_redirect_bridge_path(proxy_resp.text)
+            if redirect_path:
+                redirect_url = urljoin(parent_url, redirect_path)
+                debug_log(f"GET redirect bridge: {redirect_url}")
+                redirect_resp = session.get(
+                    redirect_url,
+                    timeout=(30, 60),
+                    allow_redirects=False,
+                    headers={
+                        "Referer": probe_url,
+                        "DNT": "1",
+                        "Upgrade-Insecure-Requests": "1",
+                    },
+                )
+                location_1920 = redirect_resp.headers.get("Location", "")
+                debug_log(f"redirect.php status: {redirect_resp.status_code}, Location: {location_1920!r}")
+
+                if location_1920:
+                    handoff_url = location_1920
+                    if not handoff_url.startswith("http"):
+                        handoff_url = f"http://{parsed.hostname}:1920/{handoff_url.lstrip('/')}"
+                    debug_log(f"Port-1920 handoff URL: {handoff_url}")
+                    landing = session.get(
+                        handoff_url,
+                        timeout=(30, 60),
+                        allow_redirects=True,
+                        headers={
+                            "Referer": f"{parent_url.rstrip('/')}/",
+                            "DNT": "1",
+                            "Upgrade-Insecure-Requests": "1",
+                        },
+                    )
+                    debug_log(f"Cookies after handoff: {dict(session.cookies)}")
+                    if _debug_enabled():
+                        debug_log(f"All cookies: {dict(session.cookies)}")
+        except requests.RequestException as exc:
+            debug_log(f"Parent URL visit failed (non-fatal): {exc}")
+
+    # If we didn't get landing from redirect.php, fetch proxy directly
+    if landing is None:
+        try:
+            landing = session.get(f"{base_url}/", timeout=(30, 60), allow_redirects=True)
+        except requests.RequestException as exc:
+            return {"ok": False, "entries": [], "error": f"Webfilter connection failed: {exc}"}
 
     debug_log(f"Landing page status={landing.status_code} url={landing.url}")
-    try_form_login(session, base_url, landing.text, username, password)
+    if _debug_enabled():
+        cookies_after_landing = [f"{c.name}={c.value} (domain={c.domain}, path={c.path})" for c in session.cookies]
+        debug_log(f"Cookies after landing: {', '.join(cookies_after_landing) if cookies_after_landing else '(none)'}")
 
-    logs_path = discover_logs_path(landing.text, urlsplit(landing.url).path)
-    logs_url = urljoin(f"{base_url}/", logs_path.lstrip("/"))
-    if "action=logs" not in logs_url:
-        joiner = "&" if "?" in logs_url else "?"
-        logs_url = f"{logs_url}{joiner}action=logs"
+    # Get the proxy base URL from landing URL (strip query params and path)
+    landing_parsed = urlsplit(landing.url)
+    proxy_base_url = f"{landing_parsed.scheme}://{landing_parsed.netloc}"
+    
+    # GET index.php entry page first (like working version does)
+    entry_url = f"{proxy_base_url}/index.php"
+    debug_log(f"GET entry page: {entry_url}")
+    try:
+        entry_resp = session.get(entry_url, timeout=(30, 60), allow_redirects=True)
+        debug_log(f"GET entry status: {entry_resp.status_code}, length: {len(entry_resp.text)}, url: {entry_resp.url}")
+    except requests.RequestException as exc:
+        return {"ok": False, "entries": [], "error": f"Entry page request failed: {exc}"}
+    
+    # Build logs URL from entry page URL
+    logs_url = f"{entry_resp.url.rsplit('?', 1)[0]}?action=logs"
+    debug_log(f"Logs URL: {logs_url}")
+    
+    # GET logs page first
+    try:
+        logs_get_resp = session.get(logs_url, timeout=(30, 60), allow_redirects=True)
+        debug_log(f"GET logs status: {logs_get_resp.status_code}, length: {len(logs_get_resp.text)}")
+    except requests.RequestException as exc:
+        return {"ok": False, "entries": [], "error": f"Logs GET request failed: {exc}"}
 
-    debug_log(f"Logs endpoint={logs_url}")
-
+    # POST to logs with page size and filter
     form_data = {
-        "sfpLogs[formPageSizeOld]": "25",
+        "sfpLogs[formFilterOld_freitext]": search_text,
         "sfpLogs[formPageOld]": "1",
-        "sfpLogs[formFilterOld_freitext]": "",
-        "sfpLogs[formPageSizeTop]": "50",
-        "sfpLogs[formFilter_freitext]": search_text,
-        "sfpLogs[submit_filter_freitext]": "Filtern",
-        "sfpLogs[formPageSizeBottom]": "50",
+        "sfpLogs[formPageSizeOld]": "25",
+        "sfpLogs[formPageSizeTop]": "300",
+        "sfpLogs[submitPageSizeTop]": "",
     }
+    
+    debug_log(f"POST {logs_url} (page_size=300)")
+    if _debug_enabled():
+        debug_log(f"POST payload keys: {list(form_data.keys())}")
 
     try:
         response = session.post(
@@ -264,13 +427,15 @@ def fetch_webfilter_logs(search_text: str) -> Dict[str, Any]:
             allow_redirects=True,
             headers={
                 "Referer": logs_url,
-                "Origin": base_url,
+                "Origin": proxy_base_url,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
         )
     except requests.RequestException as exc:
         return {"ok": False, "entries": [], "error": f"Webfilter logs request failed: {exc}"}
+
+    debug_log(f"POST logs status: {response.status_code}, length: {len(response.text)}")
 
     if response.status_code >= 400:
         return {
@@ -280,8 +445,15 @@ def fetch_webfilter_logs(search_text: str) -> Dict[str, Any]:
         }
 
     entries = parse_log_entries(response.text)
+    debug_log(f"Parsed {len(entries)} log entries")
+
     if not entries and _debug_enabled():
         debug_log("No webfilter log rows parsed from HTML response")
+        # Save response HTML to temp file for debugging
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
+            f.write(response.text)
+            debug_log(f"Saved response HTML to: {f.name}")
 
     return {
         "ok": True,
