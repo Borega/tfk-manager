@@ -10,6 +10,62 @@ use std::thread;
 use tauri::{Emitter, Manager};
 use keyring::Entry;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(not(windows))]
+const CREATE_NO_WINDOW: u32 = 0;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static PYTHON_SUBPROCESS_POLICY_APPLY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn python_subprocess_creation_flags() -> Option<u32> {
+    if cfg!(windows) {
+        Some(CREATE_NO_WINDOW)
+    } else {
+        None
+    }
+}
+
+fn apply_python_subprocess_policy(command: &mut Command) {
+    #[cfg(test)]
+    {
+        PYTHON_SUBPROCESS_POLICY_APPLY_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        if let Some(flags) = python_subprocess_creation_flags() {
+            command.creation_flags(flags);
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
+#[cfg(test)]
+fn reset_python_subprocess_policy_apply_count_for_tests() {
+    PYTHON_SUBPROCESS_POLICY_APPLY_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn python_subprocess_policy_apply_count_for_tests() -> usize {
+    PYTHON_SUBPROCESS_POLICY_APPLY_COUNT.load(Ordering::SeqCst)
+}
+
+fn build_python_command(python_path: &str) -> Command {
+    let mut command = Command::new(python_path);
+    apply_python_subprocess_policy(&mut command);
+    command
+}
+
 #[derive(Default)]
 struct ProcessState {
     child: Mutex<Option<std::process::Child>>,
@@ -329,7 +385,7 @@ fn find_python(app: tauri::AppHandle) -> Result<HelpResult, String> {
 fn install_backend_deps(app: tauri::AppHandle, python_path: String) -> Result<HelpResult, String> {
     let backend_dir = resolve_backend_dir(&app)?;
     let requirements = backend_dir.join("requirements.txt");
-    let mut cmd = Command::new(python_path);
+    let mut cmd = build_python_command(&python_path);
     cmd.arg("-m")
         .arg("pip")
         .arg("install")
@@ -632,7 +688,7 @@ fn run_dhcp_sync(app: &tauri::AppHandle, payload: RunPayload) -> Result<RunRecor
     }
 
     let data_dir = ensure_backend_data_dir(app)?;
-    let mut command = Command::new(&payload.settings.python_path);
+    let mut command = build_python_command(&payload.settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -724,7 +780,7 @@ fn export_static_sync(app: &tauri::AppHandle, payload: ExportPayload) -> Result<
         lines.push("No stored password found; login prompt may appear.".to_string());
     }
 
-    let mut command = Command::new(&settings.python_path);
+    let mut command = build_python_command(&settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -809,7 +865,7 @@ fn discover_api_credentials_sync(
     let mut lines = vec!["API bootstrap started".to_string()];
     emit_line(app, "API bootstrap started");
 
-    let mut command = Command::new(&settings.python_path);
+    let mut command = build_python_command(&settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -884,7 +940,7 @@ fn load_dynamic_leases_sync(
     let data_dir = ensure_backend_data_dir(app)?;
     let password = get_password().unwrap_or(None);
 
-    let mut command = Command::new(&settings.python_path);
+    let mut command = build_python_command(&settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -962,7 +1018,7 @@ fn move_dynamic_to_static_sync(
     let data_dir = ensure_backend_data_dir(app)?;
     let password = get_password().unwrap_or(None);
 
-    let mut command = Command::new(&payload.settings.python_path);
+    let mut command = build_python_command(&payload.settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1039,7 +1095,7 @@ fn update_static_from_dynamic_sync(
     let data_dir = ensure_backend_data_dir(app)?;
     let password = get_password().unwrap_or(None);
 
-    let mut command = Command::new(&payload.settings.python_path);
+    let mut command = build_python_command(&payload.settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1153,7 +1209,7 @@ fn test_webfilter_login(app: tauri::AppHandle, payload: WebfilterPayload) -> Res
     let script_path = resolve_webfilter_script_path(&app)?;
     let msd_password = get_msd_password().unwrap_or(None);
 
-    let mut command = Command::new(&payload.settings.python_path);
+    let mut command = build_python_command(&payload.settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1205,7 +1261,7 @@ fn fetch_webfilter_logs(app: tauri::AppHandle, payload: WebfilterPayload) -> Res
     let script_path = resolve_webfilter_script_path(&app)?;
     let msd_password = get_msd_password().unwrap_or(None);
 
-    let mut command = Command::new(&payload.settings.python_path);
+    let mut command = build_python_command(&payload.settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1275,7 +1331,7 @@ fn fetch_webfilter_address_lists(
     let script_path = resolve_webfilter_script_path(&app)?;
     let msd_password = get_msd_password().unwrap_or(None);
 
-    let mut command = Command::new(&payload.settings.python_path);
+    let mut command = build_python_command(&payload.settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1340,7 +1396,7 @@ fn write_webfilter_address_list(
     let script_path = resolve_webfilter_script_path(&app)?;
     let msd_password = get_msd_password().unwrap_or(None);
 
-    let mut command = Command::new(&payload.settings.python_path);
+    let mut command = build_python_command(&payload.settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1443,7 +1499,7 @@ async fn start_firewall_log_stream(
 
     let password = get_password().unwrap_or(None);
 
-    let mut command = Command::new(&settings.python_path);
+    let mut command = build_python_command(&settings.python_path);
     command
         .arg("-u")
         .arg(&script_path)
@@ -1575,4 +1631,83 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn count_occurrences(haystack: &str, needle_parts: &[&str]) -> usize {
+        let needle = needle_parts.concat();
+        haystack.matches(&needle).count()
+    }
+
+    #[test]
+    fn python_subprocess_creation_flags_match_platform_policy() {
+        if cfg!(windows) {
+            assert_eq!(python_subprocess_creation_flags(), Some(CREATE_NO_WINDOW));
+        } else {
+            assert_eq!(python_subprocess_creation_flags(), None);
+        }
+    }
+
+    #[test]
+    fn build_python_command_preserves_python_executable_path() {
+        let python_path = if cfg!(windows) { "python.exe" } else { "python3" };
+        let command = build_python_command(python_path);
+        assert_eq!(command.get_program(), OsStr::new(python_path));
+    }
+
+    #[test]
+    fn build_python_command_applies_subprocess_policy_each_time() {
+        reset_python_subprocess_policy_apply_count_for_tests();
+
+        let _ = build_python_command("python-a");
+        let _ = build_python_command("python-b");
+
+        assert_eq!(python_subprocess_policy_apply_count_for_tests(), 2);
+    }
+
+    #[test]
+    fn python_launch_sites_remain_centralized_through_shared_builder() {
+        let source = include_str!("lib.rs");
+
+        let command_new_python_path = count_occurrences(source, &["Command::new(", "python_path)"]);
+        assert_eq!(
+            command_new_python_path, 1,
+            "Expected exactly one direct python Command::new call in shared builder"
+        );
+
+        let direct_payload_builder_bypass =
+            count_occurrences(source, &["Command::new(", "&payload.settings.python_path)"]);
+        let direct_settings_builder_bypass =
+            count_occurrences(source, &["Command::new(", "&settings.python_path)"]);
+        let direct_input_builder_bypass = count_occurrences(source, &["Command::new(", "&python_path)"]);
+
+        assert_eq!(
+            direct_payload_builder_bypass, 0,
+            "Python launches using payload settings must go through build_python_command"
+        );
+        assert_eq!(
+            direct_settings_builder_bypass, 0,
+            "Python launches using settings must go through build_python_command"
+        );
+        assert_eq!(
+            direct_input_builder_bypass, 0,
+            "Python launches using function input must go through build_python_command"
+        );
+
+        let via_payload_builder =
+            count_occurrences(source, &["build_python_command(", "&payload.settings.python_path)"]);
+        let via_settings_builder =
+            count_occurrences(source, &["build_python_command(", "&settings.python_path)"]);
+        let via_input_builder = count_occurrences(source, &["build_python_command(", "&python_path)"]);
+
+        assert_eq!(
+            via_payload_builder + via_settings_builder + via_input_builder,
+            12,
+            "Unexpected number of centralized python builder launch sites"
+        );
+    }
 }
