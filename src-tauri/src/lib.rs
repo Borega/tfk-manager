@@ -1204,9 +1204,11 @@ fn resolve_webfilter_script_path(app: &tauri::AppHandle) -> Result<PathBuf, Stri
     resolve_script_path(app)
 }
 
-#[tauri::command]
-fn test_webfilter_login(app: tauri::AppHandle, payload: WebfilterPayload) -> Result<WebfilterResult, String> {
-    let script_path = resolve_webfilter_script_path(&app)?;
+fn test_webfilter_login_sync(
+    app: &tauri::AppHandle,
+    payload: WebfilterPayload,
+) -> Result<WebfilterResult, String> {
+    let script_path = resolve_webfilter_script_path(app)?;
     let msd_password = get_msd_password().unwrap_or(None);
 
     let mut command = build_python_command(&payload.settings.python_path);
@@ -1257,8 +1259,21 @@ fn test_webfilter_login(app: tauri::AppHandle, payload: WebfilterPayload) -> Res
 }
 
 #[tauri::command]
-fn fetch_webfilter_logs(app: tauri::AppHandle, payload: WebfilterPayload) -> Result<WebfilterLogsResult, String> {
-    let script_path = resolve_webfilter_script_path(&app)?;
+async fn test_webfilter_login(
+    app: tauri::AppHandle,
+    payload: WebfilterPayload,
+) -> Result<WebfilterResult, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || test_webfilter_login_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn fetch_webfilter_logs_sync(
+    app: &tauri::AppHandle,
+    payload: WebfilterPayload,
+) -> Result<WebfilterLogsResult, String> {
+    let script_path = resolve_webfilter_script_path(app)?;
     let msd_password = get_msd_password().unwrap_or(None);
 
     let mut command = build_python_command(&payload.settings.python_path);
@@ -1324,11 +1339,21 @@ fn fetch_webfilter_logs(app: tauri::AppHandle, payload: WebfilterPayload) -> Res
 }
 
 #[tauri::command]
-fn fetch_webfilter_address_lists(
+async fn fetch_webfilter_logs(
     app: tauri::AppHandle,
     payload: WebfilterPayload,
+) -> Result<WebfilterLogsResult, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || fetch_webfilter_logs_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn fetch_webfilter_address_lists_sync(
+    app: &tauri::AppHandle,
+    payload: WebfilterPayload,
 ) -> Result<WebfilterAddressListsResult, String> {
-    let script_path = resolve_webfilter_script_path(&app)?;
+    let script_path = resolve_webfilter_script_path(app)?;
     let msd_password = get_msd_password().unwrap_or(None);
 
     let mut command = build_python_command(&payload.settings.python_path);
@@ -1389,11 +1414,21 @@ fn fetch_webfilter_address_lists(
 }
 
 #[tauri::command]
-fn write_webfilter_address_list(
+async fn fetch_webfilter_address_lists(
     app: tauri::AppHandle,
+    payload: WebfilterPayload,
+) -> Result<WebfilterAddressListsResult, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || fetch_webfilter_address_lists_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn write_webfilter_address_list_sync(
+    app: &tauri::AppHandle,
     payload: WebfilterAddressListWritePayload,
 ) -> Result<WebfilterAddressListWriteResult, String> {
-    let script_path = resolve_webfilter_script_path(&app)?;
+    let script_path = resolve_webfilter_script_path(app)?;
     let msd_password = get_msd_password().unwrap_or(None);
 
     let mut command = build_python_command(&payload.settings.python_path);
@@ -1472,6 +1507,17 @@ fn write_webfilter_address_list(
         imported_lines: None,
         warnings: vec![],
     })
+}
+
+#[tauri::command]
+async fn write_webfilter_address_list(
+    app: tauri::AppHandle,
+    payload: WebfilterAddressListWritePayload,
+) -> Result<WebfilterAddressListWriteResult, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || write_webfilter_address_list_sync(&app_handle, payload))
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -1643,6 +1689,18 @@ mod tests {
         haystack.matches(&needle).count()
     }
 
+    fn production_source() -> &'static str {
+        let source = include_str!("lib.rs");
+        if let Some((production, _)) = source.rsplit_once("#[cfg(test)]\nmod tests {") {
+            production
+        } else {
+            source
+                .rsplit_once("mod tests {")
+                .map(|(production, _)| production)
+                .expect("lib.rs should have a tests module")
+        }
+    }
+
     #[test]
     fn python_subprocess_creation_flags_match_platform_policy() {
         if cfg!(windows) {
@@ -1709,5 +1767,35 @@ mod tests {
             12,
             "Unexpected number of centralized python builder launch sites"
         );
+    }
+
+    #[test]
+    fn webfilter_commands_are_async_entrypoints() {
+        let source = production_source();
+
+        assert!(source.contains("async fn test_webfilter_login("));
+        assert!(source.contains("async fn fetch_webfilter_logs("));
+        assert!(source.contains("async fn fetch_webfilter_address_lists("));
+        assert!(source.contains("async fn write_webfilter_address_list("));
+    }
+
+    #[test]
+    fn webfilter_async_entrypoints_use_spawn_blocking() {
+        let source = production_source();
+
+        assert!(source.contains("spawn_blocking(move || test_webfilter_login_sync("));
+        assert!(source.contains("spawn_blocking(move || fetch_webfilter_logs_sync("));
+        assert!(source.contains("spawn_blocking(move || fetch_webfilter_address_lists_sync("));
+        assert!(source.contains("spawn_blocking(move || write_webfilter_address_list_sync("));
+    }
+
+    #[test]
+    fn webfilter_sync_helpers_exist_for_command_logic() {
+        let source = production_source();
+
+        assert!(source.contains("fn test_webfilter_login_sync("));
+        assert!(source.contains("fn fetch_webfilter_logs_sync("));
+        assert!(source.contains("fn fetch_webfilter_address_lists_sync("));
+        assert!(source.contains("fn write_webfilter_address_list_sync("));
     }
 }
