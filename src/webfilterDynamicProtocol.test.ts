@@ -50,4 +50,14 @@ describe("toWebfilterDynamicEnvelope", () => {
     expect(envelope.actions.length).toBe(0);
     expect(envelope.warnings.some((item) => item.code === "unsupported-action")).toBe(true);
   });
+
+  it("clamps schedule-refetch action delays to the safe minimum", () => {
+    const envelope = toWebfilterDynamicEnvelope({
+      ok: true,
+      entries: [],
+      actions: [{ type: "schedule-refetch", delayMs: 1200 }],
+    });
+
+    expect(envelope.actions).toContainEqual({ type: "schedule-refetch", delayMs: 5000 });
+  });
 });
