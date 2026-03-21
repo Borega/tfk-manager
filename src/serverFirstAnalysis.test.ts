@@ -107,8 +107,11 @@ describe("runServerFirstAnalysis", () => {
     if (result.mode !== "fallback-local") {
       throw new Error("Expected fallback-local mode");
     }
+    expect(result.stage).toBe("freshness");
     expect(result.errorCode).toBe("token_invalid");
     expect(onFallbackLocal).toHaveBeenCalledTimes(1);
+    expect(client.getTrends).not.toHaveBeenCalled();
+    expect(client.getEvents).not.toHaveBeenCalled();
   });
 
   it("falls back for thrown network errors without bubbling", async () => {
@@ -158,6 +161,8 @@ describe("runServerFirstAnalysis", () => {
       throw new Error("Expected fallback-local mode");
     }
     expect(result.stage).toBe("unexpected");
+    expect(result.errorCode).toBe("server_first_unexpected_error");
+    expect(result.reason).toContain("network down");
     expect(onFallbackLocal).toHaveBeenCalledTimes(1);
   });
 });
