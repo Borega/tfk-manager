@@ -41,9 +41,30 @@ def build_status_payload(source_statuses: list[SourceReliabilityStatus]) -> dict
             "actionLabel": "Switch To Local Fallback" if fallback_recommended else "Continue Server Mode",
             "actionKey": "switch-local-fallback" if fallback_recommended else "none",
         },
+        "retentionLifecycle": {
+            "lastRunAt": None,
+            "cutoffAt": None,
+            "deletedCount": 0,
+            "affectedWindows": [],
+            "runStatus": "unknown",
+            "nextScheduledAt": None,
+        },
     }
     return payload
 
 
-def render_status_json(source_statuses: list[SourceReliabilityStatus]) -> str:
-    return json.dumps(build_status_payload(source_statuses), ensure_ascii=False)
+def render_status_json(
+    source_statuses: list[SourceReliabilityStatus],
+    retention_lifecycle: dict | None = None,
+) -> str:
+    payload = build_status_payload(source_statuses)
+    if retention_lifecycle:
+        payload["retentionLifecycle"] = {
+            "lastRunAt": retention_lifecycle.get("lastRunAt"),
+            "cutoffAt": retention_lifecycle.get("cutoffAt"),
+            "deletedCount": retention_lifecycle.get("deletedCount", 0),
+            "affectedWindows": retention_lifecycle.get("affectedWindows", []),
+            "runStatus": retention_lifecycle.get("runStatus", "unknown"),
+            "nextScheduledAt": retention_lifecycle.get("nextScheduledAt"),
+        }
+    return json.dumps(payload, ensure_ascii=False)

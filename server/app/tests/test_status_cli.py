@@ -40,6 +40,45 @@ class TestStatusCli(unittest.TestCase):
         self.assertEqual(payload["overallSeverity"], "Critical")
         self.assertEqual(payload["fallbackGuidance"]["actionKey"], "switch-local-fallback")
 
+    def test_status_payload_contains_retention_lifecycle_fields(self):
+        payload = json.loads(
+            render_status_json(
+                [self._status("dhcp", ReliabilityState.Healthy, False)],
+                retention_lifecycle={
+                    "lastRunAt": "2026-03-21T09:00:00Z",
+                    "cutoffAt": "2025-03-21T09:00:00Z",
+                    "deletedCount": 12,
+                    "affectedWindows": ["2024-02", "2024-03"],
+                    "runStatus": "completed",
+                    "nextScheduledAt": "2026-03-22T09:00:00Z",
+                },
+            )
+        )
+        retention = payload["retentionLifecycle"]
+        self.assertEqual(retention["deletedCount"], 12)
+        self.assertEqual(retention["affectedWindows"], ["2024-02", "2024-03"])
+        self.assertEqual(retention["runStatus"], "completed")
+
+    def test_retention_payload_coexists_with_existing_reliability_fields(self):
+        payload = json.loads(
+            render_status_json(
+                [self._status("dhcp", ReliabilityState.Degraded, False)],
+                retention_lifecycle={
+                    "lastRunAt": "2026-03-21T09:00:00Z",
+                    "cutoffAt": "2025-03-21T09:00:00Z",
+                    "deletedCount": 0,
+                    "affectedWindows": [],
+                    "runStatus": "completed",
+                    "nextScheduledAt": "2026-03-22T09:00:00Z",
+                },
+            )
+        )
+        self.assertIn("overallSeverity", payload)
+        self.assertIn("fallbackGuidance", payload)
+        self.assertIn("retentionLifecycle", payload)
+        self.assertEqual(payload["fallbackGuidance"]["actionLabel"], "Continue Server Mode")
+        self.assertEqual(payload["retentionLifecycle"]["lastRunAt"], "2026-03-21T09:00:00Z")
+
 
 if __name__ == "__main__":
     unittest.main()
