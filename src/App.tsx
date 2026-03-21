@@ -19,6 +19,20 @@ import {
   type SourcePolicyKey,
 } from "./sourcePollingPolicy";
 import { searchTopic, type TopicNode } from "./topicSearch";
+import {
+  createServerAnalysisClient,
+} from "./serverAnalysisClient";
+import {
+  createServerSession,
+} from "./serverAuthSession";
+import {
+  runServerFirstAnalysis,
+  type AnalysisMode,
+} from "./serverFirstAnalysis";
+import type {
+  ServerBucketGrain,
+  ServerTrendBucket,
+} from "./serverAnalysisContracts";
 import "./App.css";
 
 type ClientRow = {
@@ -241,6 +255,12 @@ type WebfilterAddressListWriteInvokeResult = {
   warnings?: string[];
 };
 
+type ServerTrendWindow = {
+  startAt: string;
+  endAt: string;
+  bucketGrain: ServerBucketGrain;
+};
+
 const SOURCE_LABELS: Record<SourceHealthKey, string> = {
   leases: "Leases (81)",
   "webfilter-ui": "Webfilter UI (80/1920)",
@@ -260,6 +280,16 @@ const INITIAL_SOURCE_RETRY: Record<SourceHealthKey, SourceRetryEntry> = {
   "webfilter-ui": { attempt: 0, nextRetryAtIso: null },
   "firewall-stream": { attempt: 0, nextRetryAtIso: null },
 };
+
+function buildDefaultServerTrendWindow(now: Date = new Date()): ServerTrendWindow {
+  const end = now.getTime();
+  const start = end - 60 * 60 * 1000;
+  return {
+    startAt: new Date(start).toISOString(),
+    endAt: new Date(end).toISOString(),
+    bucketGrain: "coarse",
+  };
+}
 
 function formatHealthTime(value: string | null): string {
   if (!value) return "never";
@@ -883,8 +913,19 @@ function App() {
   const [topicSearchPattern, setTopicSearchPattern] = useState("");
   const [selectedRiskDeviceIps, setSelectedRiskDeviceIps] = useState<Set<string>>(new Set());
   const [selectedAnalysisDeviceIp, setSelectedAnalysisDeviceIp] = useState<string | null>(null);
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("local-only");
+  const [analysisFallbackReason, setAnalysisFallbackReason] = useState<string | null>(null);
+  const [serverLastSyncIso, setServerLastSyncIso] = useState<string | null>(null);
+  const [serverTrendWindow] = useState<ServerTrendWindow>(() => buildDefaultServerTrendWindow());
+  const [serverTrendBuckets, setServerTrendBuckets] = useState<ServerTrendBucket[]>([]);
   const wfScheduledRefetchRef = useRef<number | null>(null);
   const wfLogsInFlightRef = useRef<Promise<WebfilterFetchResult> | null>(null);
+  const serverSessionRef = useRef(createServerSession());
+
+  const serverAnalysisClient = useMemo(() => createServerAnalysisClient({
+    baseUrl: settings.baseUrl,
+    session: serverSessionRef.current,
+  }), [settings.baseUrl]);
 
   useEffect(() => {
     return () => {
@@ -1781,7 +1822,12 @@ function App() {
   useEffect(() => {
     if (activeTab !== "analysis") return;
 
-    void refreshLeasesSilently();
+    void (async () => {
+      const mode = await refreshServerFirstAnalysisWindow();
+      if (mode !== "fallback-local") {
+        await refreshLeasesSilently();
+      }
+    })();
 
     if (!wfAutoRefresh) {
       setWfAutoRefresh(true);
@@ -2609,7 +2655,10 @@ function App() {
 
   async function handleRefreshAnalysis() {
     setLogs((prev) => [...prev, "Refreshing analysis sources (leases + webfilter)..."]);
-    await refreshLeasesSilently();
+    const mode = await refreshServerFirstAnalysisWindow();
+    if (mode !== "fallback-local") {
+      await refreshLeasesSilently();
+    }
     if (settings.msdUsername.trim() && hasMsdPassword) {
       const wfResult = await handleFetchWfLogs();
       if (!wfResult.ok) {
@@ -2622,6 +2671,44 @@ function App() {
         ]);
       }
     }
+  }
+
+  async function refreshServerFirstAnalysisWindow(): Promise<AnalysisMode> {
+    const hasServerSession = Boolean(serverSessionRef.current.getAccessToken());
+    if (!hasServerSession) {
+      setAnalysisMode("local-only");
+      setAnalysisFallbackReason("Server session unavailable. Using local collection.");
+      return "local-only";
+    }
+
+    const serverResult = await runServerFirstAnalysis({
+      client: serverAnalysisClient,
+      window: {
+        startAt: serverTrendWindow.startAt,
+        endAt: serverTrendWindow.endAt,
+        bucketGrain: serverTrendWindow.bucketGrain,
+        eventLimit: 200,
+      },
+      onFallbackLocal: async () => {
+        await refreshLeasesSilently();
+      },
+    });
+
+    if (serverResult.mode === "server") {
+      setAnalysisMode("server");
+      setAnalysisFallbackReason(null);
+      setServerLastSyncIso(new Date().toISOString());
+      setServerTrendBuckets(serverResult.trends.items);
+      return "server";
+    }
+
+    setAnalysisMode("fallback-local");
+    setAnalysisFallbackReason(`${serverResult.errorCode}: ${serverResult.reason}`);
+    setLogs((prev) => [
+      ...prev,
+      `Server analysis fallback (${serverResult.stage}): ${serverResult.reason}`,
+    ]);
+    return "fallback-local";
   }
 
   async function handleCancelRun() {
@@ -4018,6 +4105,12 @@ function App() {
               <p className="lease-meta">
                 Known devices: {analysis.knownDeviceCount} · Correlated active: {analysis.rows.length}
               </p>
+              <p className="lease-meta">
+                Analysis mode: {analysisMode} · Last server sync: {formatHealthTime(serverLastSyncIso)}
+              </p>
+              {analysisFallbackReason && analysisMode !== "server" && (
+                <p className="field-hint">Fallback reason: {analysisFallbackReason}</p>
+              )}
               <div className="source-health-grid">
                 {sourceHealthViews.map((item) => (
                   <div key={item.key} className={`source-health-card source-health-${item.status}`}>
@@ -4253,7 +4346,7 @@ function App() {
               <div className="preview-header">
                 <h3>Correlated Security Intelligence</h3>
                 <span className="lease-meta">
-                  {analysis.rows.length} active IPs · {analysis.correlatedBlocks} overlap blocks
+                  {analysis.rows.length} active IPs · {analysis.correlatedBlocks} overlap blocks · Server trend buckets: {serverTrendBuckets.length}
                 </span>
               </div>
 
