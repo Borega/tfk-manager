@@ -20,12 +20,20 @@ export type AnalysisIdentityNode = {
   displayValue: string;
 };
 
+export type AnalysisIdentityEvidenceRef = {
+  sourceType: AnalysisIdentitySource;
+  field: AnalysisIdentityField;
+  value: string;
+  observedAt?: string;
+};
+
 export type AnalysisIdentityLink = {
   id: string;
   fromNodeId: string;
   toNodeId: string;
   confidence: AnalysisIdentityConfidence;
   evidenceCount: number;
+  evidence: AnalysisIdentityEvidenceRef[];
 };
 
 export type AnalysisIdentityGraph = {
@@ -47,8 +55,8 @@ function toNodeId(field: AnalysisIdentityField, normalizedValue: string): string
   return `${field}:${normalizedValue}`;
 }
 
-function toConfidence(evidenceCount: number): AnalysisIdentityConfidence {
-  if (evidenceCount >= 4) return "high";
+function toConfidence(evidenceCount: number, sourceCount: number): AnalysisIdentityConfidence {
+  if (evidenceCount >= 4 && sourceCount >= 2) return "high";
   if (evidenceCount >= 2) return "medium";
   return "low";
 }
@@ -75,7 +83,7 @@ function toObservationEntries(observation: AnalysisIdentityObservation): Array<{
 
 export function buildAnalysisIdentityGraph(observations: AnalysisIdentityObservation[]): AnalysisIdentityGraph {
   const nodeMap = new Map<string, AnalysisIdentityNode>();
-  const linkEvidenceCount = new Map<string, number>();
+  const linkEvidence = new Map<string, Map<string, AnalysisIdentityEvidenceRef>>();
 
   for (const observation of observations) {
     const entries = toObservationEntries(observation);
@@ -97,7 +105,20 @@ export function buildAnalysisIdentityGraph(observations: AnalysisIdentityObserva
         const rightNodeId = toNodeId(entries[j].field, entries[j].normalized);
         const [fromNodeId, toNodeIdStable] = [leftNodeId, rightNodeId].sort();
         const linkId = `${fromNodeId}<->${toNodeIdStable}`;
-        linkEvidenceCount.set(linkId, (linkEvidenceCount.get(linkId) ?? 0) + 1);
+
+        const evidenceRefs: AnalysisIdentityEvidenceRef[] = [entries[i], entries[j]].map((entry) => ({
+          sourceType: observation.sourceType,
+          field: entry.field,
+          value: entry.normalized,
+          observedAt: (observation.observedAt ?? "").trim() || undefined,
+        }));
+
+        const existingEvidence = linkEvidence.get(linkId) ?? new Map<string, AnalysisIdentityEvidenceRef>();
+        for (const evidence of evidenceRefs) {
+          const evidenceKey = [evidence.sourceType, evidence.field, evidence.value, evidence.observedAt ?? ""].join("|");
+          existingEvidence.set(evidenceKey, evidence);
+        }
+        linkEvidence.set(linkId, existingEvidence);
       }
     }
   }
@@ -109,15 +130,25 @@ export function buildAnalysisIdentityGraph(observations: AnalysisIdentityObserva
     return a.id.localeCompare(b.id);
   });
 
-  const links = Array.from(linkEvidenceCount.entries())
-    .map(([id, evidenceCount]) => {
+  const links = Array.from(linkEvidence.entries())
+    .map(([id, evidenceMap]) => {
       const [fromNodeId, toNodeIdStable] = id.split("<->");
+      const evidence = Array.from(evidenceMap.values()).sort((a, b) => {
+        if (a.sourceType !== b.sourceType) return a.sourceType.localeCompare(b.sourceType);
+        const fieldOrderDiff = compareFieldOrder(a.field, b.field);
+        if (fieldOrderDiff !== 0) return fieldOrderDiff;
+        if (a.value !== b.value) return a.value.localeCompare(b.value);
+        return (a.observedAt ?? "").localeCompare(b.observedAt ?? "");
+      });
+      const evidenceCount = evidence.length;
+      const sourceCount = new Set(evidence.map((item) => item.sourceType)).size;
       return {
         id,
         fromNodeId,
         toNodeId: toNodeIdStable,
-        confidence: toConfidence(evidenceCount),
+        confidence: toConfidence(evidenceCount, sourceCount),
         evidenceCount,
+        evidence,
       } satisfies AnalysisIdentityLink;
     })
     .sort((a, b) => a.id.localeCompare(b.id));
