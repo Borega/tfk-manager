@@ -13,6 +13,7 @@ describe("App server freshness UI wiring", () => {
   it("wires server trend range controls and refresh action", () => {
     expect(appSource).toContain("Server Trend Window");
     expect(appSource).toContain("setServerTrendRange(Number(event.target.value))");
+    expect(appSource).toContain("onClick={() => void refreshServerFirstAnalysisWindow()}");
     expect(appSource).toContain("Refresh server trend window");
     expect(appSource).toContain("source-health-grid");
 
