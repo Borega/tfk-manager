@@ -8,8 +8,11 @@ class CanonicalEvent:
     eventId: str
     sourceType: str
     sourceEntityId: str
+    sourceIdentifiersJson: str
     occurredAt: datetime
     observedAt: datetime
+    collectorVersion: str
+    ingestTimestamp: datetime
     payloadHash: str
     lineageVersion: int
     confidenceState: str
@@ -20,8 +23,11 @@ class CanonicalEvent:
             "event_id": self.eventId,
             "source_type": self.sourceType,
             "source_entity_id": self.sourceEntityId,
+            "source_identifiers_json": self.sourceIdentifiersJson,
             "occurred_at": self.occurredAt.isoformat(),
             "observed_at": self.observedAt.isoformat(),
+            "collector_version": self.collectorVersion,
+            "ingest_timestamp": self.ingestTimestamp.isoformat(),
             "payload_hash": self.payloadHash,
             "lineage_version": self.lineageVersion,
             "confidence_state": self.confidenceState,

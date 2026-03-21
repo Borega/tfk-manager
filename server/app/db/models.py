@@ -11,8 +11,11 @@ class CanonicalEventModel:
     event_id: str
     source_type: str
     source_entity_id: str
+    source_identifiers_json: str
     occurred_at: str
     observed_at: str
+    collector_version: str
+    ingest_timestamp: str
     payload_hash: str
     lineage_version: int
     confidence_state: str
