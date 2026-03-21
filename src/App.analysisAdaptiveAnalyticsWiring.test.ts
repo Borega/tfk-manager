@@ -11,6 +11,12 @@ describe("App adaptive analytics wiring", () => {
     expect(appSource).toContain("Risk Evidence");
   });
 
+  it("keeps identity confidence wording explicit in list and detail surfaces", () => {
+    expect(appSource).toContain("<th>Identity Confidence</th>");
+    expect(appSource).toContain("<h5>Identity Confidence</h5>");
+    expect(appSource).toContain("Identity Confidence: {selectedAnalysisDeviceDetail.row.identityConfidence}");
+  });
+
   it("applies adaptive polling decisions in analysis refresh loops", () => {
     expect(appSource).toContain("resolveAdaptivePollPolicy");
     expect(appSource).toContain("const leasePoll = resolveAdaptivePollPolicy");
