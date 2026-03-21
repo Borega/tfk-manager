@@ -43,4 +43,51 @@ describe("analysisRiskEngine", () => {
       }),
     ]);
   });
+
+  it("raises severity for dual-block with low identity confidence and includes evidence", () => {
+    const result = computeExplainableRisk({
+      fwBlock: 3,
+      wfBlock: 2,
+      hasDualBlock: true,
+      identityConfidence: "low",
+      segment: "Unknown",
+    });
+
+    expect(result.severity).toBe("high");
+    expect(result.score).toBeGreaterThanOrEqual(40);
+    expect(result.evidence.map((item) => item.ruleId)).toEqual(
+      expect.arrayContaining([
+        "fw-block-activity",
+        "wf-block-activity",
+        "dual-block-overlap",
+        "low-identity-block-penalty",
+      ]),
+    );
+  });
+
+  it("lowers score when block activity is reduced while preserving evidence provenance", () => {
+    const high = computeExplainableRisk({
+      fwBlock: 4,
+      wfBlock: 2,
+      hasDualBlock: true,
+      identityConfidence: "medium",
+      segment: "Dynamic Gruen",
+    });
+
+    const reduced = computeExplainableRisk({
+      fwBlock: 1,
+      wfBlock: 0,
+      hasDualBlock: false,
+      identityConfidence: "medium",
+      segment: "Dynamic Gruen",
+    });
+
+    expect(reduced.score).toBeLessThan(high.score);
+    expect(high.evidence.length).toBeGreaterThan(reduced.evidence.length);
+    for (const evidence of high.evidence) {
+      expect(evidence.sourceType).toMatch(/firewall|webfilter|identity|classification|analysis/);
+      expect(evidence.field.length).toBeGreaterThan(0);
+      expect(evidence.ruleId.length).toBeGreaterThan(0);
+    }
+  });
 });
