@@ -1,0 +1,78 @@
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+from server.app.collector.repository import upsert_events_and_checkpoint
+from server.app.collector.workers.replay_policy import (
+    is_retry_ready,
+    next_retry_at,
+    should_trigger_fallback,
+)
+
+
+def create_worker_state(source_key: str, cursor: str = "") -> dict[str, Any]:
+    return {
+        "sourceKey": source_key,
+        "cursor": cursor,
+        "attempt": 0,
+        "nextRetryAt": None,
+        "outageSeconds": 0,
+        "fallbackRecommended": False,
+        "lastSuccessAt": None,
+        "lastErrorAt": None,
+    }
+
+
+def run_worker_iteration(
+    source_key: str,
+    state: dict[str, Any],
+    adapter_fetch: Callable[[str | None, datetime], tuple[list[dict[str, Any]], str]],
+    connection,
+    now_utc: datetime,
+    fail_on_event_id: str | None = None,
+) -> dict[str, Any]:
+    if not is_retry_ready(state.get("nextRetryAt"), now_utc):
+        return state
+
+    try:
+        events, next_cursor = adapter_fetch(state.get("cursor"), now_utc)
+        checkpoint = {
+            "sourceKey": source_key,
+            "cursor": next_cursor,
+            "lastSuccessAt": now_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "lastErrorAt": None,
+            "errorCount": 0,
+            "lagSeconds": 0,
+            "updatedAt": now_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        upsert_events_and_checkpoint(
+            connection,
+            events,
+            checkpoint,
+            fail_on_event_id=fail_on_event_id,
+        )
+
+        state.update(
+            {
+                "cursor": next_cursor,
+                "attempt": 0,
+                "nextRetryAt": None,
+                "outageSeconds": 0,
+                "fallbackRecommended": False,
+                "lastSuccessAt": checkpoint["lastSuccessAt"],
+            }
+        )
+        return state
+
+    except Exception:
+        outage_seconds = int(state.get("outageSeconds", 0)) + 30
+        attempt = int(state.get("attempt", 0)) + 1
+        state.update(
+            {
+                "attempt": attempt,
+                "outageSeconds": outage_seconds,
+                "nextRetryAt": next_retry_at(source_key, attempt, now_utc),
+                "fallbackRecommended": should_trigger_fallback(source_key, outage_seconds),
+                "lastErrorAt": now_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        return state
