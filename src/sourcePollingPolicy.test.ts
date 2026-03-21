@@ -5,6 +5,7 @@ import {
   getWebfilterPollIntervalMs,
   isRetryReady,
   nextRetryDelayMs,
+  resolveSourcePollIntervalMs,
 } from "./sourcePollingPolicy";
 
 describe("sourcePollingPolicy", () => {
@@ -89,5 +90,19 @@ describe("sourcePollingPolicy", () => {
     expect(applyPollJitterMs(5000, Number.NaN, () => 0)).toBe(5000);
     expect(applyPollJitterMs(5000, 0.15, () => Number.NaN)).toBe(5000);
     expect(applyPollJitterMs(5000, 0.15, () => Number.POSITIVE_INFINITY)).toBe(5000);
+  });
+
+  it("keeps static defaults when adaptive context is absent", () => {
+    expect(resolveSourcePollIntervalMs("leases")).toBe(120000);
+    expect(resolveSourcePollIntervalMs("server-api")).toBe(60000);
+  });
+
+  it("uses adaptive resolver to increase intervals under degraded conditions", () => {
+    const adapted = resolveSourcePollIntervalMs("server-api", {
+      healthStatus: "error",
+      backlogSize: 700,
+      retryAttempt: 5,
+    });
+    expect(adapted).toBeGreaterThan(60000);
   });
 });

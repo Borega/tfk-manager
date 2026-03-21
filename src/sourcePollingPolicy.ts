@@ -1,3 +1,5 @@
+import { resolveAdaptivePollPolicy, type AdaptiveHealthStatus } from "./adaptivePollingPolicy";
+
 export type SourcePolicyKey = "leases" | "webfilter-ui" | "firewall-stream" | "server-api";
 
 type RetryPolicy = {
@@ -23,6 +25,12 @@ export type WebfilterPollContext = {
   isInteractiveView: boolean;
   isDocumentVisible: boolean;
   hasRecentError: boolean;
+};
+
+export type SourceAdaptiveContext = {
+  healthStatus: AdaptiveHealthStatus;
+  backlogSize: number;
+  retryAttempt: number;
 };
 
 const SOURCE_RETRY_POLICY: Record<SourcePolicyKey, RetryPolicy> = {
@@ -62,6 +70,21 @@ export function getWebfilterPollIntervalMs(context: WebfilterPollContext): numbe
   if (context.isInteractiveView && !context.isDocumentVisible) return 12_000;
   if (!context.isInteractiveView && context.isDocumentVisible) return 20_000;
   return SOURCE_POLL_MS["webfilter-ui"];
+}
+
+export function resolveSourcePollIntervalMs(
+  source: SourcePolicyKey,
+  adaptive: SourceAdaptiveContext | null = null,
+): number {
+  const baseIntervalMs = SOURCE_POLL_MS[source];
+  if (!adaptive) return baseIntervalMs;
+  return resolveAdaptivePollPolicy({
+    source,
+    baseIntervalMs,
+    healthStatus: adaptive.healthStatus,
+    backlogSize: adaptive.backlogSize,
+    retryAttempt: adaptive.retryAttempt,
+  }).intervalMs;
 }
 
 export function applyPollJitterMs(
