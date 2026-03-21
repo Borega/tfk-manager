@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from server.app.collector.aggregates import recompute_aggregate_windows
+from server.app.collector.corrections import apply_late_corrections
 from server.app.collector.repository import upsert_events_and_checkpoint
 from server.app.collector.workers.replay_policy import (
     is_retry_ready,
@@ -35,6 +37,10 @@ def run_worker_iteration(
 
     try:
         events, next_cursor = adapter_fetch(state.get("cursor"), now_utc)
+        correction_result = apply_late_corrections(events, now_utc)
+        corrected_events = correction_result["events"]
+        corrected_windows = correction_result.get("correctedWindows", [])
+
         checkpoint = {
             "sourceKey": source_key,
             "cursor": next_cursor,
@@ -46,10 +52,13 @@ def run_worker_iteration(
         }
         upsert_events_and_checkpoint(
             connection,
-            events,
+            corrected_events,
             checkpoint,
             fail_on_event_id=fail_on_event_id,
         )
+
+        if corrected_windows:
+            recompute_aggregate_windows(connection, corrected_windows)
 
         state.update(
             {
