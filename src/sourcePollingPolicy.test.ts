@@ -12,6 +12,8 @@ describe("sourcePollingPolicy", () => {
     expect(nextRetryDelayMs("webfilter-ui", 0)).toBe(8000);
     expect(nextRetryDelayMs("webfilter-ui", 1)).toBe(16000);
     expect(nextRetryDelayMs("webfilter-ui", 10)).toBe(120000);
+    expect(nextRetryDelayMs("server-api", 0)).toBe(12000);
+    expect(nextRetryDelayMs("server-api", 8)).toBe(120000);
   });
 
   it("uses base delay when retry attempt is invalid", () => {

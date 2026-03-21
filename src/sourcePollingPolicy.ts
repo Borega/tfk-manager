@@ -1,4 +1,4 @@
-export type SourcePolicyKey = "leases" | "webfilter-ui" | "firewall-stream";
+export type SourcePolicyKey = "leases" | "webfilter-ui" | "firewall-stream" | "server-api";
 
 type RetryPolicy = {
   baseMs: number;
@@ -9,12 +9,14 @@ export const SOURCE_STALE_MS: Record<SourcePolicyKey, number> = {
   leases: 10 * 60 * 1000,
   "webfilter-ui": 3 * 60 * 1000,
   "firewall-stream": 75 * 1000,
+  "server-api": 2 * 60 * 1000,
 };
 
 export const SOURCE_POLL_MS: Record<SourcePolicyKey, number> = {
   leases: 2 * 60 * 1000,
   "webfilter-ui": 30 * 1000,
   "firewall-stream": 20 * 1000,
+  "server-api": 60 * 1000,
 };
 
 export type WebfilterPollContext = {
@@ -27,6 +29,7 @@ const SOURCE_RETRY_POLICY: Record<SourcePolicyKey, RetryPolicy> = {
   leases: { baseMs: 10_000, maxMs: 3 * 60_000 },
   "webfilter-ui": { baseMs: 8_000, maxMs: 2 * 60_000 },
   "firewall-stream": { baseMs: 5_000, maxMs: 60_000 },
+  "server-api": { baseMs: 12_000, maxMs: 2 * 60_000 },
 };
 
 export function nextRetryDelayMs(source: SourcePolicyKey, attempt: number): number {
