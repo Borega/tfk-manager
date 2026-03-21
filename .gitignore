@@ -65,6 +65,7 @@ src-tauri/resources/backend/data/to_delete.csv
 backend/API_ENDPOINTS.md
 
 # Recommended Python artifacts
+**/__pycache__/
 backend/src/__pycache__/
 backend/src/*.py[cod]
 docs/analysis-mockup.md
