@@ -1016,6 +1016,28 @@ function App() {
     errorMessage: analysisMode === "fallback-local" ? analysisFallbackReason : null,
   }), [serverFreshness, analysisMode, analysisFallbackReason, healthTick]);
 
+  const analysisSourceHealthCards = useMemo(() => {
+    const localCards = sourceHealthViews
+      .filter((item) => item.key !== "server-api")
+      .map((item) => ({
+        key: item.key,
+        status: item.status,
+        label: item.label,
+        lastSuccessLabel: item.lastSuccessLabel,
+        detail: item.detail,
+      }));
+
+    const mappedServerCards = serverFreshnessCards.map((item) => ({
+      key: `server-${item.key}`,
+      status: item.status,
+      label: item.label,
+      lastSuccessLabel: formatHealthTime(item.lastSuccessIso),
+      detail: item.detail,
+    }));
+
+    return [...localCards, ...mappedServerCards];
+  }, [sourceHealthViews, serverFreshnessCards]);
+
   const analysisModeBadge = useMemo(() => toServerAnalysisModeBadge(analysisMode), [analysisMode]);
 
   const wfLogsFiltered = useMemo(() => {
@@ -4151,30 +4173,6 @@ function App() {
               <p className="lease-meta">
                 Known devices: {analysis.knownDeviceCount} · Correlated active: {analysis.rows.length}
               </p>
-              <p className="lease-meta">
-                Analysis mode: {analysisMode} · Last server sync: {formatHealthTime(serverLastSyncIso)}
-              </p>
-              {analysisFallbackReason && analysisMode !== "server" && (
-                <p className="field-hint">Fallback reason: {analysisFallbackReason}</p>
-              )}
-              <div className="source-health-grid">
-                {sourceHealthViews.map((item) => (
-                  <div key={item.key} className={`source-health-card source-health-${item.status}`}>
-                    <strong>{item.label}</strong>
-                    <span>Status: {item.status}</span>
-                    <span>Last success: {item.lastSuccessLabel}</span>
-                    <span>{item.detail}</span>
-                  </div>
-                ))}
-                {serverFreshnessCards.map((item) => (
-                  <div key={`server-${item.key}`} className={`source-health-card source-health-${item.status}`}>
-                    <strong>{item.label}</strong>
-                    <span>Status: {item.status}</span>
-                    <span>Last success: {formatHealthTime(item.lastSuccessIso)}</span>
-                    <span>{item.detail}</span>
-                  </div>
-                ))}
-              </div>
             </div>
           )}
         </aside>
@@ -4415,19 +4413,11 @@ function App() {
               </div>
 
               <div className="source-health-grid">
-                {sourceHealthViews.map((item) => (
-                  <div key={`main-${item.key}`} className={`source-health-card source-health-${item.status}`}>
+                {analysisSourceHealthCards.map((item) => (
+                  <div key={item.key} className={`source-health-card source-health-${item.status}`}>
                     <strong>{item.label}</strong>
                     <span>Status: {item.status}</span>
                     <span>Last success: {item.lastSuccessLabel}</span>
-                    <span>{item.detail}</span>
-                  </div>
-                ))}
-                {serverFreshnessCards.map((item) => (
-                  <div key={`main-server-${item.key}`} className={`source-health-card source-health-${item.status}`}>
-                    <strong>{item.label}</strong>
-                    <span>Status: {item.status}</span>
-                    <span>Last success: {formatHealthTime(item.lastSuccessIso)}</span>
                     <span>{item.detail}</span>
                   </div>
                 ))}

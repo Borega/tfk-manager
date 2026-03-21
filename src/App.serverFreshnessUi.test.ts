@@ -4,8 +4,9 @@ import appSource from "./App.tsx?raw";
 describe("App server freshness UI wiring", () => {
   it("maps server freshness payload and renders mode banner state", () => {
     expect(appSource).toContain("mapServerFreshnessToSourceHealth");
+    expect(appSource).toContain("analysisSourceHealthCards");
     expect(appSource).toContain("analysis-mode-banner");
-    expect(appSource).toContain("Analysis mode:");
+    expect(appSource).not.toContain("Analysis mode:");
     expect(appSource).toContain("Fallback reason:");
   });
 
@@ -14,5 +15,8 @@ describe("App server freshness UI wiring", () => {
     expect(appSource).toContain("setServerTrendRange(Number(event.target.value))");
     expect(appSource).toContain("Refresh server trend window");
     expect(appSource).toContain("source-health-grid");
+
+    const sourceHealthGridMatches = appSource.match(/className=\"source-health-grid\"/g) ?? [];
+    expect(sourceHealthGridMatches).toHaveLength(1);
   });
 });
