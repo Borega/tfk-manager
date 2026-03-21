@@ -29,8 +29,13 @@ import {
   runServerFirstAnalysis,
   type AnalysisMode,
 } from "./serverFirstAnalysis";
+import {
+  mapServerFreshnessToSourceHealth,
+  toServerAnalysisModeBadge,
+} from "./serverFreshnessMapper";
 import type {
   ServerBucketGrain,
+  ServerFreshnessResponse,
   ServerTrendBucket,
 } from "./serverAnalysisContracts";
 import "./App.css";
@@ -265,12 +270,14 @@ const SOURCE_LABELS: Record<SourceHealthKey, string> = {
   leases: "Leases (81)",
   "webfilter-ui": "Webfilter UI (80/1920)",
   "firewall-stream": "Firewall stream (81)",
+  "server-api": "Server API",
 };
 
 const INITIAL_SOURCE_HEALTH: Record<SourceHealthKey, SourceHealthEntry> = {
   leases: { lastSuccessIso: null, lastError: null, lastErrorIso: null },
   "webfilter-ui": { lastSuccessIso: null, lastError: null, lastErrorIso: null },
   "firewall-stream": { lastSuccessIso: null, lastError: null, lastErrorIso: null },
+  "server-api": { lastSuccessIso: null, lastError: null, lastErrorIso: null },
 };
 
 const WEBFILTER_FAST_POLL_ERROR_COOLDOWN_MS = 60_000;
@@ -279,6 +286,7 @@ const INITIAL_SOURCE_RETRY: Record<SourceHealthKey, SourceRetryEntry> = {
   leases: { attempt: 0, nextRetryAtIso: null },
   "webfilter-ui": { attempt: 0, nextRetryAtIso: null },
   "firewall-stream": { attempt: 0, nextRetryAtIso: null },
+  "server-api": { attempt: 0, nextRetryAtIso: null },
 };
 
 function buildDefaultServerTrendWindow(now: Date = new Date()): ServerTrendWindow {
@@ -916,8 +924,10 @@ function App() {
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("local-only");
   const [analysisFallbackReason, setAnalysisFallbackReason] = useState<string | null>(null);
   const [serverLastSyncIso, setServerLastSyncIso] = useState<string | null>(null);
-  const [serverTrendWindow] = useState<ServerTrendWindow>(() => buildDefaultServerTrendWindow());
+  const [serverTrendWindow, setServerTrendWindow] = useState<ServerTrendWindow>(() => buildDefaultServerTrendWindow());
+  const [serverTrendRangeHours, setServerTrendRangeHours] = useState<number>(1);
   const [serverTrendBuckets, setServerTrendBuckets] = useState<ServerTrendBucket[]>([]);
+  const [serverFreshness, setServerFreshness] = useState<ServerFreshnessResponse | null>(null);
   const wfScheduledRefetchRef = useRef<number | null>(null);
   const wfLogsInFlightRef = useRef<Promise<WebfilterFetchResult> | null>(null);
   const serverSessionRef = useRef(createServerSession());
@@ -1000,6 +1010,13 @@ function App() {
     return (Object.keys(sourceHealth) as SourceHealthKey[]).map((key) =>
       toSourceHealthView(key, sourceHealth[key], sourceRetry[key], nowMillis));
   }, [sourceHealth, sourceRetry, healthTick]);
+
+  const serverFreshnessCards = useMemo(() => mapServerFreshnessToSourceHealth(serverFreshness, {
+    nowMillis: Date.now(),
+    errorMessage: analysisMode === "fallback-local" ? analysisFallbackReason : null,
+  }), [serverFreshness, analysisMode, analysisFallbackReason, healthTick]);
+
+  const analysisModeBadge = useMemo(() => toServerAnalysisModeBadge(analysisMode), [analysisMode]);
 
   const wfLogsFiltered = useMemo(() => {
     const byAction = wfLogFilter === "all"
@@ -1856,6 +1873,17 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, credentialsReady, sourceRetry]);
 
+  // Keep server trend and freshness view in sync while analysis is open.
+  useEffect(() => {
+    if (activeTab !== "analysis") return;
+    const id = window.setInterval(() => {
+      if (!canRunSourceNow("server-api")) return;
+      void refreshServerFirstAnalysisWindow();
+    }, SOURCE_POLL_MS["server-api"]);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, sourceRetry, serverTrendWindow]);
+
   // Stream watchdog with fallback restart and retry/backoff.
   useEffect(() => {
     if (!fwStreaming) return;
@@ -2673,11 +2701,24 @@ function App() {
     }
   }
 
+  function setServerTrendRange(hours: number) {
+    const safeHours = Number.isFinite(hours) && hours > 0 ? Math.floor(hours) : 1;
+    setServerTrendRangeHours(safeHours);
+    const endAt = new Date();
+    const startAt = new Date(endAt.getTime() - safeHours * 60 * 60 * 1000);
+    setServerTrendWindow({
+      startAt: startAt.toISOString(),
+      endAt: endAt.toISOString(),
+      bucketGrain: safeHours <= 6 ? "fine" : "coarse",
+    });
+  }
+
   async function refreshServerFirstAnalysisWindow(): Promise<AnalysisMode> {
     const hasServerSession = Boolean(serverSessionRef.current.getAccessToken());
     if (!hasServerSession) {
       setAnalysisMode("local-only");
       setAnalysisFallbackReason("Server session unavailable. Using local collection.");
+      setServerFreshness(null);
       return "local-only";
     }
 
@@ -2698,12 +2739,17 @@ function App() {
       setAnalysisMode("server");
       setAnalysisFallbackReason(null);
       setServerLastSyncIso(new Date().toISOString());
+      setServerFreshness(serverResult.freshness);
       setServerTrendBuckets(serverResult.trends.items);
+      markSourceSuccess("server-api");
       return "server";
     }
 
     setAnalysisMode("fallback-local");
     setAnalysisFallbackReason(`${serverResult.errorCode}: ${serverResult.reason}`);
+    setServerFreshness(null);
+    markSourceError("server-api", serverResult.reason);
+    scheduleSourceRetry("server-api");
     setLogs((prev) => [
       ...prev,
       `Server analysis fallback (${serverResult.stage}): ${serverResult.reason}`,
@@ -4120,6 +4166,14 @@ function App() {
                     <span>{item.detail}</span>
                   </div>
                 ))}
+                {serverFreshnessCards.map((item) => (
+                  <div key={`server-${item.key}`} className={`source-health-card source-health-${item.status}`}>
+                    <strong>{item.label}</strong>
+                    <span>Status: {item.status}</span>
+                    <span>Last success: {formatHealthTime(item.lastSuccessIso)}</span>
+                    <span>{item.detail}</span>
+                  </div>
+                ))}
               </div>
             </div>
           )}
@@ -4350,6 +4404,16 @@ function App() {
                 </span>
               </div>
 
+              <div className={`analysis-mode-banner analysis-mode-${analysisModeBadge.tone}`}>
+                <strong>{analysisModeBadge.label}</strong>
+                <span>Last server sync: {formatHealthTime(serverLastSyncIso)}</span>
+                {analysisFallbackReason && analysisMode !== "server" ? (
+                  <span>Fallback reason: {analysisFallbackReason}</span>
+                ) : (
+                  <span>Freshness cards: {serverFreshnessCards.length}</span>
+                )}
+              </div>
+
               <div className="source-health-grid">
                 {sourceHealthViews.map((item) => (
                   <div key={`main-${item.key}`} className={`source-health-card source-health-${item.status}`}>
@@ -4359,6 +4423,45 @@ function App() {
                     <span>{item.detail}</span>
                   </div>
                 ))}
+                {serverFreshnessCards.map((item) => (
+                  <div key={`main-server-${item.key}`} className={`source-health-card source-health-${item.status}`}>
+                    <strong>{item.label}</strong>
+                    <span>Status: {item.status}</span>
+                    <span>Last success: {formatHealthTime(item.lastSuccessIso)}</span>
+                    <span>{item.detail}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="analysis-section analysis-section-card">
+                <h4>Server Trend Window</h4>
+                <div className="analysis-trend-controls">
+                  <label>
+                    Range
+                    <select
+                      value={serverTrendRangeHours}
+                      onChange={(event) => setServerTrendRange(Number(event.target.value))}
+                    >
+                      <option value={1}>Last 1 hour</option>
+                      <option value={6}>Last 6 hours</option>
+                      <option value={24}>Last 24 hours</option>
+                    </select>
+                  </label>
+                  <button className="secondary" type="button" onClick={() => void refreshServerFirstAnalysisWindow()}>
+                    Refresh server trend window
+                  </button>
+                </div>
+                <ul className="analysis-list">
+                  {serverTrendBuckets.map((bucket) => (
+                    <li key={`trend-${bucket.bucketStart}-${bucket.sourceType}-${bucket.bucketGrain}`}>
+                      <span>{bucket.sourceType} ({bucket.bucketGrain})</span>
+                      <span>{bucket.bucketStart} · {bucket.eventCount}</span>
+                    </li>
+                  ))}
+                  {serverTrendBuckets.length === 0 && (
+                    <li>No server trend buckets loaded yet.</li>
+                  )}
+                </ul>
               </div>
 
               <div className="analysis-metrics">

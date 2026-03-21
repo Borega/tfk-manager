@@ -1431,6 +1431,59 @@ input[type="checkbox"]:disabled {
   margin: 0 0 8px;
 }
 
+.analysis-mode-banner {
+  border-radius: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(109, 173, 167, 0.24);
+  background: rgba(10, 16, 20, 0.62);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 10px 0 12px;
+}
+
+.analysis-mode-banner strong {
+  color: #d4ece8;
+  letter-spacing: 0.03em;
+}
+
+.analysis-mode-banner span {
+  color: #a5c2be;
+  font-size: 0.8rem;
+}
+
+.analysis-mode-healthy {
+  border-color: rgba(94, 187, 118, 0.55);
+}
+
+.analysis-mode-warning {
+  border-color: rgba(240, 177, 89, 0.58);
+}
+
+.analysis-mode-muted {
+  border-color: rgba(124, 151, 171, 0.5);
+}
+
+.analysis-trend-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.analysis-trend-controls label {
+  display: grid;
+  gap: 4px;
+  color: #b4d4d0;
+  font-size: 0.78rem;
+}
+
+.analysis-trend-controls select {
+  min-width: 150px;
+}
+
 .analysis-collapsible summary {
   cursor: pointer;
   color: #bfe2dd;
