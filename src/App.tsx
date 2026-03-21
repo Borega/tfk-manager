@@ -18,6 +18,16 @@ import {
   SOURCE_STALE_MS,
   type SourcePolicyKey,
 } from "./sourcePollingPolicy";
+import { resolveAdaptivePollPolicy, type AdaptiveHealthStatus } from "./adaptivePollingPolicy";
+import {
+  buildAnalysisIdentityGraph,
+  type AnalysisIdentityLink,
+  type AnalysisIdentityObservation,
+} from "./analysisIdentityGraph";
+import {
+  computeExplainableRisk,
+  type AnalysisRiskEvidenceReference,
+} from "./analysisRiskEngine";
 import { searchTopic, type TopicNode } from "./topicSearch";
 import {
   createServerAnalysisClient,
@@ -186,6 +196,8 @@ type AnalysisDeviceDetail = {
   dynamicLease: DynamicLease | null;
   webfilterEvents: WfLogEntry[];
   firewallEvents: FirewallLogEntry[];
+  identityLinks: AnalysisIdentityLink[];
+  riskEvidence: AnalysisRiskEvidenceReference[];
 };
 
 type SourceHealthKey = SourcePolicyKey;
@@ -357,6 +369,13 @@ function toSourceHealthView(
   };
 }
 
+function toAdaptiveHealthStatus(status: SourceHealthStatus): AdaptiveHealthStatus {
+  if (status === "error") return "error";
+  if (status === "stale") return "stale";
+  if (status === "healthy") return "healthy";
+  return "idle";
+}
+
 function isPrivateIpv4(ip: string): boolean {
   if (!ip) return false;
   if (ip.startsWith("10.")) return true;
@@ -377,12 +396,6 @@ function classifyDynamicSegment(iface: string): "Dynamic Gruen" | "Dynamic BYOD"
     return "Dynamic BYOD";
   }
   return "Dynamic Gruen";
-}
-
-function clampRisk(value: number): number {
-  if (value < 0) return 0;
-  if (value > 100) return 100;
-  return Math.round(value);
 }
 
 function isGatewayRouterIp(ipRaw: string): boolean {
@@ -1083,6 +1096,8 @@ function App() {
       ["Unknown", new Set<string>()],
     ]);
     const userToIps = new Map<string, Set<string>>();
+    const identityObservations: AnalysisIdentityObservation[] = [];
+    const riskEvidenceByIp = new Map<string, AnalysisRiskEvidenceReference[]>();
 
     const ensure = (ipRaw: string): AnalysisDeviceRow | null => {
       const ip = ipRaw.trim();
@@ -1128,6 +1143,12 @@ function App() {
       knownIps.add(row.ip);
       const segmentSet = segmentKnownIps.get(row.segment);
       if (segmentSet) segmentSet.add(row.ip);
+      identityObservations.push({
+        sourceType: "static-lease",
+        ip: row.ip,
+        mac: lease.mac,
+        hostname: lease.name,
+      });
     }
 
     for (const lease of dynamicLeases) {
@@ -1144,6 +1165,13 @@ function App() {
       const segmentSet = segmentKnownIps.get(row.segment);
       if (segmentSet) segmentSet.add(row.ip);
       markSeen(row, lease.end || lease.start);
+      identityObservations.push({
+        sourceType: "dynamic-lease",
+        ip: row.ip,
+        mac: lease.mac,
+        hostname: lease.hostname,
+        observedAt: lease.end || lease.start,
+      });
     }
 
     const blockedCategoryMap = new Map<string, number>();
@@ -1173,6 +1201,12 @@ function App() {
         }
       }
       markSeen(row, wf.time);
+      identityObservations.push({
+        sourceType: "webfilter-log",
+        ip: row.ip,
+        user: normalizedUser || undefined,
+        observedAt: wf.time,
+      });
 
       if (action === "block") {
         const cat = wf.category?.trim() || "unknown";
@@ -1204,6 +1238,11 @@ function App() {
           if (isPass) row.fwPass += 1;
           if (isBlock) row.fwBlock += 1;
           markSeen(row, fw.__timestamp__ || "");
+          identityObservations.push({
+            sourceType: "firewall-log",
+            ip: row.ip,
+            observedAt: fw.__timestamp__ || undefined,
+          });
           continue;
         }
         if (!isPrivateIpv4(ip)) continue;
@@ -1211,28 +1250,52 @@ function App() {
         if (isPass) agg.pass += 1;
         if (isBlock) agg.block += 1;
         unknownFirewallIps.set(ip, agg);
+        identityObservations.push({
+          sourceType: "firewall-log",
+          ip,
+          observedAt: fw.__timestamp__ || undefined,
+        });
+      }
+    }
+
+    const identityGraph = buildAnalysisIdentityGraph(identityObservations);
+    const identityLinksByIp = new Map<string, AnalysisIdentityLink[]>();
+    const addLinkForIp = (ip: string, link: AnalysisIdentityLink) => {
+      const links = identityLinksByIp.get(ip) ?? [];
+      links.push(link);
+      identityLinksByIp.set(ip, links);
+    };
+    for (const link of identityGraph.links) {
+      if (link.fromNodeId.startsWith("ip:")) {
+        addLinkForIp(link.fromNodeId.slice(3), link);
+      }
+      if (link.toNodeId.startsWith("ip:")) {
+        addLinkForIp(link.toNodeId.slice(3), link);
       }
     }
 
     const rows = Array.from(byIp.values())
       .map((row) => {
         row.hasDualBlock = row.fwBlock > 0 && row.wfBlock > 0;
-        const hasWebActivity = row.wfAllow + row.wfBlock > 0;
+        const rowIdentityLinks = identityLinksByIp.get(row.ip) ?? [];
         const hasIdentity = Boolean(row.mac.trim() || row.hostname.trim() || row.user.trim());
-        if (row.isStatic && row.mac.trim() && row.hostname.trim()) {
+        if (rowIdentityLinks.some((item) => item.confidence === "high")) {
           row.identityConfidence = "high";
-        } else if (hasIdentity) {
+        } else if (rowIdentityLinks.some((item) => item.confidence === "medium") || hasIdentity) {
           row.identityConfidence = "medium";
         } else {
           row.identityConfidence = "low";
         }
 
-        let risk = row.fwBlock * 6 + row.wfBlock * 4;
-        if (row.hasDualBlock) risk += 8;
-        if (row.segment === "Unknown") risk += 8;
-        if (hasWebActivity && !row.user.trim()) risk += 3;
-        if (row.identityConfidence === "low" && (row.fwBlock > 0 || row.wfBlock > 0)) risk += 2;
-        row.riskScore = clampRisk(risk);
+        const risk = computeExplainableRisk({
+          fwBlock: row.fwBlock,
+          wfBlock: row.wfBlock,
+          hasDualBlock: row.hasDualBlock,
+          identityConfidence: row.identityConfidence,
+          segment: row.segment,
+        });
+        row.riskScore = risk.score;
+        riskEvidenceByIp.set(row.ip, risk.evidence);
         return row;
       })
       .filter((r) => r.fwPass + r.fwBlock + r.wfAllow + r.wfBlock > 0)
@@ -1368,6 +1431,9 @@ function App() {
       fwOnlyBlocked,
       wfOnlyBlocked,
       knownDeviceCount: byIp.size,
+      identityGraph,
+      identityLinksByIp,
+      riskEvidenceByIp,
     };
   }, [existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
 
@@ -1395,14 +1461,29 @@ function App() {
       .sort((a, b) => toTimeMillis(b.__timestamp__ ?? "") - toTimeMillis(a.__timestamp__ ?? ""))
       .slice(0, 80);
 
+    const identityLinks = (analysis.identityLinksByIp.get(row.ip) ?? []).slice(0, 20);
+    const riskEvidence = (analysis.riskEvidenceByIp.get(row.ip) ?? []).slice(0, 20);
+
     return {
       row,
       staticLease,
       dynamicLease,
       webfilterEvents,
       firewallEvents,
+      identityLinks,
+      riskEvidence,
     };
-  }, [selectedAnalysisDeviceIp, analysis.rows, existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
+  }, [
+    selectedAnalysisDeviceIp,
+    analysis.rows,
+    analysis.identityLinksByIp,
+    analysis.riskEvidenceByIp,
+    existing.rows,
+    existingW.rows,
+    dynamicLeases,
+    wfLogs,
+    fwLogs,
+  ]);
 
   const allRiskDeviceIps = analysis.riskyDevices.map((row) => row.ip);
 
@@ -1829,7 +1910,20 @@ function App() {
         isDocumentVisible,
         hasRecentError,
       });
-      const delayMs = applyPollJitterMs(baseMs);
+      const webfilterStatus = toSourceHealthView(
+        "webfilter-ui",
+        webfilterHealth,
+        sourceRetry["webfilter-ui"],
+        Date.now(),
+      ).status;
+      const adaptivePoll = resolveAdaptivePollPolicy({
+        source: "webfilter-ui",
+        baseIntervalMs: baseMs,
+        healthStatus: toAdaptiveHealthStatus(webfilterStatus),
+        backlogSize: wfLogs.length,
+        retryAttempt: sourceRetry["webfilter-ui"].attempt,
+      });
+      const delayMs = applyPollJitterMs(adaptivePoll.intervalMs);
 
       timeoutId = window.setTimeout(async () => {
         if (cancelled) return;
@@ -1855,7 +1949,7 @@ function App() {
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wfAutoRefresh, activeTab, sourceRetry]);
+  }, [wfAutoRefresh, activeTab, sourceHealth, sourceRetry, wfLogs.length]);
 
   // Bootstrap analysis dependencies when the tab becomes active.
   useEffect(() => {
@@ -1887,29 +1981,63 @@ function App() {
   useEffect(() => {
     if (activeTab !== "analysis") return;
     if (!credentialsReady) return;
+    const leaseStatus = toSourceHealthView("leases", sourceHealth.leases, sourceRetry.leases, Date.now()).status;
+    const leasePoll = resolveAdaptivePollPolicy({
+      source: "leases",
+      baseIntervalMs: SOURCE_POLL_MS.leases,
+      healthStatus: toAdaptiveHealthStatus(leaseStatus),
+      backlogSize: analysis.rows.length + dynamicLeases.length,
+      retryAttempt: sourceRetry.leases.attempt,
+    });
     const id = window.setInterval(() => {
       if (!canRunSourceNow("leases")) return;
       void refreshLeasesSilently();
-    }, SOURCE_POLL_MS.leases);
+    }, leasePoll.intervalMs);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, credentialsReady, sourceRetry]);
+  }, [activeTab, credentialsReady, sourceHealth, sourceRetry, analysis.rows.length, dynamicLeases.length]);
 
   // Keep server trend and freshness view in sync while analysis is open.
   useEffect(() => {
     if (activeTab !== "analysis") return;
+    const serverStatus = toSourceHealthView(
+      "server-api",
+      sourceHealth["server-api"],
+      sourceRetry["server-api"],
+      Date.now(),
+    ).status;
+    const serverPoll = resolveAdaptivePollPolicy({
+      source: "server-api",
+      baseIntervalMs: SOURCE_POLL_MS["server-api"],
+      healthStatus: toAdaptiveHealthStatus(serverStatus),
+      backlogSize: serverTrendBuckets.length,
+      retryAttempt: sourceRetry["server-api"].attempt,
+    });
     const id = window.setInterval(() => {
       if (!canRunSourceNow("server-api")) return;
       void refreshServerFirstAnalysisWindow();
-    }, SOURCE_POLL_MS["server-api"]);
+    }, serverPoll.intervalMs);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, sourceRetry, serverTrendWindow]);
+  }, [activeTab, sourceHealth, sourceRetry, serverTrendWindow, serverTrendBuckets.length]);
 
   // Stream watchdog with fallback restart and retry/backoff.
   useEffect(() => {
     if (!fwStreaming) return;
     if (activeTab !== "analysis" && activeTab !== "firewall") return;
+    const firewallStatus = toSourceHealthView(
+      "firewall-stream",
+      sourceHealth["firewall-stream"],
+      sourceRetry["firewall-stream"],
+      Date.now(),
+    ).status;
+    const firewallPoll = resolveAdaptivePollPolicy({
+      source: "firewall-stream",
+      baseIntervalMs: SOURCE_POLL_MS["firewall-stream"],
+      healthStatus: toAdaptiveHealthStatus(firewallStatus),
+      backlogSize: fwLogs.length,
+      retryAttempt: sourceRetry["firewall-stream"].attempt,
+    });
     const id = window.setInterval(() => {
       const lastSuccessIso = sourceHealth["firewall-stream"].lastSuccessIso;
       if (!lastSuccessIso) return;
@@ -1920,10 +2048,10 @@ function App() {
       if (!canRunSourceNow("firewall-stream")) return;
       setLogs((prev) => [...prev, "Firewall stream stale. Attempting fallback restart..."]);
       void handleStartFwLog();
-    }, SOURCE_POLL_MS["firewall-stream"]);
+    }, firewallPoll.intervalMs);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fwStreaming, activeTab, sourceHealth, sourceRetry]);
+  }, [fwStreaming, activeTab, sourceHealth, sourceRetry, fwLogs.length]);
 
   async function handleAutoExportConfirm() {
     if (!autoExportKey) return;
@@ -3440,6 +3568,7 @@ function App() {
                 <p>Hostname: {selectedAnalysisDeviceDetail.row.hostname || "-"}</p>
                 <p>MAC: {selectedAnalysisDeviceDetail.row.mac || "-"}</p>
                 <p>Segment: {selectedAnalysisDeviceDetail.row.segment}</p>
+                <p>Identity confidence: {selectedAnalysisDeviceDetail.row.identityConfidence}</p>
                 <p>Risk: {selectedAnalysisDeviceDetail.row.riskScore}</p>
                 <p>Last seen: {selectedAnalysisDeviceDetail.row.lastSeen || "-"}</p>
               </div>
@@ -3489,6 +3618,45 @@ function App() {
                   ))}
                   {selectedAnalysisDeviceDetail.firewallEvents.length === 0 && (
                     <li>No firewall events recorded for this device.</li>
+                  )}
+                </ul>
+              </div>
+            </div>
+
+            <div className="analysis-detail-grid">
+              <div className="analysis-detail-card">
+                <h5>Identity Links</h5>
+                <ul className="analysis-detail-list">
+                  {selectedAnalysisDeviceDetail.identityLinks.map((link) => {
+                    const currentIpNodeId = `ip:${selectedAnalysisDeviceDetail.row.ip}`;
+                    const peerNodeId = link.fromNodeId === currentIpNodeId ? link.toNodeId : link.fromNodeId;
+                    const peerLabel = peerNodeId.includes(":") ? peerNodeId.split(":").slice(1).join(":") : peerNodeId;
+                    return (
+                      <li key={`detail-id-${link.id}`}>
+                        <strong>{peerLabel || "unknown"}</strong>
+                        <span>{link.confidence} confidence</span>
+                        <span>{link.evidenceCount} evidence refs</span>
+                      </li>
+                    );
+                  })}
+                  {selectedAnalysisDeviceDetail.identityLinks.length === 0 && (
+                    <li>No identity graph links available for this device.</li>
+                  )}
+                </ul>
+              </div>
+              <div className="analysis-detail-card">
+                <h5>Risk Evidence</h5>
+                <ul className="analysis-detail-list">
+                  {selectedAnalysisDeviceDetail.riskEvidence.map((item, idx) => (
+                    <li key={`detail-risk-${item.ruleId}-${idx}`}>
+                      <strong>{item.ruleId}</strong>
+                      <span>{item.sourceType}:{item.field}</span>
+                      <span>{item.observedValue}</span>
+                      <span>+{item.weight}</span>
+                    </li>
+                  ))}
+                  {selectedAnalysisDeviceDetail.riskEvidence.length === 0 && (
+                    <li>No explainable risk evidence available for this device.</li>
                   )}
                 </ul>
               </div>
