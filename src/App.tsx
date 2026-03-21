@@ -3564,11 +3564,11 @@ function App() {
             </div>
             <div className="analysis-detail-grid">
               <div className="analysis-detail-card">
-                <h5>Identity</h5>
+                <h5>Identity Confidence</h5>
                 <p>Hostname: {selectedAnalysisDeviceDetail.row.hostname || "-"}</p>
                 <p>MAC: {selectedAnalysisDeviceDetail.row.mac || "-"}</p>
                 <p>Segment: {selectedAnalysisDeviceDetail.row.segment}</p>
-                <p>Identity confidence: {selectedAnalysisDeviceDetail.row.identityConfidence}</p>
+                <p>Identity Confidence: {selectedAnalysisDeviceDetail.row.identityConfidence}</p>
                 <p>Risk: {selectedAnalysisDeviceDetail.row.riskScore}</p>
                 <p>Last seen: {selectedAnalysisDeviceDetail.row.lastSeen || "-"}</p>
               </div>
@@ -4766,7 +4766,7 @@ function App() {
                         <th>FW Block</th>
                         <th>WF Block</th>
                         <th>Dual</th>
-                        <th>Identity</th>
+                        <th>Identity Confidence</th>
                         <th>Last Seen</th>
                       </tr>
                     </thead>
@@ -4822,7 +4822,7 @@ function App() {
                         <th>FW Block</th>
                         <th>WF Allow</th>
                         <th>WF Block</th>
-                        <th>Identity</th>
+                        <th>Identity Confidence</th>
                         <th>Last Seen</th>
                       </tr>
                     </thead>
