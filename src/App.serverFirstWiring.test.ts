@@ -16,4 +16,12 @@ describe("App server-first analysis wiring", () => {
     expect(appSource).toContain("setAnalysisMode(\"fallback-local\")");
     expect(appSource).toContain("await refreshLeasesSilently();");
   });
+
+  it("wires delegated proxy client path for DHCP mutations", () => {
+    expect(appSource).toContain("createServerProxyClient");
+    expect(appSource).toContain("delegatedProxyEnabled");
+    expect(appSource).toContain("runStaticMutationsViaProxy");
+    expect(appSource).toContain("setExistingCsv(exportCsv);");
+    expect(appSource).toContain("setExistingCsvW(exportWlanbyodCsv);");
+  });
 });

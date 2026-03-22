@@ -35,6 +35,26 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             lag_seconds INTEGER NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS proxy_operation_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_role TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            target TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error_code TEXT,
+            details_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_proxy_operation_audit_request_id
+            ON proxy_operation_audit(request_id);
+
+        CREATE INDEX IF NOT EXISTS idx_proxy_operation_audit_created_at
+            ON proxy_operation_audit(created_at DESC);
         """
     )
 
@@ -187,3 +207,76 @@ def get_checkpoint_cursor(connection: sqlite3.Connection, source_key: str) -> st
         (source_key,),
     ).fetchone()
     return row[0] if row else None
+
+
+def write_proxy_operation_audit(
+    connection: sqlite3.Connection,
+    *,
+    request_id: str,
+    actor_id: str,
+    actor_role: str,
+    scope: str,
+    operation: str,
+    target: str,
+    status: str,
+    error_code: str | None,
+    details_json: str,
+    created_at: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO proxy_operation_audit (
+            request_id,
+            actor_id,
+            actor_role,
+            scope,
+            operation,
+            target,
+            status,
+            error_code,
+            details_json,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_id,
+            actor_id,
+            actor_role,
+            scope,
+            operation,
+            target,
+            status,
+            error_code,
+            details_json,
+            created_at,
+        ),
+    )
+
+
+def get_proxy_operation_audit_by_request_id(connection: sqlite3.Connection, request_id: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT request_id, actor_id, actor_role, scope, operation, target, status, error_code, details_json, created_at
+        FROM proxy_operation_audit
+        WHERE request_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (request_id,),
+    ).fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "requestId": row[0],
+        "actorId": row[1],
+        "actorRole": row[2],
+        "scope": row[3],
+        "operation": row[4],
+        "target": row[5],
+        "status": row[6],
+        "errorCode": row[7],
+        "details": row[8],
+        "createdAt": row[9],
+    }

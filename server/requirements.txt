@@ -1,0 +1,5 @@
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.32,<0.33
+bcrypt>=4.2,<4.3
+PyJWT>=2.10,<2.11
+requests>=2.32,<2.33

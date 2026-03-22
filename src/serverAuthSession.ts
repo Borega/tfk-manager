@@ -20,13 +20,29 @@ export type ServerSession = {
   isAccessTokenExpired: (nowMillis?: number) => boolean;
 };
 
+export function canMutateViaServerProxy(session: ServerSession): boolean {
+  return session.getTokens()?.role === "admin";
+}
+
 export type RefreshServerSessionArgs = {
   baseUrl: string;
   session: ServerSession;
   fetchImpl?: typeof fetch;
 };
 
+export type LoginServerSessionArgs = {
+  baseUrl: string;
+  username: string;
+  password: string;
+  session: ServerSession;
+  fetchImpl?: typeof fetch;
+};
+
 export type RefreshServerSessionResult =
+  | { ok: true; tokens: ServerSessionTokens }
+  | { ok: false; error: ServerApiErrorEnvelope };
+
+export type LoginServerSessionResult =
   | { ok: true; tokens: ServerSessionTokens }
   | { ok: false; error: ServerApiErrorEnvelope };
 
@@ -84,6 +100,19 @@ function extractTokens(payload: unknown, fallbackRole?: string): ServerSessionTo
     refreshExpiresAt,
     role: typeof objectPayload.role === "string" ? objectPayload.role : fallbackRole,
   };
+}
+
+export function isServerSessionTokens(value: unknown): value is ServerSessionTokens {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  const role = record.role;
+  return (
+    typeof record.accessToken === "string"
+    && typeof record.refreshToken === "string"
+    && typeof record.accessExpiresAt === "string"
+    && typeof record.refreshExpiresAt === "string"
+    && (role === undefined || typeof role === "string")
+  );
 }
 
 async function safeParseJson(response: Response): Promise<unknown> {
@@ -179,6 +208,83 @@ export async function refreshServerSession({
         errorCode: "refresh_contract_invalid",
         message: "refresh response missing token fields",
         requestId: "refresh-invalid-response",
+        details: asObject(payload),
+      },
+    };
+  }
+
+  session.setTokens(tokens);
+  return { ok: true, tokens };
+}
+
+export async function loginServerSession({
+  baseUrl,
+  username,
+  password,
+  session,
+  fetchImpl = fetch,
+}: LoginServerSessionArgs): Promise<LoginServerSessionResult> {
+  const trimmedUsername = username.trim();
+  if (!trimmedUsername || !password) {
+    return {
+      ok: false,
+      error: {
+        status: 400,
+        errorCode: "login_input_invalid",
+        message: "username and password are required",
+        requestId: "login-input-invalid",
+        details: {
+          usernameProvided: Boolean(trimmedUsername),
+          passwordProvided: Boolean(password),
+        },
+      },
+    };
+  }
+
+  const endpoint = `${normalizeBaseUrl(baseUrl)}/api/auth/login`;
+
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        username: trimmedUsername,
+        password,
+      }),
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        status: 503,
+        errorCode: "server_unreachable",
+        message: "server login request failed",
+        requestId: "login-network-error",
+        details: { reason: String(error) },
+      },
+    };
+  }
+
+  const payload = await safeParseJson(response);
+  if (!response.ok) {
+    return {
+      ok: false,
+      error: normalizeErrorEnvelope(response.status, payload, "login_failed", "login request failed"),
+    };
+  }
+
+  const tokens = extractTokens(payload);
+  if (!tokens) {
+    return {
+      ok: false,
+      error: {
+        status: 502,
+        errorCode: "login_contract_invalid",
+        message: "login response missing token fields",
+        requestId: "login-invalid-response",
         details: asObject(payload),
       },
     };

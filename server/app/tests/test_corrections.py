@@ -86,7 +86,7 @@ class TestCorrections(unittest.TestCase):
 
         connection.close()
 
-    def test_worker_iteration_skips_recompute_when_no_corrected_windows(self):
+    def test_worker_iteration_recomputes_ingested_windows_when_no_corrections(self):
         connection = sqlite3.connect(":memory:")
         ensure_schema(connection)
         now_utc = datetime(2026, 3, 21, 9, 0, 0, tzinfo=timezone.utc)
@@ -112,7 +112,10 @@ class TestCorrections(unittest.TestCase):
 
         with patch("server.app.collector.workers.worker_runner.recompute_aggregate_windows") as recompute:
             run_worker_iteration("webfilter", state, _adapter_fetch, connection, now_utc)
-            recompute.assert_not_called()
+            recompute.assert_called_once()
+            windows = recompute.call_args.args[1]
+            self.assertEqual(len(windows), 1)
+            self.assertEqual(windows[0]["annotation"], "ingested")
 
         connection.close()
 

@@ -44,6 +44,130 @@ Only `requests` is required for backend dependencies. Playwright and selector co
 The backend authenticates against OPNsense, captures session cookies, and calls
 the `/api/tfk/dhcp/*` endpoints directly.
 
+## Server (Docker)
+
+The repository now includes a containerized server API for server-first analysis endpoints:
+
+- `POST /api/auth/login`
+- `POST /api/auth/refresh`
+- `GET /api/history/events`
+- `GET /api/history/trends`
+- `GET /api/status/freshness`
+- `POST /api/proxy/execute`
+- `GET /api/proxy/operations/{requestId}`
+- `GET /health`
+
+### Files
+
+- `server/Dockerfile` - server image build
+- `docker-compose.yml` - local runtime stack
+- `server/requirements.txt` - Python dependencies for the server container
+
+### 1. User setup (`.env.server`)
+
+Create a `.env.server` file in the repository root:
+
+```env
+TFK_SERVER_PORT=8080
+TFK_SERVER_JWT_SECRET=replace-with-a-long-random-secret
+TFK_SERVER_BOOTSTRAP_USERNAME=admin
+TFK_SERVER_BOOTSTRAP_PASSWORD=replace-with-strong-password
+TFK_SERVER_BOOTSTRAP_ROLE=admin
+TFK_SERVER_CORS_ORIGINS=*
+TFK_SERVER_COLLECTOR_ENABLED=1
+TFK_SERVER_COLLECTOR_SAMPLE_MODE=0
+TFK_SERVER_COLLECTOR_INTERVAL_SECONDS=20
+TFK_SOURCE_OPNSENSE_BASE_URL=https://your-opnsense-host:81
+TFK_SOURCE_API_USERNAME=replace-with-opnsense-api-username
+TFK_SOURCE_API_KEY=replace-with-opnsense-api-key
+TFK_SOURCE_API_SECRET=replace-with-opnsense-api-secret
+TFK_SOURCE_OPNSENSE_USERNAME=replace-with-opnsense-username
+TFK_SOURCE_OPNSENSE_PASSWORD=replace-with-opnsense-password
+TFK_SOURCE_COOKIE_HEADER=
+TFK_SOURCE_MSD_COOKIE=
+TFK_SOURCE_VERIFY_TLS=0
+TFK_SOURCE_CONNECT_TIMEOUT_SECONDS=10
+TFK_SOURCE_READ_TIMEOUT_SECONDS=30
+TFK_SOURCE_FIREWALL_MAX_EVENTS=25
+TFK_SOURCE_DHCP_PATH=/api/tfk/dhcp/dynamic_leases
+TFK_SOURCE_FIREWALL_STREAM_PATH=/api/diagnostics/firewall/streamLog
+TFK_MSD_USERNAME=replace-with-msd-username
+TFK_MSD_PASSWORD=replace-with-msd-password
+TFK_PROXY_HMAC_SHARED_SECRET=replace-with-long-random-secret
+TFK_PROXY_REQUEST_AUDIENCE=tfk-manager-server
+TFK_PROXY_MAX_SKEW_SECONDS=120
+TFK_PROXY_NONCE_TTL_SECONDS=300
+TFK_SERVER_ALLOWED_PROXY_IPS=127.0.0.1/32
+```
+
+Notes:
+
+- `TFK_SERVER_BOOTSTRAP_USERNAME` and `TFK_SERVER_BOOTSTRAP_PASSWORD` are used to create the initial login user if it does not exist yet.
+- Supported roles from current authz policy are `admin` and `analyst`.
+- If the bootstrap user already exists, startup will keep the existing account.
+- `TFK_SERVER_COLLECTOR_ENABLED=1` runs a background collector loop in the API container.
+- `TFK_SERVER_COLLECTOR_SAMPLE_MODE=0` enables real source ingestion using the `TFK_SOURCE_*` and `TFK_MSD_*` credentials.
+- DHCP and firewall collectors now follow the same GUI-session flow as the desktop app: use `TFK_SOURCE_OPNSENSE_USERNAME` + `TFK_SOURCE_OPNSENSE_PASSWORD` (or import an existing browser cookie via `TFK_SOURCE_COOKIE_HEADER`) to access `/api/tfk/dhcp/*` and firewall stream endpoints.
+- `TFK_SOURCE_DHCP_PATH` defaults to `/api/tfk/dhcp/dynamic_leases` and automatically falls back to `/api/tfk/dynamicleases/get`.
+- Set `TFK_SERVER_COLLECTOR_SAMPLE_MODE=1` when you want demo data without source credentials.
+- `TFK_PROXY_HMAC_SHARED_SECRET` must match the desktop delegated-mode secret (or `VITE_TFK_PROXY_HMAC_SHARED_SECRET`) for proxy request signing.
+- `TFK_PROXY_REQUEST_AUDIENCE` must match the desktop audience configured in Settings.
+
+### 2. Build and run the server
+
+```powershell
+docker compose --env-file .env.server up --build -d
+```
+
+### 3. Connection and health check
+
+- Base URL: `http://localhost:8080`
+- Health endpoint:
+
+```powershell
+curl http://localhost:8080/health
+```
+
+### 4. Login and endpoint usage
+
+Get tokens:
+
+```powershell
+curl -X POST http://localhost:8080/api/auth/login \
+	-H "Content-Type: application/json" \
+	-d '{"username":"admin","password":"replace-with-strong-password"}'
+```
+
+Use the returned `accessToken` as bearer token:
+
+```powershell
+curl "http://localhost:8080/api/history/events?startAt=2026-03-21T00:00:00Z&endAt=2026-03-21T23:59:59Z&limit=100" \
+	-H "Authorization: Bearer <accessToken>"
+```
+
+### 5. Stop the server
+
+```powershell
+docker compose down
+```
+
+Data persists in Docker volume `tfk_server_data` (SQLite DB at `/data/server.db` inside the container).
+
+### 6. Reverse proxy hardening (required for internet-facing deployments)
+
+For delegated operations over remote networks, place NGINX in front of the server and keep the API container private.
+
+- Baseline hardened TLS profile and high-security mTLS profile:
+	- `docs/server/reverse-proxy-hardening.md`
+- Includes rate limiting, forwarded-header handling, request-size limits, method restrictions, and SSE-safe proxy timeout/buffering guidance.
+
+Example delegated-mode call path:
+
+1. Desktop logs in to server and receives JWT.
+2. Desktop signs `POST /api/proxy/execute` with HMAC (`X-Proxy-Signature`).
+3. Server validates nonce/timestamp/audience/signature and role/scope.
+4. Server executes allow-listed operation and writes audit record.
+
 ### Backend modes used by the app
 | Mode | Description |
 |---|---|

@@ -9,7 +9,7 @@ from the proxy management interface (port 1920).
 Env vars:
     TFK_MSD_USERNAME   - username for the MSD web UI (port 80)
     TFK_MSD_PASSWORD   - password for the MSD web UI (port 80)
-    TFK_BASE_URL       - OPNsense base URL (e.g. https://10.6.168.1:81)
+    TFK_BASE_URL       - OPNsense base URL (e.g. https://your-opnsense-host:81)
     TFK_MODE           - operation: webfilter_test | webfilter_logs | webfilter_address_lists | webfilter_address_list_write
     TFK_WF_ACTION      - address list write action: add | edit | delete | import | export
     TFK_WF_LIST        - target list: wl | bl | whitelist | blacklist

@@ -13,6 +13,7 @@ import {
   type RefreshServerSessionArgs,
   type RefreshServerSessionResult,
   type ServerSession,
+  type ServerSessionTokens,
 } from "./serverAuthSession";
 
 export type CreateServerAnalysisClientArgs = {
@@ -20,6 +21,7 @@ export type CreateServerAnalysisClientArgs = {
   session: ServerSession;
   fetchImpl?: typeof fetch;
   refreshSession?: (args: RefreshServerSessionArgs) => Promise<RefreshServerSessionResult>;
+  onSessionUpdated?: (tokens: ServerSessionTokens) => void;
 };
 
 type RequestOptions = {
@@ -87,6 +89,7 @@ export function createServerAnalysisClient({
   session,
   fetchImpl = fetch,
   refreshSession = refreshServerSession,
+  onSessionUpdated,
 }: CreateServerAnalysisClientArgs) {
   const base = normalizeBaseUrl(baseUrl);
 
@@ -139,6 +142,7 @@ export function createServerAnalysisClient({
       if (!refreshed.ok) {
         return { ok: false, status: refreshed.error.status, error: refreshed.error };
       }
+      onSessionUpdated?.(refreshed.tokens);
       return callJson<T>(options, false);
     }
 

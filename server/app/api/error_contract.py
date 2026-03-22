@@ -4,6 +4,9 @@ ERR_TOKEN_EXPIRED = "token_expired"
 ERR_TOKEN_INVALID = "token_invalid"
 ERR_FORBIDDEN = "forbidden"
 ERR_QUERY_INVALID = "query_invalid"
+ERR_PROXY_SECURITY = "proxy_security_failed"
+ERR_PROXY_OPERATION = "proxy_operation_invalid"
+ERR_PROXY_NOT_FOUND = "proxy_operation_not_found"
 ERR_INTERNAL = "internal_error"
 
 STATUS_BY_ERROR_CODE = {
@@ -11,6 +14,9 @@ STATUS_BY_ERROR_CODE = {
     ERR_TOKEN_INVALID: 401,
     ERR_FORBIDDEN: 403,
     ERR_QUERY_INVALID: 422,
+    ERR_PROXY_SECURITY: 401,
+    ERR_PROXY_OPERATION: 422,
+    ERR_PROXY_NOT_FOUND: 404,
     ERR_INTERNAL: 500,
 }
 

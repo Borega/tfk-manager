@@ -1,0 +1,56 @@
+services:
+  tfk-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: tfk-manager-server
+    ports:
+      - "${TFK_SERVER_PORT:-8080}:8080"
+    environment:
+      TFK_SERVER_DB_PATH: /data/server.db
+      TFK_SERVER_JWT_SECRET: ${TFK_SERVER_JWT_SECRET:-change-this-secret-in-production}
+      TFK_SERVER_BOOTSTRAP_USERNAME: ${TFK_SERVER_BOOTSTRAP_USERNAME:-admin}
+      TFK_SERVER_BOOTSTRAP_PASSWORD: ${TFK_SERVER_BOOTSTRAP_PASSWORD:-change-me}
+      TFK_SERVER_BOOTSTRAP_ROLE: ${TFK_SERVER_BOOTSTRAP_ROLE:-admin}
+      TFK_SERVER_ALLOWED_PROXY_IPS: ${TFK_SERVER_ALLOWED_PROXY_IPS:-127.0.0.1/32}
+      TFK_SERVER_COLLECTOR_ENABLED: ${TFK_SERVER_COLLECTOR_ENABLED:-1}
+      TFK_SERVER_COLLECTOR_SAMPLE_MODE: ${TFK_SERVER_COLLECTOR_SAMPLE_MODE:-1}
+      TFK_SERVER_COLLECTOR_INTERVAL_SECONDS: ${TFK_SERVER_COLLECTOR_INTERVAL_SECONDS:-20}
+      TFK_PROXY_HMAC_SHARED_SECRET: ${TFK_PROXY_HMAC_SHARED_SECRET:-change-this-proxy-secret}
+      TFK_PROXY_REQUEST_AUDIENCE: ${TFK_PROXY_REQUEST_AUDIENCE:-tfk-manager-server}
+      TFK_PROXY_MAX_SKEW_SECONDS: ${TFK_PROXY_MAX_SKEW_SECONDS:-120}
+      TFK_PROXY_NONCE_TTL_SECONDS: ${TFK_PROXY_NONCE_TTL_SECONDS:-300}
+      TFK_SOURCE_OPNSENSE_BASE_URL: ${TFK_SOURCE_OPNSENSE_BASE_URL:-}
+      TFK_SOURCE_API_USERNAME: ${TFK_SOURCE_API_USERNAME:-}
+      TFK_SOURCE_API_KEY: ${TFK_SOURCE_API_KEY:-}
+      TFK_SOURCE_API_SECRET: ${TFK_SOURCE_API_SECRET:-}
+      TFK_SOURCE_OPNSENSE_USERNAME: ${TFK_SOURCE_OPNSENSE_USERNAME:-}
+      TFK_SOURCE_OPNSENSE_PASSWORD: ${TFK_SOURCE_OPNSENSE_PASSWORD:-}
+      TFK_SOURCE_COOKIE_HEADER: ${TFK_SOURCE_COOKIE_HEADER:-}
+      TFK_SOURCE_MSD_COOKIE: ${TFK_SOURCE_MSD_COOKIE:-}
+      TFK_SOURCE_VERIFY_TLS: ${TFK_SOURCE_VERIFY_TLS:-0}
+      TFK_SOURCE_CONNECT_TIMEOUT_SECONDS: ${TFK_SOURCE_CONNECT_TIMEOUT_SECONDS:-10}
+      TFK_SOURCE_READ_TIMEOUT_SECONDS: ${TFK_SOURCE_READ_TIMEOUT_SECONDS:-30}
+      TFK_SOURCE_FIREWALL_MAX_EVENTS: ${TFK_SOURCE_FIREWALL_MAX_EVENTS:-25}
+      TFK_SOURCE_DHCP_PATH: ${TFK_SOURCE_DHCP_PATH:-/api/tfk/dhcp/dynamic_leases}
+      TFK_SOURCE_FIREWALL_STREAM_PATH: ${TFK_SOURCE_FIREWALL_STREAM_PATH:-/api/diagnostics/firewall/streamLog}
+      TFK_MSD_USERNAME: ${TFK_MSD_USERNAME:-}
+      TFK_MSD_PASSWORD: ${TFK_MSD_PASSWORD:-}
+    volumes:
+      - tfk_server_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  tfk_server_data:

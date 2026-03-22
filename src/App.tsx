@@ -33,7 +33,11 @@ import {
   createServerAnalysisClient,
 } from "./serverAnalysisClient";
 import {
+  canMutateViaServerProxy,
   createServerSession,
+  isServerSessionTokens,
+  loginServerSession,
+  type ServerSessionTokens,
 } from "./serverAuthSession";
 import {
   runServerFirstAnalysis,
@@ -44,11 +48,16 @@ import {
   toServerAnalysisModeBadge,
 } from "./serverFreshnessMapper";
 import type {
+  ServerApiErrorEnvelope,
   ServerBucketGrain,
   ServerFreshnessResponse,
   ServerTrendBucket,
 } from "./serverAnalysisContracts";
 import "./App.css";
+import {
+  createServerProxyClient,
+  type ProxyOperationType,
+} from "./serverProxyClient";
 
 type ClientRow = {
   name: string;
@@ -61,6 +70,10 @@ type SettingsState = {
   loginUrl: string;
   dashboardUrl: string;
   username: string;
+  serverBaseUrl: string;
+  serverUsername: string;
+  delegatedProxyEnabled: boolean;
+  proxyRequestAudience: string;
   apiUsername: string;
   apiKey: string;
   apiSecret: string;
@@ -318,6 +331,38 @@ function formatHealthTime(value: string | null): string {
   return new Date(ts).toLocaleTimeString();
 }
 
+const SERVER_SESSION_STORAGE_KEY = "tfk-manager.serverSession.v1";
+
+function normalizeServerBaseUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, "");
+}
+
+function readStoredServerSession(): ServerSessionTokens | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(SERVER_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isServerSessionTokens(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredServerSession(tokens: ServerSessionTokens | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (!tokens) {
+      window.localStorage.removeItem(SERVER_SESSION_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(SERVER_SESSION_STORAGE_KEY, JSON.stringify(tokens));
+  } catch {
+    // Ignore local storage write failures; session still stays in memory for this run.
+  }
+}
+
 function toSourceHealthView(
   key: SourceHealthKey,
   entry: SourceHealthEntry,
@@ -422,6 +467,10 @@ const DEFAULT_SETTINGS: SettingsState = {
   loginUrl: "https://your-opnsense-host:81",
   dashboardUrl: "https://your-opnsense-host:81/ui/core/dashboard",
   username: "",
+  serverBaseUrl: "http://localhost:8080",
+  serverUsername: "admin",
+  delegatedProxyEnabled: false,
+  proxyRequestAudience: "tfk-manager-server",
   apiUsername: "",
   apiKey: "",
   apiSecret: "",
@@ -470,10 +519,12 @@ function suggestCleanedUrls(baseUrl: string): Pick<SettingsState, "baseUrl" | "l
 function normalizeSettings(loaded?: Partial<SettingsState> | null): SettingsState {
   if (!loaded) return DEFAULT_SETTINGS;
   const baseSource = loaded.baseUrl ?? loaded.loginUrl ?? DEFAULT_SETTINGS.baseUrl;
+  const serverBaseSource = loaded.serverBaseUrl ?? DEFAULT_SETTINGS.serverBaseUrl;
   return {
     ...DEFAULT_SETTINGS,
     ...loaded,
     ...deriveUrlsFromBase(baseSource),
+    serverBaseUrl: normalizeServerBaseUrl(serverBaseSource),
   };
 }
 
@@ -489,6 +540,57 @@ function buildIncomingCsv(rows: ClientRow[]): string {
 function buildDeleteCsv(rows: ClientRow[]): string {
   const lines = ["Name;MAC;IP", ...rows.map((row) => `${row.name};${row.mac};${row.ip}`)];
   return lines.join("\n");
+}
+
+function toStaticLeaseCsv(rows: Array<{ hostname: string; mac: string; ip: string }>): string {
+  const lines = ["Name;MAC;IP", ...rows.map((row) => `${row.hostname};${row.mac};${row.ip}`)];
+  return lines.join("\n");
+}
+
+type DelegatedStaticLeaseRow = {
+  hostname: string;
+  mac: string;
+  ip: string;
+  iface?: string;
+};
+
+function normalizeDelegatedStaticIface(value: string | undefined): "lan" | "opt4" | "" {
+  const text = (value ?? "").trim().toLowerCase();
+  if (text === "lan" || text === "gruen") return "lan";
+  if (text === "opt4" || text === "wlanbyod") return "opt4";
+  return "";
+}
+
+function splitDelegatedStaticLeases(rows: DelegatedStaticLeaseRow[]): {
+  lanRows: DelegatedStaticLeaseRow[];
+  opt4Rows: DelegatedStaticLeaseRow[];
+  unknownIfaceCount: number;
+} {
+  const lanRows: DelegatedStaticLeaseRow[] = [];
+  const opt4Rows: DelegatedStaticLeaseRow[] = [];
+  let unknownIfaceCount = 0;
+
+  rows.forEach((row) => {
+    const iface = normalizeDelegatedStaticIface(row.iface);
+    if (iface === "opt4") {
+      opt4Rows.push(row);
+      return;
+    }
+    if (!iface) {
+      unknownIfaceCount += 1;
+    }
+    lanRows.push(row);
+  });
+
+  return {
+    lanRows,
+    opt4Rows,
+    unknownIfaceCount,
+  };
+}
+
+function toProxyErrorMessage(error: ServerApiErrorEnvelope): string {
+  return `${error.errorCode}: ${error.message} (requestId: ${error.requestId})`;
 }
 
 function parseCsvLine(line: string): string[] {
@@ -829,6 +931,10 @@ function App() {
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [passwordInput, setPasswordInput] = useState("");
   const [hasPassword, setHasPassword] = useState(false);
+  const [serverPasswordInput, setServerPasswordInput] = useState("");
+  const [proxySharedSecretInput, setProxySharedSecretInput] = useState("");
+  const [serverLoginBusy, setServerLoginBusy] = useState(false);
+  const [serverLoginError, setServerLoginError] = useState<string | null>(null);
   const [msdPasswordInput, setMsdPasswordInput] = useState("");
   const [hasMsdPassword, setHasMsdPassword] = useState(false);
   const [helpLogs, setHelpLogs] = useState<string[]>([]);
@@ -941,14 +1047,34 @@ function App() {
   const [serverTrendRangeHours, setServerTrendRangeHours] = useState<number>(1);
   const [serverTrendBuckets, setServerTrendBuckets] = useState<ServerTrendBucket[]>([]);
   const [serverFreshness, setServerFreshness] = useState<ServerFreshnessResponse | null>(null);
+  const [serverSessionTokens, setServerSessionTokens] = useState<ServerSessionTokens | null>(() => readStoredServerSession());
   const wfScheduledRefetchRef = useRef<number | null>(null);
   const wfLogsInFlightRef = useRef<Promise<WebfilterFetchResult> | null>(null);
-  const serverSessionRef = useRef(createServerSession());
+  const serverSessionRef = useRef(createServerSession(serverSessionTokens));
 
   const serverAnalysisClient = useMemo(() => createServerAnalysisClient({
-    baseUrl: settings.baseUrl,
+    baseUrl: settings.serverBaseUrl,
     session: serverSessionRef.current,
-  }), [settings.baseUrl]);
+    onSessionUpdated: (tokens) => {
+      writeStoredServerSession(tokens);
+      setServerSessionTokens(tokens);
+    },
+  }), [settings.serverBaseUrl]);
+
+  const serverProxyClient = useMemo(() => {
+    const envSecret = (import.meta.env.VITE_TFK_PROXY_HMAC_SHARED_SECRET ?? "").trim();
+    const resolvedSecret = proxySharedSecretInput.trim() || envSecret;
+    return createServerProxyClient({
+      baseUrl: settings.serverBaseUrl,
+      session: serverSessionRef.current,
+      sharedSecret: resolvedSecret,
+      requestAudience: settings.proxyRequestAudience,
+      onSessionUpdated: (tokens) => {
+        writeStoredServerSession(tokens);
+        setServerSessionTokens(tokens);
+      },
+    });
+  }, [settings.serverBaseUrl, settings.proxyRequestAudience, proxySharedSecretInput]);
 
   useEffect(() => {
     return () => {
@@ -1614,6 +1740,8 @@ function App() {
   }, [incomingCsvW, existingCsvW]);
 
   const credentialsReady = settings.username.trim().length > 0 && hasPassword;
+  const delegatedProxyEnabled = settings.delegatedProxyEnabled;
+  const runCredentialsReady = delegatedProxyEnabled || credentialsReady;
   const hasRealUrls =
     settings.baseUrl.trim() !== DEFAULT_SETTINGS.baseUrl &&
     settings.baseUrl.trim().length > 0;
@@ -1655,7 +1783,7 @@ function App() {
     existing.errors.length === 0 &&
     (!hasIgnored || acknowledgeIgnored) &&
     confirmChanges &&
-    credentialsReady;
+    runCredentialsReady;
 
   const allAddsChecked = diff.adds.length > 0 && diff.adds.every((row) => !excludedAddKeys.has(rowKey(row)));
   const allConflictsChecked =
@@ -1669,8 +1797,9 @@ function App() {
     incoming.errors.length > 0 ? "Incoming CSV has validation errors" : null,
     existing.errors.length > 0 ? "Existing CSV has validation errors" : null,
     hasIgnored && !acknowledgeIgnored ? "Acknowledge ignored rows to continue" : null,
-    settings.username.trim().length === 0 ? "Enter a username in Settings" : null,
-    !hasPassword ? "Save a password in Settings" : null,
+    !delegatedProxyEnabled && settings.username.trim().length === 0 ? "Enter a username in Settings" : null,
+    !delegatedProxyEnabled && !hasPassword ? "Save a password in Settings" : null,
+    delegatedProxyEnabled && !serverSessionTokens ? "Log in to Server API for delegated mode" : null,
     !confirmChanges ? "Confirm the changes to enable running" : null,
   ].filter(Boolean) as string[];
 
@@ -1681,7 +1810,7 @@ function App() {
     existingW.errors.length === 0 &&
     (!hasIgnoredW || acknowledgeIgnoredW) &&
     confirmChangesW &&
-    credentialsReady;
+    runCredentialsReady;
   const allAddsCheckedW = diffW.adds.length > 0 && diffW.adds.every((row) => !excludedAddKeysW.has(rowKey(row)));
   const allConflictsCheckedW =
     diffW.conflicts.length > 0 &&
@@ -1693,8 +1822,9 @@ function App() {
     incomingW.errors.length > 0 ? "Incoming CSV has validation errors" : null,
     existingW.errors.length > 0 ? "Existing CSV has validation errors" : null,
     hasIgnoredW && !acknowledgeIgnoredW ? "Acknowledge ignored rows to continue" : null,
-    settings.username.trim().length === 0 ? "Enter a username in Settings" : null,
-    !hasPassword ? "Save a password in Settings" : null,
+    !delegatedProxyEnabled && settings.username.trim().length === 0 ? "Enter a username in Settings" : null,
+    !delegatedProxyEnabled && !hasPassword ? "Save a password in Settings" : null,
+    delegatedProxyEnabled && !serverSessionTokens ? "Log in to Server API for delegated mode" : null,
     !confirmChangesW ? "Confirm the changes to enable running" : null,
   ].filter(Boolean) as string[];
   const existingByMac = useMemo(() => {
@@ -2114,6 +2244,74 @@ function App() {
     return nextSettings;
   }
 
+  function syncServerSessionState(tokens: ServerSessionTokens | null) {
+    if (tokens) {
+      writeStoredServerSession(tokens);
+      setServerSessionTokens(tokens);
+      return;
+    }
+
+    serverSessionRef.current.clear();
+    writeStoredServerSession(null);
+    setServerSessionTokens(null);
+  }
+
+  async function handleServerLogin() {
+    const serverBaseUrl = normalizeServerBaseUrl(settings.serverBaseUrl);
+    const serverUsername = settings.serverUsername.trim();
+    const serverPassword = serverPasswordInput;
+
+    if (!serverBaseUrl) {
+      setServerLoginError("Server API base URL is required.");
+      return;
+    }
+    if (!serverUsername) {
+      setServerLoginError("Server API username is required.");
+      return;
+    }
+    if (!serverPassword) {
+      setServerLoginError("Server API password is required.");
+      return;
+    }
+
+    setServerLoginBusy(true);
+    setServerLoginError(null);
+    try {
+      const result = await loginServerSession({
+        baseUrl: serverBaseUrl,
+        username: serverUsername,
+        password: serverPassword,
+        session: serverSessionRef.current,
+      });
+
+      if (!result.ok) {
+        setServerLoginError(`${result.error.errorCode}: ${result.error.message}`);
+        markSourceError("server-api", result.error.message);
+        scheduleSourceRetry("server-api");
+        return;
+      }
+
+      syncServerSessionState(result.tokens);
+      setServerPasswordInput("");
+      setAnalysisFallbackReason(null);
+      markSourceSuccess("server-api");
+      setLogs((prev) => [...prev, `Server login successful for ${serverUsername}.`]);
+    } finally {
+      setServerLoginBusy(false);
+    }
+  }
+
+  function handleServerSessionClear() {
+    syncServerSessionState(null);
+    setServerFreshness(null);
+    setServerTrendBuckets([]);
+    setServerLastSyncIso(null);
+    setAnalysisMode("local-only");
+    setAnalysisFallbackReason("Server session cleared. Using local collection.");
+    setServerLoginError(null);
+    setLogs((prev) => [...prev, "Server session cleared."]);
+  }
+
   async function handleSaveSettings() {
     try {
       await invoke("save_settings", { settings });
@@ -2196,10 +2394,85 @@ function App() {
     }
   }
 
+  async function executeProxyOperation<TResult>(
+    operation: ProxyOperationType,
+    payload: Record<string, unknown>,
+  ): Promise<{ requestId: string; result: TResult }> {
+    const response = await serverProxyClient.execute<TResult>(operation, payload);
+    if (!response.ok) {
+      const message = toProxyErrorMessage(response.error);
+      markSourceError("server-api", message);
+      scheduleSourceRetry("server-api");
+      throw new Error(message);
+    }
+    markSourceSuccess("server-api");
+    return {
+      requestId: response.data.requestId,
+      result: response.data.result,
+    };
+  }
+
+  async function runStaticMutationsViaProxy(options: {
+    iface: "lan" | "opt4";
+    adds: ClientRow[];
+    updates: Array<{ incoming: ClientRow; existing: ClientRow }>;
+    deletes: ClientRow[];
+    label: string;
+  }): Promise<RunRecord> {
+    const lines: string[] = [
+      `Delegated proxy run (${options.label})`,
+      `Interface: ${options.iface}`,
+      `Planned changes: delete=${options.deletes.length}, update=${options.updates.length}, add=${options.adds.length}`,
+    ];
+
+    for (const row of options.deletes) {
+      const response = await executeProxyOperation<{ ok: boolean }>("deleteStaticLease", {
+        iface: options.iface,
+        mac: row.mac,
+      });
+      lines.push(`Delete ${row.mac} -> requestId ${response.requestId}`);
+    }
+
+    for (const pair of options.updates) {
+      const response = await executeProxyOperation<{ ok: boolean }>("updateStaticLease", {
+        iface: options.iface,
+        oldmac: pair.existing.mac,
+        ip: pair.incoming.ip,
+        mac: pair.incoming.mac,
+        hostname: pair.incoming.name,
+      });
+      lines.push(`Update ${pair.existing.mac} -> ${pair.incoming.mac} (${pair.incoming.ip}) requestId ${response.requestId}`);
+    }
+
+    for (const row of options.adds) {
+      const response = await executeProxyOperation<{ ok: boolean }>("addStaticLease", {
+        iface: options.iface,
+        ip: row.ip,
+        mac: row.mac,
+        hostname: row.name,
+      });
+      lines.push(`Add ${row.name} ${row.mac} ${row.ip} -> requestId ${response.requestId}`);
+    }
+
+    if (options.deletes.length + options.updates.length + options.adds.length === 0) {
+      lines.push("No selected mutations to execute.");
+    }
+
+    return {
+      timestamp: new Date().toISOString(),
+      lines,
+    };
+  }
+
   async function handleRun() {
-    if (!credentialsReady) {
+    if (!delegatedProxyEnabled && !credentialsReady) {
       setRunError("Username and saved password are required.");
       setLogs(["Missing credentials. Open Settings to save them."]);
+      return;
+    }
+    if (delegatedProxyEnabled && !canMutateViaServerProxy(serverSessionRef.current)) {
+      setRunError("Delegated mode requires an admin server session for mutating DHCP operations.");
+      setLogs(["Delegated mode blocked: server role is not allowed to mutate DHCP operations."]);
       return;
     }
     setCancelRequested(false);
@@ -2220,6 +2493,22 @@ function App() {
       const filteredIncomingCsv = buildIncomingCsv(filteredRows);
       const deleteRows = displayDeletes.filter((row) => selectedDeleteKeys.has(rowKey(row)));
       const deleteCsv = buildDeleteCsv(deleteRows);
+      if (delegatedProxyEnabled) {
+        const selectedAdds = diff.adds.filter((row) => !excludedAddKeys.has(rowKey(row)));
+        const selectedUpdates = diff.conflicts.filter(({ incoming: row }) => !excludedConflictKeys.has(rowKey(row)));
+        const proxyRecord = await runStaticMutationsViaProxy({
+          iface: "lan",
+          adds: selectedAdds,
+          updates: selectedUpdates,
+          deletes: deleteRows,
+          label: "Gruen static leases",
+        });
+        setHistory((prev) => [proxyRecord, ...prev]);
+        setLogs((prev) => [...prev, ...proxyRecord.lines]);
+        await handleLoadDynamicLeases({ silent: true });
+        await refreshStaticLeases({ silent: true });
+        return;
+      }
       if (existingCsv.trim().length === 0) {
         const settingsForExport = await bootstrapApiDataIfNeeded(settings);
         const exportResult = await invoke<RunRecord>("export_static", { payload: { settings: settingsForExport } });
@@ -2263,9 +2552,14 @@ function App() {
   }
 
   async function handleRunW() {
-    if (!credentialsReady) {
+    if (!delegatedProxyEnabled && !credentialsReady) {
       setRunError("Username and saved password are required.");
       setLogs(["Missing credentials. Open Settings to save them."]);
+      return;
+    }
+    if (delegatedProxyEnabled && !canMutateViaServerProxy(serverSessionRef.current)) {
+      setRunError("Delegated mode requires an admin server session for mutating DHCP operations.");
+      setLogs(["Delegated mode blocked: server role is not allowed to mutate DHCP operations."]);
       return;
     }
     setCancelRequested(false);
@@ -2286,6 +2580,22 @@ function App() {
       const filteredIncomingCsv = buildIncomingCsv(filteredRows);
       const deleteRows = displayDeletesW.filter((row) => selectedDeleteKeysW.has(rowKey(row)));
       const deleteCsv = buildDeleteCsv(deleteRows);
+      if (delegatedProxyEnabled) {
+        const selectedAdds = diffW.adds.filter((row) => !excludedAddKeysW.has(rowKey(row)));
+        const selectedUpdates = diffW.conflicts.filter(({ incoming: row }) => !excludedConflictKeysW.has(rowKey(row)));
+        const proxyRecord = await runStaticMutationsViaProxy({
+          iface: "opt4",
+          adds: selectedAdds,
+          updates: selectedUpdates,
+          deletes: deleteRows,
+          label: "WLANBYOD static leases",
+        });
+        setHistory((prev) => [proxyRecord, ...prev]);
+        setLogs((prev) => [...prev, ...proxyRecord.lines]);
+        await handleLoadDynamicLeases({ silent: true });
+        await refreshStaticLeases({ silent: true });
+        return;
+      }
       if (existingCsvW.trim().length === 0) {
         const settingsForExport = await bootstrapApiDataIfNeeded(settings);
         const exportResult = await invoke<RunRecord>("export_static", { payload: { settings: settingsForExport } });
@@ -2414,13 +2724,48 @@ function App() {
 
   async function handleLoadDynamicLeases(options: { silent?: boolean } = {}) {
     const { silent = false } = options;
-    if (!credentialsReady) {
+    if (!delegatedProxyEnabled && !credentialsReady) {
       if (!silent) setDynamicError("Username and saved password are required.");
       return;
     }
     setDynamicBusy(true);
     if (!silent) setDynamicError(null);
     try {
+      if (delegatedProxyEnabled) {
+        const delegated = await executeProxyOperation<{ rows?: DynamicLease[]; count?: number }>(
+          "getDynamicLeases",
+          {},
+        );
+        const rows = Array.isArray(delegated.result.rows) ? delegated.result.rows : [];
+        const movableCount = rows.filter((row) => Boolean(row.movableToStatic)).length;
+        const infoCount = Math.max(0, rows.length - movableCount);
+        setDynamicLeases(rows);
+        setDynamicMeta({
+          movableCount,
+          infoCount,
+          leaseSource: "server-proxy",
+          leaseSourceDetail: `delegated requestId ${delegated.requestId}`,
+        });
+        if (!silent) {
+          const logLine = `Dynamic leases loaded via server proxy: total=${rows.length}, movable=${movableCount}, info=${infoCount}`;
+          setLogs((prev) => [...prev, logLine]);
+          setHistory((prev) => [
+            {
+              timestamp: new Date().toISOString(),
+              lines: [
+                "Dynamic lease fetch",
+                logLine,
+                `Lease source: server-proxy`,
+                `Lease source detail: delegated requestId ${delegated.requestId}`,
+              ],
+            },
+            ...prev,
+          ]);
+        }
+        markSourceSuccess("leases");
+        return;
+      }
+
       const settingsForFetch = await bootstrapApiDataIfNeeded(settings);
       const result = await invoke<DynamicLeasesResult>("load_dynamic_leases", {
         payload: { settings: settingsForFetch },
@@ -2459,7 +2804,7 @@ function App() {
   async function refreshStaticLeases(options: { silent?: boolean } = {}) {
     const { silent = false } = options;
     setStaticRefreshBusy(true);
-    if (!credentialsReady) {
+    if (!delegatedProxyEnabled && !credentialsReady) {
       if (!silent) {
         setRunError("Username and saved password are required.");
         setLogs((prev) => [...prev, "Static refresh blocked: missing username/password."]);
@@ -2472,6 +2817,38 @@ function App() {
         setRunError(null);
         setLogs((prev) => [...prev, "Refreshing static leases..."]);
       }
+
+      if (delegatedProxyEnabled) {
+        const delegated = await executeProxyOperation<{
+          rows?: DelegatedStaticLeaseRow[];
+          count?: number;
+        }>("getStaticLeases", {});
+        const rows = Array.isArray(delegated.result.rows) ? delegated.result.rows : [];
+        const splitRows = splitDelegatedStaticLeases(rows);
+        const exportCsv = toStaticLeaseCsv(splitRows.lanRows);
+        const exportWlanbyodCsv = toStaticLeaseCsv(splitRows.opt4Rows);
+        setExistingCsv(exportCsv);
+        setExistingCsvW(exportWlanbyodCsv);
+        if (!silent) {
+          setHistory((prev) => [
+            {
+              timestamp: new Date().toISOString(),
+              lines: [
+                "Static lease refresh",
+                `Loaded ${rows.length} static entries via server proxy (lan=${splitRows.lanRows.length}, opt4=${splitRows.opt4Rows.length}, unknownIface=${splitRows.unknownIfaceCount}).`,
+                `RequestId: ${delegated.requestId}`,
+              ],
+              exportCsv,
+              exportWlanbyodCsv,
+            },
+            ...prev,
+          ]);
+          setLogs((prev) => [...prev, "Static leases refreshed via server proxy."]);
+        }
+        markSourceSuccess("leases");
+        return;
+      }
+
       const settingsForExport = await bootstrapApiDataIfNeeded(settings);
       const result = await invoke<RunRecord>("export_static", { payload: { settings: settingsForExport } });
       if (result.exportCsv) {
@@ -2864,10 +3241,17 @@ function App() {
   }
 
   async function refreshServerFirstAnalysisWindow(): Promise<AnalysisMode> {
+    if (!normalizeServerBaseUrl(settings.serverBaseUrl)) {
+      setAnalysisMode("local-only");
+      setAnalysisFallbackReason("Server base URL is not configured. Using local collection.");
+      setServerFreshness(null);
+      return "local-only";
+    }
+
     const hasServerSession = Boolean(serverSessionRef.current.getAccessToken());
     if (!hasServerSession) {
       setAnalysisMode("local-only");
-      setAnalysisFallbackReason("Server session unavailable. Using local collection.");
+      setAnalysisFallbackReason("Server session unavailable. Log in in Settings to use server analysis.");
       setServerFreshness(null);
       return "local-only";
     }
@@ -3115,17 +3499,45 @@ function App() {
   async function confirmMoveDynamicToStatic() {
     if (!moveDynamicPrompt) return;
     if (!canSubmitMoveDynamic) return;
+    if (delegatedProxyEnabled && !canMutateViaServerProxy(serverSessionRef.current)) {
+      setDynamicError("Delegated mode requires an admin server session for move/update operations.");
+      return;
+    }
     setMoveDynamicBusy(true);
     setDynamicError(null);
     try {
       setLogs((prev) => [...prev, "Preparing dynamic → static move..."]);
-      const settingsForMove = await bootstrapApiDataIfNeeded(settings);
-      setLogs((prev) => [...prev, "Refreshing static export for conflict precheck..."]);
-      const precheckExport = await invoke<RunRecord>("export_static", { payload: { settings: settingsForMove } });
-      if (precheckExport.exportCsv) {
-        setExistingCsv(precheckExport.exportCsv);
+      let refreshedRows: ClientRow[] = [];
+      let settingsForMove: SettingsState | null = null;
+
+      if (delegatedProxyEnabled) {
+        setLogs((prev) => [...prev, "Refreshing static leases via delegated server proxy for conflict precheck..."]);
+        const delegatedStatic = await executeProxyOperation<{
+          rows?: DelegatedStaticLeaseRow[];
+        }>("getStaticLeases", {});
+        const rows = Array.isArray(delegatedStatic.result.rows) ? delegatedStatic.result.rows : [];
+        const targetIface = normalizeDelegatedStaticIface(moveDynamicPrompt.iface);
+        refreshedRows = rows
+          .filter((row) => {
+            const rowIface = normalizeDelegatedStaticIface(row.iface);
+            if (!targetIface) return true;
+            return rowIface === targetIface || rowIface === "";
+          })
+          .map((row) => ({
+            name: row.hostname,
+            mac: row.mac,
+            ip: row.ip,
+          }));
+      } else {
+        settingsForMove = await bootstrapApiDataIfNeeded(settings);
+        setLogs((prev) => [...prev, "Refreshing static export for conflict precheck..."]);
+        const precheckExport = await invoke<RunRecord>("export_static", { payload: { settings: settingsForMove } });
+        if (precheckExport.exportCsv) {
+          setExistingCsv(precheckExport.exportCsv);
+        }
+        refreshedRows = parseCsv(precheckExport.exportCsv ?? "").rows;
       }
-      const refreshedRows = parseCsv(precheckExport.exportCsv ?? "").rows;
+
       const precheck = evaluateMoveConflicts(refreshedRows, moveDynamicPrompt);
       if (precheck.alreadyExists || precheck.ipConflict || precheck.macConflict || precheck.nameConflict) {
         const messages: string[] = ["Move blocked by static-side conflict after refresh."];
@@ -3153,19 +3565,35 @@ function App() {
       }
 
       setLogs((prev) => [...prev, "Submitting move request to router..."]);
-      const payload: MoveDynamicLeasePayload = {
-        settings: settingsForMove,
-        iface: moveDynamicPrompt.iface,
-        ip: moveDynamicPrompt.ip,
-        mac: moveDynamicPrompt.mac,
-        hostname: moveDynamicPrompt.hostname,
-      };
-      const result = await invoke<MoveDynamicLeaseResult>("move_dynamic_to_static", { payload });
+      let result: MoveDynamicLeaseResult;
+      let requestIdSuffix = "";
+
+      if (delegatedProxyEnabled) {
+        const delegatedMove = await executeProxyOperation<MoveDynamicLeaseResult>("moveDynamicToStatic", {
+          iface: moveDynamicPrompt.iface,
+          ip: moveDynamicPrompt.ip,
+          mac: moveDynamicPrompt.mac,
+          hostname: moveDynamicPrompt.hostname,
+        });
+        result = delegatedMove.result;
+        requestIdSuffix = ` (requestId: ${delegatedMove.requestId})`;
+      } else {
+        const payload: MoveDynamicLeasePayload = {
+          settings: settingsForMove as SettingsState,
+          iface: moveDynamicPrompt.iface,
+          ip: moveDynamicPrompt.ip,
+          mac: moveDynamicPrompt.mac,
+          hostname: moveDynamicPrompt.hostname,
+        };
+        result = await invoke<MoveDynamicLeaseResult>("move_dynamic_to_static", { payload });
+      }
+
       if (!result.ok) {
         setDynamicError(result.message || result.status || "Move to static failed.");
         return;
       }
-      const moveLine = `Moved dynamic lease to static: ${payload.hostname} ${payload.mac} ${payload.ip}`;
+
+      const moveLine = `Moved dynamic lease to static: ${moveDynamicPrompt.hostname} ${moveDynamicPrompt.mac} ${moveDynamicPrompt.ip}${requestIdSuffix}`;
       setLogs((prev) => [...prev, moveLine]);
       const record: RunRecord = {
         timestamp: new Date().toISOString(),
@@ -3192,22 +3620,42 @@ function App() {
       setDynamicError("Select at least one field (IP or MAC) to update.");
       return;
     }
+    if (delegatedProxyEnabled && !canMutateViaServerProxy(serverSessionRef.current)) {
+      setDynamicError("Delegated mode requires an admin server session for move/update operations.");
+      return;
+    }
     setMoveDynamicBusy(true);
     setDynamicError(null);
     try {
       setLogs((prev) => [...prev, "Updating existing static lease with dynamic values..."]);
-      const settingsForUpdate = await bootstrapApiDataIfNeeded(settings);
+      const settingsForUpdate = delegatedProxyEnabled ? null : await bootstrapApiDataIfNeeded(settings);
       const nextIp = updateStaticIpSelected ? moveDynamicPrompt.ip : moveConflictTarget.ip;
       const nextMac = updateStaticMacSelected ? moveDynamicPrompt.mac : moveConflictTarget.mac;
-      const payload: UpdateStaticFromDynamicPayload = {
-        settings: settingsForUpdate,
-        oldMac: moveConflictTarget.mac,
-        iface: moveDynamicPrompt.iface,
-        ip: nextIp,
-        mac: nextMac,
-        hostname: moveConflictTarget.name,
-      };
-      const result = await invoke<UpdateStaticFromDynamicResult>("update_static_from_dynamic", { payload });
+      let result: UpdateStaticFromDynamicResult;
+      let requestIdSuffix = "";
+
+      if (delegatedProxyEnabled) {
+        const delegatedUpdate = await executeProxyOperation<UpdateStaticFromDynamicResult>("updateStaticFromDynamic", {
+          oldmac: moveConflictTarget.mac,
+          iface: moveDynamicPrompt.iface,
+          ip: nextIp,
+          mac: nextMac,
+          hostname: moveConflictTarget.name,
+        });
+        result = delegatedUpdate.result;
+        requestIdSuffix = ` (requestId: ${delegatedUpdate.requestId})`;
+      } else {
+        const payload: UpdateStaticFromDynamicPayload = {
+          settings: settingsForUpdate as SettingsState,
+          oldMac: moveConflictTarget.mac,
+          iface: moveDynamicPrompt.iface,
+          ip: nextIp,
+          mac: nextMac,
+          hostname: moveConflictTarget.name,
+        };
+        result = await invoke<UpdateStaticFromDynamicResult>("update_static_from_dynamic", { payload });
+      }
+
       if (!result.ok) {
         setDynamicError(result.message || result.status || "Static update failed.");
         return;
@@ -3218,7 +3666,7 @@ function App() {
       ].filter(Boolean).join("+");
       const updateLine =
         `Updated static lease ${moveConflictTarget.name} (${moveConflictTarget.mac}) `
-        + `[${updatedFields}] -> ${payload.mac} ${payload.ip}`;
+        + `[${updatedFields}] -> ${nextMac} ${nextIp}${requestIdSuffix}`;
       setLogs((prev) => [...prev, updateLine]);
       setHistory((prev) => [
         {
@@ -3232,10 +3680,12 @@ function App() {
       setUpdateStaticMacSelected(true);
       setLogs((prev) => [...prev, "Refreshing dynamic/static data after static update..."]);
       await handleLoadDynamicLeases();
-      const exportResult = await invoke<RunRecord>("export_static", { payload: { settings: settingsForUpdate } });
-      setHistory((prev) => [exportResult, ...prev]);
-      if (exportResult.exportCsv) {
-        setExistingCsv(exportResult.exportCsv);
+      if (!delegatedProxyEnabled) {
+        const exportResult = await invoke<RunRecord>("export_static", { payload: { settings: settingsForUpdate as SettingsState } });
+        setHistory((prev) => [exportResult, ...prev]);
+        if (exportResult.exportCsv) {
+          setExistingCsv(exportResult.exportCsv);
+        }
       }
       await refreshLeasesSilently();
     } catch (error) {
@@ -3866,6 +4316,97 @@ function App() {
                     const value = e.currentTarget.value;
                     setSettings((prev) => ({ ...prev, pythonPath: value }));
                   }}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="server-base-url">Server API Base URL</label>
+                <input
+                  id="server-base-url"
+                  type="text"
+                  value={settings.serverBaseUrl}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, serverBaseUrl: value }));
+                  }}
+                  placeholder="http://localhost:8080"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="server-username">Server API username</label>
+                <input
+                  id="server-username"
+                  type="text"
+                  value={settings.serverUsername}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, serverUsername: value }));
+                  }}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="server-password">Server API password</label>
+                <input
+                  id="server-password"
+                  type="password"
+                  value={serverPasswordInput}
+                  onChange={(e) => setServerPasswordInput(e.currentTarget.value)}
+                  placeholder={serverSessionTokens ? "Session active. Enter new to re-login." : "Enter password for server login"}
+                />
+              </div>
+              <div className="field">
+                <label>Server session</label>
+                <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                  <button className="secondary" type="button" onClick={() => void handleServerLogin()} disabled={serverLoginBusy}>
+                    {serverLoginBusy ? "Logging in..." : "Login to server"}
+                  </button>
+                  <button className="secondary" type="button" onClick={handleServerSessionClear} disabled={!serverSessionTokens}>
+                    Clear server session
+                  </button>
+                </div>
+                <p className="lease-meta" style={{ marginTop: "0.5rem" }}>
+                  {serverSessionTokens
+                    ? `Logged in as ${((serverSessionTokens.role ?? settings.serverUsername) || "user")}; access token expires ${new Date(serverSessionTokens.accessExpiresAt).toLocaleString()}.`
+                    : "No active server session. Analysis uses local-only or fallback mode until login."}
+                </p>
+                {serverLoginError && <p className="run-error">{serverLoginError}</p>}
+              </div>
+              <div className="field">
+                <label className="toggle-pill" style={{ alignSelf: "flex-start" }}>
+                  <input
+                    type="checkbox"
+                    checked={settings.delegatedProxyEnabled}
+                    onChange={(e) => {
+                      const checked = e.currentTarget.checked;
+                      setSettings((prev) => ({ ...prev, delegatedProxyEnabled: checked }));
+                    }}
+                  />
+                  Enable delegated server proxy mode for DHCP operations
+                </label>
+                <p className="lease-meta" style={{ marginTop: "0.5rem" }}>
+                  When enabled, static mutations and dynamic move/update calls run via <code>/api/proxy/execute</code> instead of direct local network access.
+                </p>
+              </div>
+              <div className="field">
+                <label htmlFor="proxy-request-audience">Proxy request audience</label>
+                <input
+                  id="proxy-request-audience"
+                  type="text"
+                  value={settings.proxyRequestAudience}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, proxyRequestAudience: value }));
+                  }}
+                  placeholder="tfk-manager-server"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="proxy-shared-secret">Proxy HMAC shared secret (session only)</label>
+                <input
+                  id="proxy-shared-secret"
+                  type="password"
+                  value={proxySharedSecretInput}
+                  onChange={(e) => setProxySharedSecretInput(e.currentTarget.value)}
+                  placeholder="Enter to override VITE_TFK_PROXY_HMAC_SHARED_SECRET"
                 />
               </div>
               <div className="field">

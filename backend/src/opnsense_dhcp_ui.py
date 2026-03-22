@@ -3,9 +3,13 @@ import json
 import os
 import re
 import sys
-import tkinter as tk
 import requests
-from tkinter import simpledialog
+try:
+    import tkinter as tk
+    from tkinter import simpledialog
+except Exception:
+    tk = None
+    simpledialog = None
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -253,6 +257,10 @@ def validate_rows(rows: List[DhcpRow]) -> List[DhcpRow]:
 
 
 def prompt_credentials() -> tuple[str, str]:
+    if tk is None or simpledialog is None:
+        raise RuntimeError(
+            "tkinter is unavailable in this environment; provide TFK_USERNAME and TFK_PASSWORD"
+        )
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)

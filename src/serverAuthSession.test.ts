@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { createServerSession, refreshServerSession } from "./serverAuthSession";
+import {
+  canMutateViaServerProxy,
+  createServerSession,
+  loginServerSession,
+  refreshServerSession,
+} from "./serverAuthSession";
 
 describe("serverAuthSession", () => {
   it("stores and clears tokens in session state", () => {
@@ -83,5 +88,53 @@ describe("serverAuthSession", () => {
     }
     expect(result.error.status).toBe(401);
     expect(result.error.errorCode).toBe("token_invalid");
+  });
+
+  it("logs in and stores server session tokens", async () => {
+    const session = createServerSession();
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({
+        accessToken: "login-access",
+        refreshToken: "login-refresh",
+        accessExpiresAt: "2026-03-21T14:00:00Z",
+        refreshExpiresAt: "2026-03-21T15:00:00Z",
+        role: "admin",
+      }), { status: 200 }),
+    );
+
+    const result = await loginServerSession({
+      baseUrl: "https://example.local:8080/",
+      username: "admin",
+      password: "secret",
+      session,
+      fetchImpl: fetchMock,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://example.local:8080/api/auth/login");
+    expect(session.getTokens()?.accessToken).toBe("login-access");
+    expect(session.getTokens()?.refreshToken).toBe("login-refresh");
+    expect(session.getTokens()?.role).toBe("admin");
+  });
+
+  it("allows mutating proxy operations only for admin role", () => {
+    const analystSession = createServerSession({
+      accessToken: "analyst-token",
+      refreshToken: "analyst-refresh",
+      accessExpiresAt: "2026-03-21T14:00:00Z",
+      refreshExpiresAt: "2026-03-21T15:00:00Z",
+      role: "analyst",
+    });
+    const adminSession = createServerSession({
+      accessToken: "admin-token",
+      refreshToken: "admin-refresh",
+      accessExpiresAt: "2026-03-21T14:00:00Z",
+      refreshExpiresAt: "2026-03-21T15:00:00Z",
+      role: "admin",
+    });
+
+    expect(canMutateViaServerProxy(analystSession)).toBe(false);
+    expect(canMutateViaServerProxy(adminSession)).toBe(true);
   });
 });

@@ -11,6 +11,65 @@ from server.app.collector.workers.replay_policy import (
 )
 
 
+def _hour_window_bounds(occurred_at: str) -> tuple[str, str]:
+    parsed = datetime.fromisoformat(occurred_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+    start = parsed.replace(minute=0, second=0, microsecond=0)
+    end = start.replace(minute=59, second=59)
+    return (
+        start.isoformat().replace("+00:00", "Z"),
+        end.isoformat().replace("+00:00", "Z"),
+    )
+
+
+def _windows_for_ingested_events(events: list[dict[str, Any]]) -> list[dict[str, str]]:
+    windows_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
+    for event in events:
+        source_type = str(event.get("sourceType", "unknown"))
+        occurred_at = str(event.get("occurredAt", ""))
+        if not occurred_at:
+            continue
+        window_start, window_end = _hour_window_bounds(occurred_at)
+        key = (source_type, window_start, window_end)
+        windows_by_key[key] = {
+            "sourceType": source_type,
+            "windowStart": window_start,
+            "windowEnd": window_end,
+            "annotation": "ingested",
+        }
+    return list(windows_by_key.values())
+
+
+def _merge_recompute_windows(*window_sets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for windows in window_sets:
+        for window in windows:
+            source_type = str(window.get("sourceType", "unknown"))
+            window_start = str(window.get("windowStart", ""))
+            window_end = str(window.get("windowEnd", ""))
+            if not window_start or not window_end:
+                continue
+
+            key = (source_type, window_start, window_end)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = {
+                    "sourceType": source_type,
+                    "windowStart": window_start,
+                    "windowEnd": window_end,
+                    "annotation": window.get("annotation", "ingested"),
+                }
+                continue
+
+            # Keep corrected annotation when either window flags a correction.
+            if (
+                str(existing.get("annotation", "")).lower() != "corrected"
+                and str(window.get("annotation", "")).lower() == "corrected"
+            ):
+                existing["annotation"] = "corrected"
+
+    return list(merged.values())
+
+
 def create_worker_state(source_key: str, cursor: str = "") -> dict[str, Any]:
     return {
         "sourceKey": source_key,
@@ -57,8 +116,12 @@ def run_worker_iteration(
             fail_on_event_id=fail_on_event_id,
         )
 
-        if corrected_windows:
-            recompute_aggregate_windows(connection, corrected_windows)
+        recompute_windows = _merge_recompute_windows(
+            _windows_for_ingested_events(corrected_events),
+            corrected_windows,
+        )
+        if recompute_windows:
+            recompute_aggregate_windows(connection, recompute_windows)
 
         state.update(
             {

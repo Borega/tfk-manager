@@ -84,6 +84,10 @@ struct UiSettings {
     dashboard_url: String,
     username: String,
     #[serde(default)]
+    server_base_url: String,
+    #[serde(default)]
+    server_username: String,
+    #[serde(default)]
     api_username: String,
     #[serde(default)]
     api_key: String,

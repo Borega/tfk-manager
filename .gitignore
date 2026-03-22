@@ -83,3 +83,4 @@ scripts/sfp4*.js
 
 # Project planning documents
 plans/
+.planning/
