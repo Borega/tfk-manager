@@ -629,6 +629,11 @@ fn read_text_file(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    fs::write(path, content).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn load_settings(app: tauri::AppHandle) -> Result<Option<UiSettings>, String> {
     let path = app_data_file(&app, "settings.json")?;
     if !path.exists() {
@@ -1666,6 +1671,7 @@ pub fn run() {
             save_msd_password,
             has_msd_password,
             read_text_file,
+            write_text_file,
             find_python,
             install_backend_deps,
             discover_api_credentials,

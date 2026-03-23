@@ -547,6 +547,24 @@ function toStaticLeaseCsv(rows: Array<{ hostname: string; mac: string; ip: strin
   return lines.join("\n");
 }
 
+function toDynamicLeaseCsv(rows: DynamicLease[]): string {
+  const lines = [
+    "Interface;Name;MAC;IP;Start;End;Status;Online;MovableToStatic",
+    ...rows.map((row) => [
+      row.iface,
+      row.hostname,
+      row.mac,
+      row.ip,
+      row.start,
+      row.end,
+      row.status,
+      row.online ? "1" : "0",
+      row.movableToStatic ? "1" : "0",
+    ].join(";")),
+  ];
+  return lines.join("\n");
+}
+
 type DelegatedStaticLeaseRow = {
   hostname: string;
   mac: string;
@@ -2798,6 +2816,47 @@ function App() {
       if (!silent) setDynamicError(String(error));
     } finally {
       setDynamicBusy(false);
+    }
+  }
+
+  async function handleExportDynamicLeases() {
+    if (dynamicLeases.length === 0) {
+      setDynamicError("No dynamic leases loaded to export.");
+      return;
+    }
+
+    const savePath = await save({
+      title: "Save dynamic lease export",
+      filters: [{ name: "CSV", extensions: ["csv"] }],
+      defaultPath: "export_dynamic.csv",
+    });
+    if (!savePath) {
+      setLogs((prev) => [...prev, "Dynamic export canceled."]);
+      return;
+    }
+
+    try {
+      const csv = toDynamicLeaseCsv(dynamicLeases);
+      await invoke("write_text_file", {
+        path: savePath,
+        content: csv,
+      });
+      setDynamicError(null);
+      const lines = [
+        "Dynamic lease export",
+        `Saved ${dynamicLeases.length} dynamic rows to ${savePath}`,
+      ];
+      setLogs((prev) => [...prev, lines[1]]);
+      setHistory((prev) => [
+        {
+          timestamp: new Date().toISOString(),
+          lines,
+        },
+        ...prev,
+      ]);
+    } catch (error) {
+      setDynamicError(String(error));
+      setLogs((prev) => [...prev, `Dynamic export failed: ${error}`]);
     }
   }
 
@@ -5435,6 +5494,14 @@ function App() {
             <div className="card full">
               <div className="preview-header">
                 <h3>Dynamic Leases</h3>
+                <button
+                  className="mini-action"
+                  type="button"
+                  onClick={() => void handleExportDynamicLeases()}
+                  disabled={dynamicBusy || dynamicLeases.length === 0}
+                >
+                  Export CSV
+                </button>
                 <button className="mini-action" type="button" onClick={() => void handleLoadDynamicLeases()} disabled={dynamicBusy}>
                   {dynamicBusy ? "Refreshing..." : "Refresh"}
                 </button>

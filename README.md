@@ -172,7 +172,7 @@ Example delegated-mode call path:
 | Mode | Description |
 |---|---|
 | `export` | Fetch `/api/tfk/dhcp/static_leases` once; write `export_static.csv` (Gruen/`lan`) **and** `export_static_wlanbyod.csv` (WLANBYOD/`opt4`) |
-| `dynamic` | Fetch dynamic leases from `/api/tfk/dhcp/leases` |
+| `dynamic` | Fetch dynamic leases from `/api/tfk/dhcp/leases`; write `export_dynamic.csv` |
 | `move_dynamic` | Move a dynamic lease to static — interface mapped via `TFK_IFACE` (`Gruen`→`lan`, `WLANBYOD`→`opt4`) |
 | `update_dynamic_conflict` | Update an existing static lease from dynamic values — same interface mapping as above |
 

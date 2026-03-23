@@ -28,6 +28,7 @@ LOG_PATH = DATA_DIR / "run_log.csv"
 TEMP_CSV_PATH = DATA_DIR / "to_add.csv"
 EXPORT_CSV_PATH = DATA_DIR / "export_static.csv"
 EXPORT_WLANBYOD_CSV_PATH = DATA_DIR / "export_static_wlanbyod.csv"
+DYNAMIC_EXPORT_CSV_PATH = DATA_DIR / "export_dynamic.csv"
 DELETE_CSV_PATH = DATA_DIR / "to_delete.csv"
 DEBUG = False
 DRY_RUN = True  # Set False to submit entries
@@ -1069,6 +1070,25 @@ def export_static_wlanbyod_leases(rows: List[DhcpRow]) -> None:
             writer.writerow([row.hostname, row.mac, row.ip])
 
 
+def export_dynamic_leases(rows: List[DynamicLeaseRow]) -> None:
+    DYNAMIC_EXPORT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DYNAMIC_EXPORT_CSV_PATH.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter=";")
+        writer.writerow(["Interface", "Name", "MAC", "IP", "Start", "End", "Status", "Online", "MovableToStatic"])
+        for row in rows:
+            writer.writerow([
+                row.iface,
+                row.hostname,
+                row.mac,
+                row.ip,
+                row.start,
+                row.end,
+                row.status,
+                "1" if row.online else "0",
+                "1" if row.movable_to_static else "0",
+            ])
+
+
 def summarize_changes(to_add: List[DhcpRow], to_update: List[Tuple[DhcpRow, DhcpRow]]) -> str:
     lines = []
     if to_add:
@@ -1165,6 +1185,7 @@ def main() -> int:
         LAST_LEASE_SOURCE_DETAIL = ""
         dynamic_entries = fetch_dynamic_leases_via_session_api(api_session)
         LAST_LEASE_SOURCE = "api-session-dynamic"
+        export_dynamic_leases(dynamic_entries)
 
         rows = [item.to_dict() for item in dynamic_entries]
         movable_count = sum(1 for item in dynamic_entries if item.movable_to_static)
