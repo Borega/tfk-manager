@@ -1,8 +1,7 @@
 services:
   tfk-server:
-    build:
-      context: .
-      dockerfile: server/Dockerfile
+    image: ghcr.io/borega/tfk-manager-server:${TFK_SERVER_IMAGE_TAG:-latest}
+    pull_policy: always
     container_name: tfk-manager-server
     ports:
       - "${TFK_SERVER_PORT:-8080}:8080"

@@ -59,7 +59,7 @@ The repository now includes a containerized server API for server-first analysis
 
 ### Files
 
-- `server/Dockerfile` - server image build
+- `server/Dockerfile` - source Dockerfile used by GitHub Actions to publish the server image
 - `docker-compose.yml` - local runtime stack
 - `server/requirements.txt` - Python dependencies for the server container
 
@@ -116,7 +116,8 @@ Notes:
 ### 2. Build and run the server
 
 ```powershell
-docker compose --env-file .env.server up --build -d
+docker compose --env-file .env.server pull
+docker compose --env-file .env.server up -d
 ```
 
 ### 3. Connection and health check

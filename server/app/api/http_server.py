@@ -837,6 +837,25 @@ def _adapter_for_source(source_key: str) -> Callable[[str | None, datetime, list
 
 def _run_collector_iteration() -> None:
     now_utc = _utc_now()
+    iteration_id = uuid4().hex[:8]
+    mode = "sample" if COLLECTOR_SAMPLE_MODE else "live"
+    print(
+        f"collector refresh start id={iteration_id} at={_to_iso(now_utc)} "
+        f"mode={mode} intervalSeconds={COLLECTOR_INTERVAL_SECONDS}"
+    )
+
+    def _safe_int(value: object) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    total_fetched = 0
+    total_new_saved = 0
+    success_count = 0
+    retry_wait_count = 0
+    error_count = 0
+
     with _open_connection() as connection:
         global _collector_state_by_source
         if not _collector_state_by_source:
@@ -857,6 +876,57 @@ def _run_collector_iteration() -> None:
                 connection=connection,
                 now_utc=now_utc,
             )
+
+            outcome = str(state.get("lastRunOutcome") or "unknown")
+            fetched_count = _safe_int(state.get("lastFetchedCount"))
+            unique_count = _safe_int(state.get("lastUniqueEventCount"))
+            new_saved_count = _safe_int(state.get("lastNewEventsSaved"))
+            db_total_count = _safe_int(state.get("lastDbEventCount"))
+            recomputed_windows = _safe_int(state.get("lastRecomputedWindows"))
+            source_rows_count = len(source_rows)
+
+            if outcome == "success":
+                success_count += 1
+                total_fetched += fetched_count
+                total_new_saved += new_saved_count
+                print(
+                    f"collector refresh source={source_key} outcome=success seedRows={source_rows_count} "
+                    f"fetched={fetched_count} unique={unique_count} newSaved={new_saved_count} "
+                    f"dbTotal={db_total_count} recomputedWindows={recomputed_windows} "
+                    f"cursor={state.get('cursor', '')}"
+                )
+                continue
+
+            if outcome == "retry_wait":
+                retry_wait_count += 1
+                print(
+                    f"collector refresh source={source_key} outcome=retry_wait "
+                    f"attempt={_safe_int(state.get('attempt'))} outageSeconds={_safe_int(state.get('outageSeconds'))} "
+                    f"nextRetryAt={state.get('nextRetryAt')}"
+                )
+                continue
+
+            if outcome == "error":
+                error_count += 1
+                print(
+                    f"collector refresh source={source_key} outcome=error seedRows={source_rows_count} "
+                    f"attempt={_safe_int(state.get('attempt'))} outageSeconds={_safe_int(state.get('outageSeconds'))} "
+                    f"fallbackRecommended={bool(state.get('fallbackRecommended'))} "
+                    f"nextRetryAt={state.get('nextRetryAt')} lastErrorAt={state.get('lastErrorAt')}"
+                )
+                continue
+
+            print(
+                f"collector refresh source={source_key} outcome={outcome} seedRows={source_rows_count} "
+                f"cursor={state.get('cursor', '')}"
+            )
+
+    elapsed_ms = int((_utc_now() - now_utc).total_seconds() * 1000)
+    print(
+        f"collector refresh end id={iteration_id} success={success_count} "
+        f"retryWait={retry_wait_count} error={error_count} totalFetched={total_fetched} "
+        f"totalNewSaved={total_new_saved} elapsedMs={elapsed_ms}"
+    )
 
 
 def _run_collector_if_due(force: bool = False) -> None:
@@ -889,6 +959,7 @@ def _collector_loop() -> None:
 def _start_background_collector() -> None:
     global _collector_thread, _collector_state_by_source
     if not COLLECTOR_ENABLED:
+        print("collector disabled by TFK_SERVER_COLLECTOR_ENABLED")
         return
 
     with _open_connection() as connection:
@@ -897,6 +968,11 @@ def _start_background_collector() -> None:
     _collector_stop_event.clear()
     _collector_thread = threading.Thread(target=_collector_loop, name="tfk-server-collector", daemon=True)
     _collector_thread.start()
+    mode = "sample" if COLLECTOR_SAMPLE_MODE else "live"
+    print(
+        f"collector background thread started intervalSeconds={COLLECTOR_INTERVAL_SECONDS} "
+        f"mode={mode} sources={','.join(SOURCE_POLICY.keys())}"
+    )
 
 
 def _stop_background_collector() -> None:
@@ -905,6 +981,7 @@ def _stop_background_collector() -> None:
     if _collector_thread is not None:
         _collector_thread.join(timeout=2.0)
         _collector_thread = None
+        print("collector background thread stopped")
 
 
 @app.on_event("startup")

@@ -3,7 +3,7 @@ from typing import Any, Callable
 
 from server.app.collector.aggregates import recompute_aggregate_windows
 from server.app.collector.corrections import apply_late_corrections
-from server.app.collector.repository import upsert_events_and_checkpoint
+from server.app.collector.repository import count_canonical_events, upsert_events_and_checkpoint
 from server.app.collector.workers.replay_policy import (
     is_retry_ready,
     next_retry_at,
@@ -80,6 +80,12 @@ def create_worker_state(source_key: str, cursor: str = "") -> dict[str, Any]:
         "fallbackRecommended": False,
         "lastSuccessAt": None,
         "lastErrorAt": None,
+        "lastRunOutcome": None,
+        "lastFetchedCount": 0,
+        "lastUniqueEventCount": 0,
+        "lastNewEventsSaved": 0,
+        "lastDbEventCount": 0,
+        "lastRecomputedWindows": 0,
     }
 
 
@@ -92,6 +98,13 @@ def run_worker_iteration(
     fail_on_event_id: str | None = None,
 ) -> dict[str, Any]:
     if not is_retry_ready(state.get("nextRetryAt"), now_utc):
+        state.update({
+            "lastRunOutcome": "retry_wait",
+            "lastFetchedCount": 0,
+            "lastUniqueEventCount": 0,
+            "lastNewEventsSaved": 0,
+            "lastRecomputedWindows": 0,
+        })
         return state
 
     try:
@@ -99,6 +112,12 @@ def run_worker_iteration(
         correction_result = apply_late_corrections(events, now_utc)
         corrected_events = correction_result["events"]
         corrected_windows = correction_result.get("correctedWindows", [])
+        unique_event_ids = {
+            str(event.get("eventId") or "")
+            for event in corrected_events
+            if str(event.get("eventId") or "")
+        }
+        total_events_before = count_canonical_events(connection)
 
         checkpoint = {
             "sourceKey": source_key,
@@ -115,6 +134,8 @@ def run_worker_iteration(
             checkpoint,
             fail_on_event_id=fail_on_event_id,
         )
+        total_events_after = count_canonical_events(connection)
+        new_events_saved = max(0, total_events_after - total_events_before)
 
         recompute_windows = _merge_recompute_windows(
             _windows_for_ingested_events(corrected_events),
@@ -131,6 +152,13 @@ def run_worker_iteration(
                 "outageSeconds": 0,
                 "fallbackRecommended": False,
                 "lastSuccessAt": checkpoint["lastSuccessAt"],
+                "lastErrorAt": None,
+                "lastRunOutcome": "success",
+                "lastFetchedCount": len(corrected_events),
+                "lastUniqueEventCount": len(unique_event_ids),
+                "lastNewEventsSaved": new_events_saved,
+                "lastDbEventCount": total_events_after,
+                "lastRecomputedWindows": len(recompute_windows),
             }
         )
         return state
@@ -145,6 +173,11 @@ def run_worker_iteration(
                 "nextRetryAt": next_retry_at(source_key, attempt, now_utc),
                 "fallbackRecommended": should_trigger_fallback(source_key, outage_seconds),
                 "lastErrorAt": now_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "lastRunOutcome": "error",
+                "lastFetchedCount": 0,
+                "lastUniqueEventCount": 0,
+                "lastNewEventsSaved": 0,
+                "lastRecomputedWindows": 0,
             }
         )
         return state
