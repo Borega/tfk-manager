@@ -90,20 +90,21 @@ def _extract_rows_from_api_payload(data: object) -> list[dict[str, object]]:
     return []
 
 
-def _walk_payload_dicts(node: object) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
+def _walk_payload_dicts_with_iface(node: object) -> list[tuple[dict[str, object], str]]:
+    rows: list[tuple[dict[str, object], str]] = []
 
-    def walk(value: object) -> None:
+    def walk(value: object, iface_hint: str) -> None:
         if isinstance(value, dict):
-            rows.append(value)
-            for nested in value.values():
-                walk(nested)
+            rows.append((value, iface_hint))
+            for key, nested in value.items():
+                key_iface = _normalize_static_iface(key)
+                walk(nested, key_iface or iface_hint)
             return
         if isinstance(value, list):
             for nested in value:
-                walk(nested)
+                walk(nested, iface_hint)
 
-    walk(node)
+    walk(node, "")
     return rows
 
 
@@ -119,12 +120,14 @@ def _normalize_static_iface(value: object) -> str:
 def _collect_static_rows_with_iface(payload: object) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     seen: set[tuple[str, str, str, str]] = set()
-    for item in _walk_payload_dicts(payload):
+    for item, inherited_iface in _walk_payload_dicts_with_iface(payload):
         item_ci = {str(key).lower(): value for key, value in item.items()}
         hostname = str(item_ci.get("hostname") or item_ci.get("name") or "").strip()
         mac = str(item_ci.get("mac") or "").strip()
         ip = str(item_ci.get("ip") or item_ci.get("ipv4") or item_ci.get("address") or "").strip()
         iface = _normalize_static_iface(item_ci.get("iface") or item_ci.get("if") or item_ci.get("interface"))
+        if not iface:
+            iface = inherited_iface
         if not hostname or not mac or not ip:
             continue
         dedupe_key = (hostname, mac, ip, iface)
