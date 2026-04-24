@@ -52,7 +52,7 @@ from server.app.api.token_codec import TokenDecodeError, decode_token
 from server.app.collector.health_service import evaluate_all_sources
 from server.app.collector.adapters import dhcp_adapter, firewall_adapter, webfilter_adapter
 from server.app.collector.repository import ensure_schema, get_proxy_operation_audit_by_request_id, write_proxy_operation_audit
-from server.app.collector.workers.replay_policy import SOURCE_POLICY
+from server.app.collector.workers.replay_policy import SOURCE_POLICY, is_retry_ready
 from server.app.collector.workers.worker_runner import create_worker_state, run_worker_iteration
 
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
@@ -835,8 +835,9 @@ def _adapter_for_source(source_key: str) -> Callable[[str | None, datetime, list
     return adapters[source_key]
 
 
-def _run_collector_iteration() -> None:
+def _run_collector_iteration(force_retry_sources: set[str] | None = None) -> None:
     now_utc = _utc_now()
+    force_retry_sources = force_retry_sources or set()
     iteration_id = uuid4().hex[:8]
     mode = "sample" if COLLECTOR_SAMPLE_MODE else "live"
     print(
@@ -875,6 +876,7 @@ def _run_collector_iteration() -> None:
                 adapter_fetch=_fetch,
                 connection=connection,
                 now_utc=now_utc,
+                force_refresh=source_key in force_retry_sources,
             )
 
             outcome = str(state.get("lastRunOutcome") or "unknown")
@@ -929,7 +931,7 @@ def _run_collector_iteration() -> None:
     )
 
 
-def _run_collector_if_due(force: bool = False) -> None:
+def _run_collector_if_due(force: bool = False, force_retry_sources: set[str] | None = None) -> None:
     global _collector_last_run_at
     if not COLLECTOR_ENABLED:
         return
@@ -943,8 +945,34 @@ def _run_collector_if_due(force: bool = False) -> None:
         ):
             return
 
-        _run_collector_iteration()
+        _run_collector_iteration(force_retry_sources=force_retry_sources)
         _collector_last_run_at = now_utc
+
+
+def _run_collector_if_due_async(force_retry_sources: set[str] | None = None) -> None:
+    def _target() -> None:
+        try:
+            _run_collector_if_due(force_retry_sources=force_retry_sources)
+        except Exception as exc:
+            print(f"collector async refresh failed: {exc}")
+
+    threading.Thread(target=_target, name="tfk-server-collector-kick", daemon=True).start()
+
+
+def _should_force_source_retry(source_key: str, now_utc: datetime) -> bool:
+    state = _collector_state_by_source.get(source_key)
+    if not state:
+        return False
+
+    # Only bypass retry backoff when the source has never produced a successful fetch.
+    if state.get("lastSuccessAt"):
+        return False
+
+    next_retry_at = state.get("nextRetryAt")
+    if not isinstance(next_retry_at, str) or not next_retry_at:
+        return False
+
+    return not is_retry_ready(next_retry_at, now_utc)
 
 
 def _collector_loop() -> None:
@@ -1051,7 +1079,10 @@ def history_events(
     authorization: str | None = Header(default=None, alias="Authorization"),
 ):
     try:
-        _run_collector_if_due()
+        now_utc = _utc_now()
+        force_dhcp_retry = _should_force_source_retry("dhcp", now_utc)
+        force_sources = {"dhcp"} if force_dhcp_retry else None
+        _run_collector_if_due_async(force_retry_sources=force_sources)
         _, role = _read_claims_and_role(authorization)
         query = EventsQuery(
             startAt=startAt,
@@ -1076,7 +1107,10 @@ def history_trends(
     authorization: str | None = Header(default=None, alias="Authorization"),
 ):
     try:
-        _run_collector_if_due()
+        now_utc = _utc_now()
+        force_dhcp_retry = _should_force_source_retry("dhcp", now_utc)
+        force_sources = {"dhcp"} if force_dhcp_retry else None
+        _run_collector_if_due_async(force_retry_sources=force_sources)
         _, role = _read_claims_and_role(authorization)
         query = TrendsQuery(
             startAt=startAt,
@@ -1096,7 +1130,10 @@ def status_freshness(
     authorization: str | None = Header(default=None, alias="Authorization"),
 ):
     try:
-        _run_collector_if_due()
+        now_utc = _utc_now()
+        force_dhcp_retry = _should_force_source_retry("dhcp", now_utc)
+        force_sources = {"dhcp"} if force_dhcp_retry else None
+        _run_collector_if_due_async(force_retry_sources=force_sources)
         claims, role = _read_claims_and_role(authorization)
         with _open_connection() as connection:
             source_statuses = _load_source_statuses(connection)

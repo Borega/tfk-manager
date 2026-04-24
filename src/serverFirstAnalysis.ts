@@ -37,6 +37,7 @@ export type ServerFirstFallback = {
   reason: string;
   errorCode: string;
   stage: "freshness" | "trends" | "events" | "unexpected";
+  freshness?: ServerFreshnessResponse;
 };
 
 export type ServerFirstResult = ServerFirstSuccess | ServerFirstFallback;
@@ -50,6 +51,7 @@ export type RunServerFirstAnalysisArgs = {
 function fallbackFromError(
   stage: ServerFirstFallback["stage"],
   result: ServerClientResult<unknown>,
+  options: { freshness?: ServerFreshnessResponse } = {},
 ): ServerFirstFallback {
   if (result.ok) {
     return {
@@ -57,6 +59,7 @@ function fallbackFromError(
       reason: "unexpected success payload",
       errorCode: "unexpected_success_payload",
       stage,
+      ...options,
     };
   }
   return {
@@ -64,6 +67,7 @@ function fallbackFromError(
     reason: result.error.message,
     errorCode: result.error.errorCode,
     stage,
+    ...options,
   };
 }
 
@@ -77,12 +81,15 @@ export async function runServerFirstAnalysis({
   window,
   onFallbackLocal,
 }: RunServerFirstAnalysisArgs): Promise<ServerFirstResult> {
+  let freshnessSnapshot: ServerFreshnessResponse | undefined;
+
   try {
     const freshness = await client.getFreshness();
     if (!freshness.ok) {
       await runFallbackHook(onFallbackLocal);
       return fallbackFromError("freshness", freshness);
     }
+    freshnessSnapshot = freshness.data;
 
     const trends = await client.getTrends({
       startAt: window.startAt,
@@ -92,7 +99,7 @@ export async function runServerFirstAnalysis({
     });
     if (!trends.ok) {
       await runFallbackHook(onFallbackLocal);
-      return fallbackFromError("trends", trends);
+      return fallbackFromError("trends", trends, { freshness: freshnessSnapshot });
     }
 
     const events = await client.getEvents({
@@ -103,7 +110,7 @@ export async function runServerFirstAnalysis({
     });
     if (!events.ok) {
       await runFallbackHook(onFallbackLocal);
-      return fallbackFromError("events", events);
+      return fallbackFromError("events", events, { freshness: freshnessSnapshot });
     }
 
     return {
@@ -119,6 +126,7 @@ export async function runServerFirstAnalysis({
       reason: String(error),
       errorCode: "server_first_unexpected_error",
       stage: "unexpected",
+      freshness: freshnessSnapshot,
     };
   }
 }

@@ -80,6 +80,72 @@ class TestAuthService(unittest.TestCase):
                 secret=DEFAULT_JWT_SECRET,
             )
 
+    def test_authenticate_user_accepts_blob_password_hash(self) -> None:
+        blob_hash = bcrypt.hashpw(b"blob-secret", bcrypt.gensalt())
+        self.connection.execute(
+            """
+            INSERT INTO auth_users (id, username, password_hash, role, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "user-blob",
+                "blob-user",
+                blob_hash,
+                "analyst",
+                1,
+                self._now(),
+                self._now(),
+            ),
+        )
+        self.connection.commit()
+
+        result = authenticate_user(
+            username="blob-user",
+            password="blob-secret",
+            connection=self.connection,
+            now_utc=self._now_dt(),
+            secret=DEFAULT_JWT_SECRET,
+        )
+        self.assertTrue(result.accessToken)
+
+    def test_authenticate_user_repairs_legacy_schema_columns(self) -> None:
+        legacy_connection = sqlite3.connect(":memory:")
+        try:
+            legacy_connection.executescript(
+                """
+                CREATE TABLE auth_users (
+                    id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    password_hash TEXT NOT NULL
+                );
+
+                CREATE TABLE auth_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL
+                );
+                """
+            )
+
+            legacy_hash = bcrypt.hashpw(b"legacy-secret", bcrypt.gensalt()).decode("utf-8")
+            legacy_connection.execute(
+                "INSERT INTO auth_users (id, username, password_hash) VALUES (?, ?, ?)",
+                ("legacy-user-1", "legacy-user", legacy_hash),
+            )
+            legacy_connection.commit()
+
+            result = authenticate_user(
+                username="legacy-user",
+                password="legacy-secret",
+                connection=legacy_connection,
+                now_utc=self._now_dt(),
+                secret=DEFAULT_JWT_SECRET,
+            )
+
+            self.assertTrue(result.accessToken)
+            self.assertEqual(result.role, "admin")
+        finally:
+            legacy_connection.close()
+
     def test_refresh_rotation_revokes_old_token(self) -> None:
         login = authenticate_user(
             username="analyst",

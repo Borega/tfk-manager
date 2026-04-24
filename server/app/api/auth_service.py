@@ -26,6 +26,63 @@ class TokenRefreshError(RuntimeError):
     pass
 
 
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row[1]) for row in rows}
+
+
+def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
+    if column_name in _table_columns(connection, table_name):
+        return
+    connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def _ensure_auth_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS auth_users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(username)
+        );
+
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            session_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            refresh_token_id TEXT NOT NULL,
+            session_version INTEGER NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT
+        );
+        """
+    )
+
+    _ensure_column(connection, "auth_users", "role", "TEXT NOT NULL DEFAULT 'admin'")
+    _ensure_column(connection, "auth_users", "is_active", "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(connection, "auth_users", "created_at", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(connection, "auth_users", "updated_at", "TEXT NOT NULL DEFAULT ''")
+
+    _ensure_column(connection, "auth_sessions", "refresh_token_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(connection, "auth_sessions", "session_version", "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(connection, "auth_sessions", "issued_at", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(connection, "auth_sessions", "expires_at", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(connection, "auth_sessions", "revoked_at", "TEXT")
+
+
+def _to_hash_bytes(stored_hash: object) -> bytes:
+    if isinstance(stored_hash, bytes):
+        return stored_hash
+    if isinstance(stored_hash, memoryview):
+        return stored_hash.tobytes()
+    return str(stored_hash).encode("utf-8")
+
+
 def _to_iso(value: datetime) -> str:
     return value.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -109,6 +166,8 @@ def authenticate_user(
     now_utc: datetime,
     secret: str = DEFAULT_JWT_SECRET,
 ) -> LoginResponse:
+    _ensure_auth_schema(connection)
+
     user_row = connection.execute(
         """
         SELECT id, password_hash, role, is_active
@@ -125,8 +184,12 @@ def authenticate_user(
     if not is_active:
         raise AuthenticationError("inactive_user")
 
-    if not bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8")):
-        raise AuthenticationError("invalid_credentials")
+    try:
+        hash_bytes = _to_hash_bytes(stored_hash)
+        if not bcrypt.checkpw(password.encode("utf-8"), hash_bytes):
+            raise AuthenticationError("invalid_credentials")
+    except ValueError as exc:
+        raise AuthenticationError("invalid_credentials") from exc
 
     access_token, refresh_token, access_expires_at, refresh_expires_at, _ = _issue_session_tokens(
         connection=connection,
@@ -153,6 +216,8 @@ def refresh_session(
     now_utc: datetime,
     secret: str = DEFAULT_JWT_SECRET,
 ) -> RefreshResponse:
+    _ensure_auth_schema(connection)
+
     try:
         refresh_claims = decode_token(refresh_token, secret)
     except TokenDecodeError as exc:

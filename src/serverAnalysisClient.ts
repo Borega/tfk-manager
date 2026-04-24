@@ -30,8 +30,30 @@ type RequestOptions = {
   body?: unknown;
 };
 
+const SERVER_ANALYSIS_REQUEST_TIMEOUT_MS = 12_000;
+
 function normalizeBaseUrl(value: string): string {
   return value.trim().replace(/\/+$/, "");
+}
+
+function endpointCandidates(baseUrl: string, path: string): string[] {
+  const primary = `${baseUrl}${path}`;
+  const candidates = [primary];
+
+  try {
+    const parsed = new URL(baseUrl);
+    if (parsed.hostname === "localhost") {
+      parsed.hostname = "127.0.0.1";
+      candidates.push(`${parsed.toString().replace(/\/+$/, "")}${path}`);
+    } else if (parsed.hostname === "127.0.0.1") {
+      parsed.hostname = "localhost";
+      candidates.push(`${parsed.toString().replace(/\/+$/, "")}${path}`);
+    }
+  } catch {
+    // Keep only primary candidate when base URL cannot be parsed.
+  }
+
+  return Array.from(new Set(candidates));
 }
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -109,28 +131,50 @@ export function createServerAnalysisClient({
       };
     }
 
-    const endpoint = `${base}${options.path}`;
+    const endpoints = endpointCandidates(base, options.path);
 
-    let response: Response;
-    try {
-      response = await fetchImpl(endpoint, {
-        method: options.method,
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      });
-    } catch (error) {
+    let response: Response | null = null;
+    let lastError: unknown = null;
+    let timeoutTriggered = false;
+
+    for (const endpoint of endpoints) {
+      const abortController = new AbortController();
+      const timeoutId = globalThis.setTimeout(() => {
+        timeoutTriggered = true;
+        abortController.abort();
+      }, SERVER_ANALYSIS_REQUEST_TIMEOUT_MS);
+
+      try {
+        response = await fetchImpl(endpoint, {
+          method: options.method,
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: options.body === undefined ? undefined : JSON.stringify(options.body),
+          signal: abortController.signal,
+        });
+        break;
+      } catch (error) {
+        lastError = error;
+      } finally {
+        globalThis.clearTimeout(timeoutId);
+      }
+    }
+
+    if (!response) {
       return {
         ok: false,
-        status: 503,
+        status: timeoutTriggered ? 504 : 503,
         error: {
-          status: 503,
-          errorCode: "server_unreachable",
-          message: "server request failed",
+          status: timeoutTriggered ? 504 : 503,
+          errorCode: timeoutTriggered ? "server_timeout" : "server_unreachable",
+          message: timeoutTriggered ? "server request timed out" : "server request failed",
           requestId: "server-analysis-client-network",
-          details: { reason: String(error) },
+          details: {
+            reason: String(lastError),
+            attemptedEndpoints: endpoints,
+          },
         },
       };
     }

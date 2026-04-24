@@ -96,8 +96,9 @@ def run_worker_iteration(
     connection,
     now_utc: datetime,
     fail_on_event_id: str | None = None,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
-    if not is_retry_ready(state.get("nextRetryAt"), now_utc):
+    if not force_refresh and not is_retry_ready(state.get("nextRetryAt"), now_utc):
         state.update({
             "lastRunOutcome": "retry_wait",
             "lastFetchedCount": 0,

@@ -72,6 +72,27 @@ class TestWorkerRunner(unittest.TestCase):
         )
         self.assertTrue(state["fallbackRecommended"])
 
+    def test_force_refresh_bypasses_retry_wait_gate(self):
+        now_utc = datetime(2026, 3, 21, 8, 0, 0, tzinfo=timezone.utc)
+        state = create_worker_state("dhcp")
+        state["attempt"] = 4
+        state["outageSeconds"] = 120
+        state["nextRetryAt"] = "2099-01-01T00:00:00Z"
+
+        run_worker_iteration(
+            "dhcp",
+            state,
+            self._adapter_with_event("evt-force-1"),
+            self.connection,
+            now_utc,
+            force_refresh=True,
+        )
+
+        self.assertEqual(state["lastRunOutcome"], "success")
+        self.assertEqual(state["attempt"], 0)
+        self.assertIsNone(state["nextRetryAt"])
+        self.assertEqual(get_checkpoint_cursor(self.connection, "dhcp"), "evt-force-1")
+
 
 if __name__ == "__main__":
     unittest.main()

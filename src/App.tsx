@@ -75,6 +75,9 @@ type SettingsState = {
   loginUrl: string;
   dashboardUrl: string;
   username: string;
+  greenIpRangeStart: string;
+  greenIpRangeEnd: string;
+  greenIpRangePeakUsed: number;
   serverBaseUrl: string;
   serverUsername: string;
   delegatedProxyEnabled: boolean;
@@ -426,6 +429,14 @@ function toAdaptiveHealthStatus(status: SourceHealthStatus): AdaptiveHealthStatu
   return "idle";
 }
 
+function mapServerFreshnessSourceKey(sourceKey: string): SourceHealthKey | null {
+  const normalized = sourceKey.trim().toLowerCase();
+  if (normalized === "dhcp") return "leases";
+  if (normalized === "firewall") return "firewall-stream";
+  if (normalized === "webfilter") return "webfilter-ui";
+  return null;
+}
+
 function isPrivateIpv4(ip: string): boolean {
   if (!ip) return false;
   if (ip.startsWith("10.")) return true;
@@ -472,6 +483,9 @@ const DEFAULT_SETTINGS: SettingsState = {
   loginUrl: "https://your-opnsense-host:81",
   dashboardUrl: "https://your-opnsense-host:81/ui/core/dashboard",
   username: "",
+  greenIpRangeStart: "",
+  greenIpRangeEnd: "",
+  greenIpRangePeakUsed: 0,
   serverBaseUrl: "http://localhost:8080",
   serverUsername: "admin",
   delegatedProxyEnabled: false,
@@ -525,12 +539,23 @@ function normalizeSettings(loaded?: Partial<SettingsState> | null): SettingsStat
   if (!loaded) return DEFAULT_SETTINGS;
   const baseSource = loaded.baseUrl ?? loaded.loginUrl ?? DEFAULT_SETTINGS.baseUrl;
   const serverBaseSource = loaded.serverBaseUrl ?? DEFAULT_SETTINGS.serverBaseUrl;
+  const parsedPeakUsed = Number(loaded.greenIpRangePeakUsed ?? DEFAULT_SETTINGS.greenIpRangePeakUsed);
   return {
     ...DEFAULT_SETTINGS,
     ...loaded,
     ...deriveUrlsFromBase(baseSource),
     serverBaseUrl: normalizeServerBaseUrl(serverBaseSource),
+    greenIpRangePeakUsed: Number.isFinite(parsedPeakUsed) && parsedPeakUsed >= 0 ? Math.floor(parsedPeakUsed) : 0,
   };
+}
+
+function ipv4ToNumber(ip: string): number | null {
+  if (!IP_RE.test(ip)) return null;
+  const octets = ip.split(".").map((value) => Number(value));
+  if (octets.length !== 4 || octets.some((value) => Number.isNaN(value) || value < 0 || value > 255)) {
+    return null;
+  }
+  return (((octets[0] * 256 + octets[1]) * 256 + octets[2]) * 256) + octets[3];
 }
 
 function rowKey(row: ClientRow): string {
@@ -914,6 +939,8 @@ function App() {
   const [hasPassword, setHasPassword] = useState(false);
   const [serverPasswordInput, setServerPasswordInput] = useState("");
   const [proxySharedSecretInput, setProxySharedSecretInput] = useState("");
+  const [persistProxySharedSecret, setPersistProxySharedSecret] = useState(false);
+  const [hasStoredProxySharedSecret, setHasStoredProxySharedSecret] = useState(false);
   const [serverLoginBusy, setServerLoginBusy] = useState(false);
   const [serverLoginError, setServerLoginError] = useState<string | null>(null);
   const [msdPasswordInput, setMsdPasswordInput] = useState("");
@@ -1032,6 +1059,7 @@ function App() {
   const wfScheduledRefetchRef = useRef<number | null>(null);
   const wfLogsInFlightRef = useRef<Promise<WebfilterFetchResult> | null>(null);
   const serverSessionRef = useRef(createServerSession(serverSessionTokens));
+  const serverAnalysisStatusLogRef = useRef<string>("");
 
   const serverAnalysisClient = useMemo(() => createServerAnalysisClient({
     baseUrl: settings.serverBaseUrl,
@@ -1121,6 +1149,61 @@ function App() {
     });
   }
 
+  function applyServerFreshnessSnapshot(freshness: ServerFreshnessResponse) {
+    const generatedAt = freshness.data.generatedAt;
+    setSourceHealth((prev) => {
+      const next = {
+        ...prev,
+        "server-api": {
+          lastSuccessIso: generatedAt,
+          lastError: null,
+          lastErrorIso: null,
+        },
+      };
+
+      for (const source of freshness.data.sources) {
+        const key = mapServerFreshnessSourceKey(source.sourceKey);
+        if (!key) continue;
+        next[key] = {
+          lastSuccessIso: generatedAt,
+          lastError: null,
+          lastErrorIso: null,
+        };
+      }
+
+      return next;
+    });
+
+    setSourceRetry((prev) => {
+      const next = {
+        ...prev,
+        "server-api": {
+          attempt: 0,
+          nextRetryAtIso: null,
+        },
+      };
+
+      for (const source of freshness.data.sources) {
+        const key = mapServerFreshnessSourceKey(source.sourceKey);
+        if (!key) continue;
+        next[key] = {
+          attempt: 0,
+          nextRetryAtIso: null,
+        };
+      }
+
+      return next;
+    });
+  }
+
+  function logServerAnalysisStatus(signature: string, message: string, options: { force?: boolean } = {}) {
+    if (!options.force && serverAnalysisStatusLogRef.current === signature) {
+      return;
+    }
+    serverAnalysisStatusLogRef.current = signature;
+    setLogs((prev) => [...prev, message]);
+  }
+
   function canRunSourceNow(key: SourceHealthKey): boolean {
     return isRetryReady(sourceRetry[key].nextRetryAtIso, Date.now());
   }
@@ -1133,7 +1216,7 @@ function App() {
 
   const serverFreshnessCards = useMemo(() => mapServerFreshnessToSourceHealth(serverFreshness, {
     nowMillis: Date.now(),
-    errorMessage: analysisMode === "fallback-local" ? analysisFallbackReason : null,
+    errorMessage: analysisMode !== "server" ? analysisFallbackReason : null,
   }), [serverFreshness, analysisMode, analysisFallbackReason, healthTick]);
 
   const analysisSourceHealthCards = useMemo(() => {
@@ -1191,6 +1274,8 @@ function App() {
     () => wfAddressEntries.reduce((sum, entry) => sum + (wfAddressSelectedIds.has(entry.id) ? 1 : 0), 0),
     [wfAddressEntries, wfAddressSelectedIds],
   );
+
+  const analysisActivityLines = useMemo(() => logs.slice(-120), [logs]);
 
   const analysis = useMemo(() => {
     const byIp = new Map<string, AnalysisDeviceRow>();
@@ -1543,6 +1628,83 @@ function App() {
       riskEvidenceByIp,
     };
   }, [existing.rows, existingW.rows, dynamicLeases, wfLogs, fwLogs]);
+
+  const greenRangeStats = useMemo(() => {
+    const startText = settings.greenIpRangeStart.trim();
+    const endText = settings.greenIpRangeEnd.trim();
+    if (!startText || !endText) {
+      return {
+        configured: false,
+        valid: false,
+        message: "Configure Gruen IP range in Settings.",
+        usedNow: 0,
+        total: 0,
+      };
+    }
+
+    const startValue = ipv4ToNumber(startText);
+    const endValue = ipv4ToNumber(endText);
+    if (startValue === null || endValue === null) {
+      return {
+        configured: true,
+        valid: false,
+        message: "Gruen IP range must use valid IPv4 addresses.",
+        usedNow: 0,
+        total: 0,
+      };
+    }
+    if (startValue > endValue) {
+      return {
+        configured: true,
+        valid: false,
+        message: "Gruen IP range start must be lower than or equal to end.",
+        usedNow: 0,
+        total: 0,
+      };
+    }
+
+    const usedIpNumbers = new Set<number>();
+    for (const lease of existing.rows) {
+      const ipValue = ipv4ToNumber(lease.ip.trim());
+      if (ipValue !== null) {
+        usedIpNumbers.add(ipValue);
+      }
+    }
+    for (const lease of dynamicLeases) {
+      if (classifyDynamicSegment(lease.iface) !== "Dynamic Gruen") {
+        continue;
+      }
+      const ipValue = ipv4ToNumber(lease.ip.trim());
+      if (ipValue !== null) {
+        usedIpNumbers.add(ipValue);
+      }
+    }
+
+    let usedNow = 0;
+    usedIpNumbers.forEach((ipValue) => {
+      if (ipValue >= startValue && ipValue <= endValue) {
+        usedNow += 1;
+      }
+    });
+
+    return {
+      configured: true,
+      valid: true,
+      message: null,
+      usedNow,
+      total: endValue - startValue + 1,
+    };
+  }, [settings.greenIpRangeStart, settings.greenIpRangeEnd, existing.rows, dynamicLeases]);
+
+  useEffect(() => {
+    if (!greenRangeStats.valid) return;
+    const nextPeak = Math.max(settings.greenIpRangePeakUsed, greenRangeStats.usedNow);
+    if (nextPeak === settings.greenIpRangePeakUsed) return;
+    setSettings((prev) => ({
+      ...prev,
+      greenIpRangePeakUsed: nextPeak,
+    }));
+  }, [greenRangeStats.valid, greenRangeStats.usedNow, settings.greenIpRangePeakUsed]);
 
   const filteredCategoryNodes = useMemo(() => {
     return searchTopic(topicSearchPattern, analysis.categoryNodes).slice(0, 15);
@@ -1915,6 +2077,20 @@ function App() {
       .then((value) => setHasMsdPassword(value))
       .catch(() => setHasMsdPassword(false));
 
+    invoke<boolean>("has_proxy_shared_secret")
+      .then((value) => setHasStoredProxySharedSecret(value))
+      .catch(() => setHasStoredProxySharedSecret(false));
+
+    invoke<string | null>("load_proxy_shared_secret")
+      .then((value) => {
+        const secret = (value ?? "").trim();
+        if (!secret) return;
+        setProxySharedSecretInput(secret);
+        setPersistProxySharedSecret(true);
+        setHasStoredProxySharedSecret(true);
+      })
+      .catch(() => undefined);
+
     return () => {
       active = false;
       if (unlisten) unlisten();
@@ -2181,6 +2357,7 @@ function App() {
       if (result.exportWlanbyodCsv) {
         setExistingCsvW(result.exportWlanbyodCsv);
       }
+      markSourceSuccess("leases");
       setLastAutoExportKey(autoExportKey);
     } catch (error) {
       setRunError(String(error));
@@ -2277,6 +2454,9 @@ function App() {
       setAnalysisFallbackReason(null);
       markSourceSuccess("server-api");
       setLogs((prev) => [...prev, `Server login successful for ${serverUsername}.`]);
+
+      // Kick off an immediate server freshness/trend sync so analysis cards leave idle state right after login.
+      void refreshServerFirstAnalysisWindow();
     } finally {
       setServerLoginBusy(false);
     }
@@ -2297,6 +2477,7 @@ function App() {
     try {
       await invoke("save_settings", { settings });
       const hasNewPassword = passwordInput.trim().length > 0;
+      const proxySharedSecretTrimmed = proxySharedSecretInput.trim();
       if (passwordInput.trim().length > 0) {
         await invoke("save_password", { password: passwordInput });
         setPasswordInput("");
@@ -2306,6 +2487,13 @@ function App() {
         await invoke("save_msd_password", { password: msdPasswordInput });
         setMsdPasswordInput("");
         setHasMsdPassword(true);
+      }
+      if (persistProxySharedSecret && proxySharedSecretTrimmed.length > 0) {
+        await invoke("save_proxy_shared_secret", { secret: proxySharedSecretTrimmed });
+        setHasStoredProxySharedSecret(true);
+      } else if (!persistProxySharedSecret && hasStoredProxySharedSecret) {
+        await invoke("clear_proxy_shared_secret");
+        setHasStoredProxySharedSecret(false);
       }
       setLogs([hasNewPassword || msdPasswordInput.trim().length > 0 ? "Settings and password(s) saved." : "Settings saved."]);
 
@@ -2652,6 +2840,7 @@ function App() {
       if (result.exportCsv) {
         setExistingCsv(result.exportCsv);
       }
+      markSourceSuccess("leases");
     } catch (error) {
       setRunError(String(error));
       setLogs(["Export failed. See error details."]);
@@ -2694,6 +2883,7 @@ function App() {
       if (result.exportCsv) {
         setExistingCsv(result.exportCsv);
       }
+      markSourceSuccess("leases");
     } catch (error) {
       setRunError(String(error));
       setLogs(["Export failed. See error details."]);
@@ -3233,6 +3423,7 @@ function App() {
   async function handleRefreshAnalysis() {
     setLogs((prev) => [...prev, "Refreshing analysis sources (leases + webfilter)..."]);
     const mode = await refreshServerFirstAnalysisWindow();
+    setLogs((prev) => [...prev, `Analysis refresh result: mode=${mode}`]);
     if (mode !== "fallback-local") {
       await refreshLeasesSilently();
     }
@@ -3264,17 +3455,21 @@ function App() {
 
   async function refreshServerFirstAnalysisWindow(): Promise<AnalysisMode> {
     if (!normalizeServerBaseUrl(settings.serverBaseUrl)) {
+      const reason = "Server base URL is not configured. Using local collection.";
       setAnalysisMode("local-only");
-      setAnalysisFallbackReason("Server base URL is not configured. Using local collection.");
+      setAnalysisFallbackReason(reason);
       setServerFreshness(null);
+      logServerAnalysisStatus("local-only:no-base-url", `Server analysis local-only: ${reason}`, { force: true });
       return "local-only";
     }
 
     const hasServerSession = Boolean(serverSessionRef.current.getAccessToken());
     if (!hasServerSession) {
+      const reason = "Server session unavailable. Log in in Settings to use server analysis.";
       setAnalysisMode("local-only");
-      setAnalysisFallbackReason("Server session unavailable. Log in in Settings to use server analysis.");
+      setAnalysisFallbackReason(reason);
       setServerFreshness(null);
+      logServerAnalysisStatus("local-only:no-session", `Server analysis local-only: ${reason}`, { force: true });
       return "local-only";
     }
 
@@ -3297,19 +3492,36 @@ function App() {
       setServerLastSyncIso(new Date().toISOString());
       setServerFreshness(serverResult.freshness);
       setServerTrendBuckets(serverResult.trends.items);
+      applyServerFreshnessSnapshot(serverResult.freshness);
       markSourceSuccess("server-api");
+      logServerAnalysisStatus(
+        `server:${serverResult.freshness.data.generatedAt}`,
+        `Server analysis connected: freshness ok, trends=${serverResult.trends.count}, events=${serverResult.events.count}`,
+        { force: true },
+      );
       return "server";
     }
 
     setAnalysisMode("fallback-local");
     setAnalysisFallbackReason(`${serverResult.errorCode}: ${serverResult.reason}`);
-    setServerFreshness(null);
+    if (serverResult.freshness) {
+      setServerFreshness(serverResult.freshness);
+      applyServerFreshnessSnapshot(serverResult.freshness);
+      setServerLastSyncIso(new Date().toISOString());
+    } else {
+      setServerFreshness(null);
+    }
     markSourceError("server-api", serverResult.reason);
     scheduleSourceRetry("server-api");
     setLogs((prev) => [
       ...prev,
       `Server analysis fallback (${serverResult.stage}): ${serverResult.reason}`,
     ]);
+    logServerAnalysisStatus(
+      `fallback:${serverResult.stage}:${serverResult.errorCode}:${serverResult.reason}`,
+      `Server analysis fallback (${serverResult.stage}): ${serverResult.errorCode} - ${serverResult.reason}`,
+      { force: true },
+    );
     return "fallback-local";
   }
 
@@ -4329,6 +4541,37 @@ function App() {
                 />
               </div>
               <div className="field">
+                <label htmlFor="green-ip-range-start">Gruen IP range start</label>
+                <input
+                  id="green-ip-range-start"
+                  type="text"
+                  value={settings.greenIpRangeStart}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, greenIpRangeStart: value }));
+                  }}
+                  placeholder="10.20.30.10"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="green-ip-range-end">Gruen IP range end</label>
+                <input
+                  id="green-ip-range-end"
+                  type="text"
+                  value={settings.greenIpRangeEnd}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSettings((prev) => ({ ...prev, greenIpRangeEnd: value }));
+                  }}
+                  placeholder="10.20.32.234"
+                />
+                <p className="lease-meta" style={{ marginTop: "0.5rem" }}>
+                  {greenRangeStats.valid
+                    ? `Gruen in use now: ${greenRangeStats.usedNow}/${greenRangeStats.total}. Peak observed: ${settings.greenIpRangePeakUsed}/${greenRangeStats.total}.`
+                    : greenRangeStats.message}
+                </p>
+              </div>
+              <div className="field">
                 <label htmlFor="python-path">Python path</label>
                 <input
                   id="python-path"
@@ -4422,7 +4665,7 @@ function App() {
                 />
               </div>
               <div className="field">
-                <label htmlFor="proxy-shared-secret">Proxy HMAC shared secret (session only)</label>
+                <label htmlFor="proxy-shared-secret">Proxy HMAC shared secret</label>
                 <input
                   id="proxy-shared-secret"
                   type="password"
@@ -4430,6 +4673,19 @@ function App() {
                   onChange={(e) => setProxySharedSecretInput(e.currentTarget.value)}
                   placeholder="Enter to override VITE_TFK_PROXY_HMAC_SHARED_SECRET"
                 />
+                <label className="toggle-pill" style={{ alignSelf: "flex-start", marginTop: "0.5rem" }}>
+                  <input
+                    type="checkbox"
+                    checked={persistProxySharedSecret}
+                    onChange={(e) => setPersistProxySharedSecret(e.currentTarget.checked)}
+                  />
+                  Save Proxy HMAC shared secret securely (OS keyring)
+                </label>
+                <p className="lease-meta" style={{ marginTop: "0.5rem" }}>
+                  {hasStoredProxySharedSecret
+                    ? "A Proxy HMAC shared secret is currently stored in the OS keyring."
+                    : "No Proxy HMAC shared secret is stored in the OS keyring."}
+                </p>
               </div>
               <div className="field">
                 <label htmlFor="login-url">Login URL</label>
@@ -5133,6 +5389,24 @@ function App() {
                 </span>
               </div>
 
+              <div className="analysis-section analysis-section-card">
+                <div className="preview-header" style={{ marginBottom: "0.5rem" }}>
+                  <h4 style={{ margin: 0 }}>Analysis Activity Log</h4>
+                  <button
+                    className="secondary"
+                    type="button"
+                    onClick={() => setLogs([])}
+                  >
+                    Clear log
+                  </button>
+                </div>
+                <pre className="run-overlay-log" style={{ maxHeight: "220px", margin: 0 }}>
+                  {analysisActivityLines.length > 0
+                    ? analysisActivityLines.join("\n")
+                    : "No analysis activity yet. Click 'Refresh analysis sources'."}
+                </pre>
+              </div>
+
               <div className={`analysis-mode-banner analysis-mode-${analysisModeBadge.tone}`}>
                 <strong>{analysisModeBadge.label}</strong>
                 <span>Last server sync: {formatHealthTime(serverLastSyncIso)}</span>
@@ -5142,6 +5416,9 @@ function App() {
                   <span>Freshness cards: {serverFreshnessCards.length}</span>
                 )}
               </div>
+              {!greenRangeStats.valid && greenRangeStats.configured && (
+                <p className="lease-meta">Gruen range status: {greenRangeStats.message}</p>
+              )}
 
               <div className="source-health-grid">
                 {analysisSourceHealthCards.map((item) => (
@@ -5189,6 +5466,22 @@ function App() {
                 <div className="analysis-metric-card">
                   <span>Known Devices</span>
                   <strong>{analysis.knownDeviceCount}</strong>
+                </div>
+                <div className="analysis-metric-card">
+                  <span>Gruen Range In Use</span>
+                  <strong>
+                    {greenRangeStats.valid
+                      ? `${greenRangeStats.usedNow}/${greenRangeStats.total}`
+                      : "n/a"}
+                  </strong>
+                </div>
+                <div className="analysis-metric-card">
+                  <span>Gruen Peak Recorded</span>
+                  <strong>
+                    {greenRangeStats.valid
+                      ? `${settings.greenIpRangePeakUsed}/${greenRangeStats.total}`
+                      : "n/a"}
+                  </strong>
                 </div>
                 <div className="analysis-metric-card">
                   <span>Active Correlated IPs</span>

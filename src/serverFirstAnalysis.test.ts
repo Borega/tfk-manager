@@ -165,4 +165,71 @@ describe("runServerFirstAnalysis", () => {
     expect(result.reason).toContain("network down");
     expect(onFallbackLocal).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps freshness snapshot when trends fail", async () => {
+    const client = {
+      getFreshness: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        data: {
+          status: 200,
+          data: {
+            generatedAt: "2026-03-21T10:00:00Z",
+            overallSeverity: "Info",
+            sources: [
+              {
+                sourceKey: "dhcp",
+                state: "Healthy",
+                lagSeconds: 2,
+                checkpointCursor: "abc",
+                severityCandidate: "Info",
+                fallbackRecommended: false,
+                confidenceImpact: "none",
+              },
+            ],
+            fallbackGuidance: {
+              recommended: false,
+              reason: "none",
+              actionLabel: "Continue Server Mode",
+              actionKey: "none",
+            },
+            retentionLifecycle: {
+              lastRunAt: null,
+              cutoffAt: null,
+              deletedCount: 0,
+              affectedWindows: [],
+              runStatus: "unknown",
+              nextScheduledAt: null,
+            },
+          },
+        },
+      }),
+      getTrends: vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        error: {
+          status: 500,
+          errorCode: "request_failed",
+          message: "trends failed",
+          requestId: "trends-failed",
+        },
+      }),
+      getEvents: vi.fn(),
+    };
+
+    const result = await runServerFirstAnalysis({
+      client,
+      window: {
+        startAt: "2026-03-21T09:00:00Z",
+        endAt: "2026-03-21T10:00:00Z",
+      },
+    });
+
+    expect(result.mode).toBe("fallback-local");
+    if (result.mode !== "fallback-local") {
+      throw new Error("Expected fallback-local mode");
+    }
+    expect(result.stage).toBe("trends");
+    expect(result.freshness?.data.sources[0]?.sourceKey).toBe("dhcp");
+  });
 });

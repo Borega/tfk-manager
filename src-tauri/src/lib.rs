@@ -84,6 +84,12 @@ struct UiSettings {
     dashboard_url: String,
     username: String,
     #[serde(default)]
+    green_ip_range_start: String,
+    #[serde(default)]
+    green_ip_range_end: String,
+    #[serde(default)]
+    green_ip_range_peak_used: usize,
+    #[serde(default)]
     server_base_url: String,
     #[serde(default)]
     server_username: String,
@@ -511,6 +517,48 @@ fn save_msd_password(password: String) -> Result<(), String> {
 #[tauri::command]
 fn has_msd_password() -> Result<bool, String> {
     Ok(get_msd_password()?.is_some())
+}
+
+fn proxy_shared_secret_entry() -> Result<Entry, String> {
+    Entry::new("tfk-manager", "proxy-hmac-shared-secret").map_err(|err| err.to_string())
+}
+
+fn get_proxy_shared_secret() -> Result<Option<String>, String> {
+    let entry = proxy_shared_secret_entry()?;
+    match entry.get_password() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+#[tauri::command]
+fn save_proxy_shared_secret(secret: String) -> Result<(), String> {
+    if secret.trim().is_empty() {
+        return Err("Proxy shared secret is empty".to_string());
+    }
+    let entry = proxy_shared_secret_entry()?;
+    entry.set_password(secret.trim()).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn load_proxy_shared_secret() -> Result<Option<String>, String> {
+    get_proxy_shared_secret()
+}
+
+#[tauri::command]
+fn has_proxy_shared_secret() -> Result<bool, String> {
+    Ok(get_proxy_shared_secret()?.is_some())
+}
+
+#[tauri::command]
+fn clear_proxy_shared_secret() -> Result<(), String> {
+    let entry = proxy_shared_secret_entry()?;
+    match entry.delete_password() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -1670,6 +1718,10 @@ pub fn run() {
             has_password,
             save_msd_password,
             has_msd_password,
+            save_proxy_shared_secret,
+            load_proxy_shared_secret,
+            has_proxy_shared_secret,
+            clear_proxy_shared_secret,
             read_text_file,
             write_text_file,
             find_python,
