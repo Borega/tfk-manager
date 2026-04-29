@@ -7,6 +7,9 @@ ROLE_POLICY: dict[str, dict[str, set[str]]] = {
     "/api/history/trends": {
         "GET": {"analyst", "admin"},
     },
+    "/api/analysis/dashboard": {
+        "GET": {"analyst", "admin"},
+    },
     "/api/status/freshness": {
         "GET": {"analyst", "admin"},
     },

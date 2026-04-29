@@ -1,4 +1,6 @@
 import {
+  type ServerAnalysisDashboardQuery,
+  type ServerAnalysisDashboardResponse,
   isServerApiErrorEnvelope,
   type ServerApiErrorEnvelope,
   type ServerClientResult,
@@ -266,9 +268,23 @@ export function createServerAnalysisClient({
     };
   };
 
+  const getAnalysisDashboard = (query: ServerAnalysisDashboardQuery): Promise<ServerClientResult<ServerAnalysisDashboardResponse>> => {
+    const params = toQueryString({
+      startAt: query.startAt,
+      endAt: query.endAt,
+      bucketGrain: query.bucketGrain,
+    });
+
+    return callJson<ServerAnalysisDashboardResponse>({
+      method: "GET",
+      path: `/api/analysis/dashboard${params}`,
+    }, true);
+  };
+
   return {
     getEvents,
     getTrends,
     getFreshness,
+    getAnalysisDashboard,
   };
 }

@@ -143,4 +143,67 @@ describe("serverAnalysisClient", () => {
     expect(url).toContain("sourceType=dhcp");
     expect(url).toContain("bucketGrain=coarse");
   });
+
+  it("builds analysis dashboard endpoint query string with expected params", async () => {
+    const session = createServerSession({
+      accessToken: "access",
+      refreshToken: "refresh",
+      accessExpiresAt: "2026-03-21T13:00:00Z",
+      refreshExpiresAt: "2026-03-21T15:00:00Z",
+      role: "analyst",
+    });
+
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({
+        generatedAt: "2026-03-21T12:00:00Z",
+        window: {
+          startAt: "2026-03-20T00:00:00Z",
+          endAt: "2026-03-21T00:00:00Z",
+          bucketGrain: "coarse",
+          eventCount: 0,
+        },
+        trends: { dhcpLeaseCounts: [], firewallDenyCounts: [] },
+        networkInfrastructure: { vlanIpPoolUtilization: [], networkLoad: [] },
+        deviceBehavior: {
+          churn: { newDevices: 0, departedDevices: 0, stableDevices: 0, churnRatePercent: 0 },
+          deviceTypes: [],
+          vlanTransitions: [],
+          leaseDurationDistribution: [],
+          perDevice: [],
+          perBlockedUrl: [],
+        },
+        securityPolicy: {
+          firewallDeniesByVlan: [],
+          blockedCategories: [],
+          anomalousEvents: [],
+          misconfigurations: [],
+          topBlockedDomainsByVlan: [],
+        },
+        suggestions: [],
+        dashboards: {
+          dhcpLeaseTimeseries: { data: [], layout: {} },
+          firewallDenyTimeseries: { data: [], layout: {} },
+          topBlockedDomainsByVlan: { data: [], layout: {} },
+          deviceChurnSummary: { data: [], layout: {} },
+        },
+      }), { status: 200 }),
+    );
+
+    const client = createServerAnalysisClient({
+      baseUrl: "https://history.local:9000",
+      session,
+      fetchImpl: fetchMock,
+    });
+
+    await client.getAnalysisDashboard({
+      startAt: "2026-03-20T00:00:00Z",
+      endAt: "2026-03-21T00:00:00Z",
+      bucketGrain: "coarse",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = String(fetchMock.mock.calls[0]?.[0]);
+    expect(url).toContain("/api/analysis/dashboard");
+    expect(url).toContain("bucketGrain=coarse");
+  });
 });

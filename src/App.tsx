@@ -53,6 +53,7 @@ import {
   type DelegatedStaticLeaseRow,
 } from "./delegatedStaticLeases";
 import type {
+  ServerAnalysisDashboardResponse,
   ServerApiErrorEnvelope,
   ServerBucketGrain,
   ServerFreshnessResponse,
@@ -474,6 +475,14 @@ function normalizeWebfilterUser(userRaw: string): string {
   // LBOX-* identities represent the filter appliance itself, not an end user.
   if (/^LBOX-[A-Z0-9-]+$/i.test(user)) return "";
   return user;
+}
+
+function webfilterHostFromUrl(urlRaw: string): string {
+  try {
+    return new URL(urlRaw).hostname || "unknown";
+  } catch {
+    return (urlRaw || "").split("/")[0] || "unknown";
+  }
 }
 
 const MAX_FW_LOG_ENTRIES = 500;
@@ -1048,6 +1057,7 @@ function App() {
   const [topicSearchPattern, setTopicSearchPattern] = useState("");
   const [selectedRiskDeviceIps, setSelectedRiskDeviceIps] = useState<Set<string>>(new Set());
   const [selectedAnalysisDeviceIp, setSelectedAnalysisDeviceIp] = useState<string | null>(null);
+  const [selectedBlockedHost, setSelectedBlockedHost] = useState<string | null>(null);
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("local-only");
   const [analysisFallbackReason, setAnalysisFallbackReason] = useState<string | null>(null);
   const [serverLastSyncIso, setServerLastSyncIso] = useState<string | null>(null);
@@ -1055,11 +1065,13 @@ function App() {
   const [serverTrendRangeHours, setServerTrendRangeHours] = useState<number>(1);
   const [serverTrendBuckets, setServerTrendBuckets] = useState<ServerTrendBucket[]>([]);
   const [serverFreshness, setServerFreshness] = useState<ServerFreshnessResponse | null>(null);
+  const [serverAnalysisDashboard, setServerAnalysisDashboard] = useState<ServerAnalysisDashboardResponse | null>(null);
   const [serverSessionTokens, setServerSessionTokens] = useState<ServerSessionTokens | null>(() => readStoredServerSession());
   const wfScheduledRefetchRef = useRef<number | null>(null);
   const wfLogsInFlightRef = useRef<Promise<WebfilterFetchResult> | null>(null);
   const serverSessionRef = useRef(createServerSession(serverSessionTokens));
   const serverAnalysisStatusLogRef = useRef<string>("");
+  const analysisRefreshInFlightRef = useRef(false);
 
   const serverAnalysisClient = useMemo(() => createServerAnalysisClient({
     baseUrl: settings.serverBaseUrl,
@@ -1403,12 +1415,7 @@ function App() {
       if (action === "block") {
         const cat = wf.category?.trim() || "unknown";
         blockedCategoryMap.set(cat, (blockedCategoryMap.get(cat) ?? 0) + 1);
-        let host = "unknown";
-        try {
-          host = new URL(wf.url).hostname || "unknown";
-        } catch {
-          host = (wf.url || "").split("/")[0] || "unknown";
-        }
+        const host = webfilterHostFromUrl(wf.url);
         blockedHostMap.set(host, (blockedHostMap.get(host) ?? 0) + 1);
         const hostByCategory = categoryHostMap.get(cat) ?? new Map<string, number>();
         hostByCategory.set(host, (hostByCategory.get(host) ?? 0) + 1);
@@ -1508,6 +1515,7 @@ function App() {
       .slice(0, 8);
 
     const unknownActiveIps = Array.from(unknownFirewallIps.entries())
+      .filter(([ip]) => !(ip.endsWith(".1") || ip.endsWith(".255")))
       .map(([ip, counts]) => ({ ip, ...counts }))
       .sort((a, b) => b.block + b.pass - (a.block + a.pass))
       .slice(0, 12);
@@ -1755,6 +1763,20 @@ function App() {
   ]);
 
   const allRiskDeviceIps = analysis.riskyDevices.map((row) => row.ip);
+
+  const blockedHostDetailRows = useMemo(() => {
+    const selectedHost = selectedBlockedHost?.trim().toLowerCase();
+    if (!selectedHost) return [];
+
+    return wfLogs
+      .filter((entry) => {
+        const action = (entry.action || "").toLowerCase();
+        if (!(action.includes("block") || action.includes("deny"))) return false;
+        return webfilterHostFromUrl(entry.url).toLowerCase() === selectedHost;
+      })
+      .sort((a, b) => toTimeMillis(b.time) - toTimeMillis(a.time))
+      .slice(0, 100);
+  }, [selectedBlockedHost, wfLogs]);
 
   const allRiskDevicesSelected = allRiskDeviceIps.length > 0
     && allRiskDeviceIps.every((ip) => selectedRiskDeviceIps.has(ip));
@@ -2264,49 +2286,17 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
-  // Keep lease data fresh while analysis is open.
+  // Refresh analysis sources every 30s while analysis is open.
   useEffect(() => {
     if (activeTab !== "analysis") return;
-    if (!credentialsReady) return;
-    const leaseStatus = toSourceHealthView("leases", sourceHealth.leases, sourceRetry.leases, Date.now()).status;
-    const leasePoll = resolveAdaptivePollPolicy({
-      source: "leases",
-      baseIntervalMs: SOURCE_POLL_MS.leases,
-      healthStatus: toAdaptiveHealthStatus(leaseStatus),
-      backlogSize: analysis.rows.length + dynamicLeases.length,
-      retryAttempt: sourceRetry.leases.attempt,
-    });
-    const id = window.setInterval(() => {
-      if (!canRunSourceNow("leases")) return;
-      void refreshLeasesSilently();
-    }, leasePoll.intervalMs);
-    return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, credentialsReady, sourceHealth, sourceRetry, analysis.rows.length, dynamicLeases.length]);
 
-  // Keep server trend and freshness view in sync while analysis is open.
-  useEffect(() => {
-    if (activeTab !== "analysis") return;
-    const serverStatus = toSourceHealthView(
-      "server-api",
-      sourceHealth["server-api"],
-      sourceRetry["server-api"],
-      Date.now(),
-    ).status;
-    const serverPoll = resolveAdaptivePollPolicy({
-      source: "server-api",
-      baseIntervalMs: SOURCE_POLL_MS["server-api"],
-      healthStatus: toAdaptiveHealthStatus(serverStatus),
-      backlogSize: serverTrendBuckets.length,
-      retryAttempt: sourceRetry["server-api"].attempt,
-    });
     const id = window.setInterval(() => {
-      if (!canRunSourceNow("server-api")) return;
-      void refreshServerFirstAnalysisWindow();
-    }, serverPoll.intervalMs);
+      void handleRefreshAnalysis();
+    }, 30_000);
+
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, sourceHealth, sourceRetry, serverTrendWindow, serverTrendBuckets.length]);
+  }, [activeTab]);
 
   // Stream watchdog with fallback restart and retry/backoff.
   useEffect(() => {
@@ -3421,23 +3411,29 @@ function App() {
   }
 
   async function handleRefreshAnalysis() {
+    if (analysisRefreshInFlightRef.current) return;
+    analysisRefreshInFlightRef.current = true;
     setLogs((prev) => [...prev, "Refreshing analysis sources (leases + webfilter)..."]);
-    const mode = await refreshServerFirstAnalysisWindow();
-    setLogs((prev) => [...prev, `Analysis refresh result: mode=${mode}`]);
-    if (mode !== "fallback-local") {
-      await refreshLeasesSilently();
-    }
-    if (settings.msdUsername.trim() && hasMsdPassword) {
-      const wfResult = await handleFetchWfLogs();
-      if (!wfResult.ok) {
-        const recovery = wfResult.status.recoveryAction !== "None"
-          ? ` Recovery: ${wfResult.status.recoveryAction}.`
-          : "";
-        setLogs((prev) => [
-          ...prev,
-          `Webfilter status (${wfResult.status.status}): ${wfResult.status.message}${recovery}`,
-        ]);
+    try {
+      const mode = await refreshServerFirstAnalysisWindow();
+      setLogs((prev) => [...prev, `Analysis refresh result: mode=${mode}`]);
+      if (mode !== "fallback-local") {
+        await refreshLeasesSilently();
       }
+      if (settings.msdUsername.trim() && hasMsdPassword) {
+        const wfResult = await handleFetchWfLogs();
+        if (!wfResult.ok) {
+          const recovery = wfResult.status.recoveryAction !== "None"
+            ? ` Recovery: ${wfResult.status.recoveryAction}.`
+            : "";
+          setLogs((prev) => [
+            ...prev,
+            `Webfilter status (${wfResult.status.status}): ${wfResult.status.message}${recovery}`,
+          ]);
+        }
+      }
+    } finally {
+      analysisRefreshInFlightRef.current = false;
     }
   }
 
@@ -3459,6 +3455,7 @@ function App() {
       setAnalysisMode("local-only");
       setAnalysisFallbackReason(reason);
       setServerFreshness(null);
+      setServerAnalysisDashboard(null);
       logServerAnalysisStatus("local-only:no-base-url", `Server analysis local-only: ${reason}`, { force: true });
       return "local-only";
     }
@@ -3469,6 +3466,7 @@ function App() {
       setAnalysisMode("local-only");
       setAnalysisFallbackReason(reason);
       setServerFreshness(null);
+      setServerAnalysisDashboard(null);
       logServerAnalysisStatus("local-only:no-session", `Server analysis local-only: ${reason}`, { force: true });
       return "local-only";
     }
@@ -3492,6 +3490,7 @@ function App() {
       setServerLastSyncIso(new Date().toISOString());
       setServerFreshness(serverResult.freshness);
       setServerTrendBuckets(serverResult.trends.items);
+      setServerAnalysisDashboard(serverResult.dashboard);
       applyServerFreshnessSnapshot(serverResult.freshness);
       markSourceSuccess("server-api");
       logServerAnalysisStatus(
@@ -3511,6 +3510,7 @@ function App() {
     } else {
       setServerFreshness(null);
     }
+    setServerAnalysisDashboard(null);
     markSourceError("server-api", serverResult.reason);
     scheduleSourceRetry("server-api");
     setLogs((prev) => [
@@ -5389,9 +5389,10 @@ function App() {
                 </span>
               </div>
 
-              <div className="analysis-section analysis-section-card">
+              <details className="analysis-section analysis-section-card analysis-collapsible">
+                <summary>Analysis Activity Log</summary>
                 <div className="preview-header" style={{ marginBottom: "0.5rem" }}>
-                  <h4 style={{ margin: 0 }}>Analysis Activity Log</h4>
+                  <span className="lease-meta">{analysisActivityLines.length} lines</span>
                   <button
                     className="secondary"
                     type="button"
@@ -5405,7 +5406,7 @@ function App() {
                     ? analysisActivityLines.join("\n")
                     : "No analysis activity yet. Click 'Refresh analysis sources'."}
                 </pre>
-              </div>
+              </details>
 
               <div className={`analysis-mode-banner analysis-mode-${analysisModeBadge.tone}`}>
                 <strong>{analysisModeBadge.label}</strong>
@@ -5479,7 +5480,7 @@ function App() {
                   <span>Gruen Peak Recorded</span>
                   <strong>
                     {greenRangeStats.valid
-                      ? `${settings.greenIpRangePeakUsed}/${greenRangeStats.total}`
+                      ? `${(serverAnalysisDashboard?.networkInfrastructure.gruenPeakRecorded ?? settings.greenIpRangePeakUsed)}/${greenRangeStats.total}`
                       : "n/a"}
                   </strong>
                 </div>
@@ -5585,7 +5586,13 @@ function App() {
                   <ul className="analysis-list">
                     {analysis.topBlockedHosts.map((item) => (
                       <li key={`host-${item.label}`}>
-                        <span>{item.label}</span>
+                        <button
+                          className="analysis-link-button"
+                          type="button"
+                          onClick={() => setSelectedBlockedHost(item.label)}
+                        >
+                          {item.label}
+                        </button>
                         <strong>{item.count}</strong>
                       </li>
                     ))}
@@ -5593,6 +5600,50 @@ function App() {
                   </ul>
                 </div>
               </div>
+
+              {selectedBlockedHost && (
+                <div className="analysis-section analysis-section-card">
+                  <div className="analysis-selection-head">
+                    <h4>Blocked URL Detail: {selectedBlockedHost}</h4>
+                    <button className="secondary" type="button" onClick={() => setSelectedBlockedHost(null)}>
+                      Clear
+                    </button>
+                  </div>
+                  <div className="fw-table-wrap">
+                    <table className="fw-table">
+                      <thead>
+                        <tr>
+                          <th>Time</th>
+                          <th>User</th>
+                          <th>IP</th>
+                          <th>Category</th>
+                          <th>Action</th>
+                          <th>URL</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {blockedHostDetailRows.map((row, index) => (
+                          <tr key={`blocked-host-${selectedBlockedHost}-${index}`}>
+                            <td className="fw-cell-time">{row.time || "-"}</td>
+                            <td>{row.user || "-"}</td>
+                            <td className="fw-cell-addr">{row.ip || "-"}</td>
+                            <td>{row.category || "-"}</td>
+                            <td>{row.action || "-"}</td>
+                            <td className="wf-cell-url" title={row.url}>{row.url || "-"}</td>
+                          </tr>
+                        ))}
+                        {blockedHostDetailRows.length === 0 && (
+                          <tr>
+                            <td colSpan={6} className="fw-empty">
+                              No blocked webfilter events found for this destination in the current analysis window.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
 
               <div className="analysis-section analysis-section-card">
                 <div className="analysis-selection-head">

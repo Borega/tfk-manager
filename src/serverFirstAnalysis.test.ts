@@ -55,6 +55,43 @@ describe("runServerFirstAnalysis", () => {
           count: 0,
         },
       }),
+      getAnalysisDashboard: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        data: {
+          generatedAt: "2026-03-21T10:00:00Z",
+          window: {
+            startAt: "2026-03-21T09:00:00Z",
+            endAt: "2026-03-21T10:00:00Z",
+            bucketGrain: "coarse",
+            eventCount: 1,
+          },
+          trends: { dhcpLeaseCounts: [], firewallDenyCounts: [] },
+          networkInfrastructure: { vlanIpPoolUtilization: [], networkLoad: [] },
+          deviceBehavior: {
+            churn: { newDevices: 0, departedDevices: 0, stableDevices: 0, churnRatePercent: 0 },
+            deviceTypes: [],
+            vlanTransitions: [],
+            leaseDurationDistribution: [],
+            perDevice: [],
+            perBlockedUrl: [],
+          },
+          securityPolicy: {
+            firewallDeniesByVlan: [],
+            blockedCategories: [],
+            anomalousEvents: [],
+            misconfigurations: [],
+            topBlockedDomainsByVlan: [],
+          },
+          suggestions: [],
+          dashboards: {
+            dhcpLeaseTimeseries: { data: [], layout: {} },
+            firewallDenyTimeseries: { data: [], layout: {} },
+            topBlockedDomainsByVlan: { data: [], layout: {} },
+            deviceChurnSummary: { data: [], layout: {} },
+          },
+        },
+      }),
     };
 
     const result = await runServerFirstAnalysis({
@@ -75,6 +112,7 @@ describe("runServerFirstAnalysis", () => {
     expect(client.getFreshness).toHaveBeenCalledTimes(1);
     expect(client.getTrends).toHaveBeenCalledTimes(1);
     expect(client.getEvents).toHaveBeenCalledTimes(1);
+    expect(client.getAnalysisDashboard).toHaveBeenCalledTimes(1);
   });
 
   it("falls back when server call returns auth error and runs local fallback callback", async () => {
@@ -92,6 +130,7 @@ describe("runServerFirstAnalysis", () => {
       }),
       getTrends: vi.fn(),
       getEvents: vi.fn(),
+      getAnalysisDashboard: vi.fn(),
     };
 
     const result = await runServerFirstAnalysis({
@@ -112,6 +151,7 @@ describe("runServerFirstAnalysis", () => {
     expect(onFallbackLocal).toHaveBeenCalledTimes(1);
     expect(client.getTrends).not.toHaveBeenCalled();
     expect(client.getEvents).not.toHaveBeenCalled();
+    expect(client.getAnalysisDashboard).not.toHaveBeenCalled();
   });
 
   it("falls back for thrown network errors without bubbling", async () => {
@@ -145,6 +185,7 @@ describe("runServerFirstAnalysis", () => {
       }),
       getTrends: vi.fn().mockRejectedValue(new Error("network down")),
       getEvents: vi.fn(),
+      getAnalysisDashboard: vi.fn(),
     };
 
     const result = await runServerFirstAnalysis({
@@ -215,6 +256,7 @@ describe("runServerFirstAnalysis", () => {
         },
       }),
       getEvents: vi.fn(),
+      getAnalysisDashboard: vi.fn(),
     };
 
     const result = await runServerFirstAnalysis({
@@ -231,5 +273,70 @@ describe("runServerFirstAnalysis", () => {
     }
     expect(result.stage).toBe("trends");
     expect(result.freshness?.data.sources[0]?.sourceKey).toBe("dhcp");
+  });
+
+  it("falls back when dashboard query fails", async () => {
+    const client = {
+      getFreshness: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        data: {
+          status: 200,
+          data: {
+            generatedAt: "2026-03-21T10:00:00Z",
+            overallSeverity: "Info",
+            sources: [],
+            fallbackGuidance: {
+              recommended: false,
+              reason: "none",
+              actionLabel: "Continue Server Mode",
+              actionKey: "none",
+            },
+            retentionLifecycle: {
+              lastRunAt: null,
+              cutoffAt: null,
+              deletedCount: 0,
+              affectedWindows: [],
+              runStatus: "unknown",
+              nextScheduledAt: null,
+            },
+          },
+        },
+      }),
+      getTrends: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        data: { items: [], count: 0 },
+      }),
+      getEvents: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        data: { items: [], nextCursor: null, count: 0 },
+      }),
+      getAnalysisDashboard: vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        error: {
+          status: 500,
+          errorCode: "request_failed",
+          message: "dashboard failed",
+          requestId: "dashboard-failed",
+        },
+      }),
+    };
+
+    const result = await runServerFirstAnalysis({
+      client,
+      window: {
+        startAt: "2026-03-21T09:00:00Z",
+        endAt: "2026-03-21T10:00:00Z",
+      },
+    });
+
+    expect(result.mode).toBe("fallback-local");
+    if (result.mode !== "fallback-local") {
+      throw new Error("Expected fallback-local mode");
+    }
+    expect(result.stage).toBe("dashboard");
   });
 });

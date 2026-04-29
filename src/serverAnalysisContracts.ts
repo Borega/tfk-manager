@@ -58,6 +58,80 @@ export type ServerTrendsResponse = {
   count: number;
 };
 
+export type ServerPlotlyFigure = {
+  data: Array<Record<string, unknown>>;
+  layout: Record<string, unknown>;
+  config?: Record<string, unknown>;
+};
+
+export type ServerAnalysisDashboardQuery = {
+  startAt: string;
+  endAt: string;
+  bucketGrain?: ServerBucketGrain;
+};
+
+export type ServerAnalysisDashboardResponse = {
+  generatedAt: string;
+  window: {
+    startAt: string;
+    endAt: string;
+    bucketGrain: ServerBucketGrain;
+    eventCount: number;
+  };
+  trends: {
+    dhcpLeaseCounts: Array<{ bucketStart: string; eventCount: number }>;
+    firewallDenyCounts: Array<{ bucketStart: string; eventCount: number }>;
+  };
+  networkInfrastructure: {
+    vlanIpPoolUtilization: Array<{
+      vlan: string;
+      activeDevices: number;
+      poolCapacity: number;
+      poolUsedPercent: number;
+    }>;
+    networkLoad: Array<{
+      vlan: string;
+      activeDevices: number;
+      firewallDenies: number;
+      blockedRequests: number;
+      loadScore: number;
+    }>;
+    gruenPeakRecorded?: number;
+  };
+  deviceBehavior: {
+    churn: {
+      newDevices: number;
+      departedDevices: number;
+      stableDevices: number;
+      churnRatePercent: number;
+    };
+    deviceTypes: Array<{ vendor: string; count: number }>;
+    vlanTransitions: Array<{
+      entityId: string;
+      transitionCount: number;
+      lastVlan: string;
+      lastOccurredAt: string;
+    }>;
+    leaseDurationDistribution: Array<{ bucket: string; count: number }>;
+    perDevice: Array<Record<string, unknown>>;
+    perBlockedUrl: Array<{ url: string; blockCount: number }>;
+  };
+  securityPolicy: {
+    firewallDeniesByVlan: Array<{ vlan: string; count: number }>;
+    blockedCategories: Array<{ category: string; count: number }>;
+    anomalousEvents: Array<Record<string, unknown>>;
+    misconfigurations: Array<Record<string, unknown>>;
+    topBlockedDomainsByVlan: Array<{ vlan: string; url: string; blockCount: number }>;
+  };
+  suggestions: string[];
+  dashboards: {
+    dhcpLeaseTimeseries: ServerPlotlyFigure;
+    firewallDenyTimeseries: ServerPlotlyFigure;
+    topBlockedDomainsByVlan: ServerPlotlyFigure;
+    deviceChurnSummary: ServerPlotlyFigure;
+  };
+};
+
 export type ServerFreshnessSource = {
   sourceKey: string;
   state: "Healthy" | "Degraded" | "Stale" | "Unknown";

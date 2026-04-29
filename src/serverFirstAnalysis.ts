@@ -1,4 +1,5 @@
 import type {
+  ServerAnalysisDashboardResponse,
   ServerBucketGrain,
   ServerClientResult,
   ServerEventsQuery,
@@ -23,6 +24,7 @@ export type ServerFirstClient = {
   getFreshness: () => Promise<ServerClientResult<ServerFreshnessResponse>>;
   getTrends: (query: ServerTrendsQuery) => Promise<ServerClientResult<ServerTrendsResponse>>;
   getEvents: (query: ServerEventsQuery) => Promise<ServerClientResult<ServerEventsResponse>>;
+  getAnalysisDashboard: (query: { startAt: string; endAt: string; bucketGrain?: ServerBucketGrain }) => Promise<ServerClientResult<ServerAnalysisDashboardResponse>>;
 };
 
 export type ServerFirstSuccess = {
@@ -30,13 +32,14 @@ export type ServerFirstSuccess = {
   freshness: ServerFreshnessResponse;
   trends: ServerTrendsResponse;
   events: ServerEventsResponse;
+  dashboard: ServerAnalysisDashboardResponse;
 };
 
 export type ServerFirstFallback = {
   mode: "fallback-local";
   reason: string;
   errorCode: string;
-  stage: "freshness" | "trends" | "events" | "unexpected";
+  stage: "freshness" | "trends" | "events" | "dashboard" | "unexpected";
   freshness?: ServerFreshnessResponse;
 };
 
@@ -113,11 +116,22 @@ export async function runServerFirstAnalysis({
       return fallbackFromError("events", events, { freshness: freshnessSnapshot });
     }
 
+    const dashboard = await client.getAnalysisDashboard({
+      startAt: window.startAt,
+      endAt: window.endAt,
+      bucketGrain: window.bucketGrain,
+    });
+    if (!dashboard.ok) {
+      await runFallbackHook(onFallbackLocal);
+      return fallbackFromError("dashboard", dashboard, { freshness: freshnessSnapshot });
+    }
+
     return {
       mode: "server",
       freshness: freshness.data,
       trends: trends.data,
       events: events.data,
+      dashboard: dashboard.data,
     };
   } catch (error) {
     await runFallbackHook(onFallbackLocal);

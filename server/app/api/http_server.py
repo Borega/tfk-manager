@@ -46,6 +46,8 @@ from server.app.api.proxy_contracts import (
 from server.app.api.proxy_operations_api import proxy_execute_operation, proxy_get_operation_status
 from server.app.api.proxy_security import ProxySecurityError, validate_proxy_request
 from server.app.api.freshness_api import get_freshness_status
+from server.app.api.analysis_dashboard_api import get_analysis_dashboard
+from server.app.api.analysis_dashboard_contracts import AnalysisDashboardQuery
 from server.app.api.query_api import get_historical_events, get_historical_trends
 from server.app.api.query_contracts import EventsQuery, TrendsQuery
 from server.app.api.token_codec import TokenDecodeError, decode_token
@@ -1123,6 +1125,31 @@ def history_trends(
         return payload
     except Exception as exc:
         return _json_error(exc, "history-trends")
+
+
+@app.get("/api/analysis/dashboard")
+def analysis_dashboard(
+    startAt: str = Query(...),
+    endAt: str = Query(...),
+    bucketGrain: str = Query(default="coarse"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    try:
+        now_utc = _utc_now()
+        force_dhcp_retry = _should_force_source_retry("dhcp", now_utc)
+        force_sources = {"dhcp"} if force_dhcp_retry else None
+        _run_collector_if_due_async(force_retry_sources=force_sources)
+        _, role = _read_claims_and_role(authorization)
+        query = AnalysisDashboardQuery(
+            startAt=startAt,
+            endAt=endAt,
+            bucketGrain=bucketGrain,
+        )
+        with _open_connection() as connection:
+            payload = get_analysis_dashboard(query=query, role=role, connection=connection)
+        return payload
+    except Exception as exc:
+        return _json_error(exc, "analysis-dashboard")
 
 
 @app.get("/api/status/freshness")
