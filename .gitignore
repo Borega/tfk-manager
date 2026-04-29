@@ -84,3 +84,4 @@ scripts/sfp4*.js
 # Project planning documents
 plans/
 .planning/
+.docker-test-data/server.db
