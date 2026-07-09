@@ -1176,31 +1176,22 @@ def status_freshness(
         return _json_error(exc, "status-freshness")
 
 
-@app.post("/api/proxy/execute")
-def proxy_execute(
-    body: ProxyOperationRequest,
-    authorization: str | None = Header(default=None, alias="Authorization"),
-    xProxySignature: str | None = Header(default=None, alias="X-Proxy-Signature"),
-):
-    request_id = f"proxy-{uuid4()}"
-    claims: dict[str, object]
-    role: str
-    try:
-        claims, role = _read_claims_and_role(authorization)
-    except Exception as exc:
-        return _json_error(exc, request_id)
 
-    actor_id = str(claims.get("sub") or "")
-    target = _proxy_target_from_payload(body.payload)
-
-    allowed, reason = role_allows_proxy_operation(role, body.operation)
+def _check_proxy_authorization(
+    role: str,
+    operation: str,
+    request_id: str,
+    actor_id: str,
+    target: str,
+) -> JSONResponse | None:
+    allowed, reason = role_allows_proxy_operation(role, operation)
     if not allowed:
         _write_proxy_audit(
             request_id=request_id,
             actor_id=actor_id,
             actor_role=role,
             scope="n/a",
-            operation=body.operation,
+            operation=operation,
             target=target,
             status="denied",
             error_code=ERR_FORBIDDEN if reason == "forbidden" else ERR_PROXY_OPERATION,
@@ -1210,17 +1201,28 @@ def proxy_execute(
             error_code=ERR_FORBIDDEN if reason == "forbidden" else ERR_PROXY_OPERATION,
             message="proxy operation denied",
             request_id=request_id,
-            details={"operation": body.operation, "reason": reason},
+            details={"operation": operation, "reason": reason},
         )
+    return None
 
+
+def _validate_proxy_security(
+    body: ProxyOperationRequest,
+    signature_header: str,
+    request_id: str,
+    actor_id: str,
+    role: str,
+    target: str,
+) -> tuple[str | None, JSONResponse | None]:
     try:
         scope = required_scope_for_operation(body.operation)
         security_context = validate_proxy_request(
             request=body,
-            signature_header=xProxySignature or "",
+            signature_header=signature_header,
             request_id=request_id,
             scope=scope,
         )
+        return security_context.scope, None
     except ProxySecurityError as exc:
         _write_proxy_audit(
             request_id=request_id,
@@ -1233,14 +1235,39 @@ def proxy_execute(
             error_code=ERR_PROXY_SECURITY,
             details={"reason": exc.reason},
         )
-        return _json_proxy_error(
+        return None, _json_proxy_error(
             error_code=ERR_PROXY_SECURITY,
             message="proxy security validation failed",
             request_id=request_id,
             details={"operation": body.operation, "reason": exc.reason},
         )
     except Exception as exc:
+        return None, _json_error(exc, request_id)
+
+@app.post("/api/proxy/execute")
+def proxy_execute(
+    body: ProxyOperationRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    xProxySignature: str | None = Header(default=None, alias="X-Proxy-Signature"),
+):
+    request_id = f"proxy-{uuid4()}"
+    try:
+        claims, role = _read_claims_and_role(authorization)
+    except Exception as exc:
         return _json_error(exc, request_id)
+
+    actor_id = str(claims.get("sub") or "")
+    target = _proxy_target_from_payload(body.payload)
+
+    auth_err = _check_proxy_authorization(role, body.operation, request_id, actor_id, target)
+    if auth_err:
+        return auth_err
+
+    scope, sec_err = _validate_proxy_security(
+        body, xProxySignature or "", request_id, actor_id, role, target
+    )
+    if sec_err:
+        return sec_err
 
     try:
         result = proxy_execute_operation(body.operation, body.payload)
@@ -1248,7 +1275,7 @@ def proxy_execute(
             request_id=request_id,
             actor_id=actor_id,
             actor_role=role,
-            scope=security_context.scope,
+            scope=scope,  # type: ignore
             operation=body.operation,
             target=target,
             status="success",
@@ -1258,7 +1285,7 @@ def proxy_execute(
         return {
             "requestId": request_id,
             "operation": body.operation,
-            "scope": security_context.scope,
+            "scope": scope,
             "result": result,
         }
     except ProxyOperationError as exc:
@@ -1266,7 +1293,7 @@ def proxy_execute(
             request_id=request_id,
             actor_id=actor_id,
             actor_role=role,
-            scope=security_context.scope,
+            scope=scope,  # type: ignore
             operation=body.operation,
             target=target,
             status="failed",
@@ -1288,7 +1315,7 @@ def proxy_execute(
             request_id=request_id,
             actor_id=actor_id,
             actor_role=role,
-            scope=security_context.scope,
+            scope=scope,  # type: ignore
             operation=body.operation,
             target=target,
             status="failed",
