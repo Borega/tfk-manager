@@ -376,10 +376,12 @@ class MsdSession:
         tbody = tbody_match.group(1)
         rows = re.findall(r'<tr[^>]*>(.*?)</tr>', tbody, re.DOTALL | re.IGNORECASE)
 
+        td_re = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
+        tag_re = re.compile(r'<[^>]+>')
         for row in rows:
             # Extract cell text content, stripping any inner tags
-            cells_raw = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
-            cells = [html_unescape(re.sub(r'<[^>]+>', '', c)).strip() for c in cells_raw]
+            cells_raw = td_re.findall(row)
+            cells = [html_unescape(tag_re.sub('', c)).strip() for c in cells_raw]
             if len(cells) < 6:
                 continue
             entries.append({
