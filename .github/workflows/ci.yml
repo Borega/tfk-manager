@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Vitest
+        run: npm test
+
+      - name: Build frontend bundle
+        run: npm run build
+
+  server:
+    name: Server tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      - name: Run server unit tests
+        run: >-
+          uv run
+          --with bcrypt
+          --with PyJWT
+          --with fastapi
+          --with requests
+          python -m unittest discover -s server/app/tests -v
+
+      - name: Compile Python entry points
+        run: >-
+          uv run python -m py_compile
+          src-tauri/src/fetch_webfilter_embedded.py
+          backend/src/fetch_webfilter.py
+          server/app/collector/aggregates.py
+          server/app/collector/repository.py
+          server/app/api/auth_service.py
+          server/app/api/http_server.py
+          server/app/proxy/opnsense_proxy_service.py
