@@ -1213,7 +1213,7 @@ def _validate_proxy_security(
     actor_id: str,
     role: str,
     target: str,
-) -> tuple[str | None, JSONResponse | None]:
+) -> tuple[str, None] | tuple[None, JSONResponse]:
     try:
         scope = required_scope_for_operation(body.operation)
         security_context = validate_proxy_request(
@@ -1268,6 +1268,8 @@ def proxy_execute(
     )
     if sec_err:
         return sec_err
+    if scope is None:
+        return _json_error(RuntimeError("proxy security scope missing"), request_id)
 
     try:
         result = proxy_execute_operation(body.operation, body.payload)
@@ -1275,7 +1277,7 @@ def proxy_execute(
             request_id=request_id,
             actor_id=actor_id,
             actor_role=role,
-            scope=scope,  # type: ignore
+            scope=scope,
             operation=body.operation,
             target=target,
             status="success",
@@ -1293,7 +1295,7 @@ def proxy_execute(
             request_id=request_id,
             actor_id=actor_id,
             actor_role=role,
-            scope=scope,  # type: ignore
+            scope=scope,
             operation=body.operation,
             target=target,
             status="failed",
@@ -1315,7 +1317,7 @@ def proxy_execute(
             request_id=request_id,
             actor_id=actor_id,
             actor_role=role,
-            scope=scope,  # type: ignore
+            scope=scope,
             operation=body.operation,
             target=target,
             status="failed",
