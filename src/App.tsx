@@ -2286,17 +2286,46 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
-  // Refresh analysis sources every 30s while analysis is open.
+  // Refresh analysis sources with adaptive source-specific backoff while analysis is open.
   useEffect(() => {
     if (activeTab !== "analysis") return;
 
+    const now = Date.now();
+    const leaseStatus = toSourceHealthView(
+      "leases",
+      sourceHealth.leases,
+      sourceRetry.leases,
+      now,
+    ).status;
+    const serverStatus = toSourceHealthView(
+      "server-api",
+      sourceHealth["server-api"],
+      sourceRetry["server-api"],
+      now,
+    ).status;
+    const leasePoll = resolveAdaptivePollPolicy({
+      source: "leases",
+      baseIntervalMs: SOURCE_POLL_MS.leases,
+      healthStatus: toAdaptiveHealthStatus(leaseStatus),
+      backlogSize: analysis.rows.length + dynamicLeases.length,
+      retryAttempt: sourceRetry.leases.attempt,
+    });
+    const serverPoll = resolveAdaptivePollPolicy({
+      source: "server-api",
+      baseIntervalMs: SOURCE_POLL_MS["server-api"],
+      healthStatus: toAdaptiveHealthStatus(serverStatus),
+      backlogSize: serverTrendBuckets.length,
+      retryAttempt: sourceRetry["server-api"].attempt,
+    });
+    const intervalMs = applyPollJitterMs(Math.min(leasePoll.intervalMs, serverPoll.intervalMs));
+
     const id = window.setInterval(() => {
       void handleRefreshAnalysis();
-    }, 30_000);
+    }, intervalMs);
 
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab]);
+  }, [activeTab, sourceHealth, sourceRetry, analysis.rows.length, dynamicLeases.length, serverTrendBuckets.length]);
 
   // Stream watchdog with fallback restart and retry/backoff.
   useEffect(() => {

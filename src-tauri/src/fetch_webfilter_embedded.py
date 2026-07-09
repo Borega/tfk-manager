@@ -376,10 +376,12 @@ class MsdSession:
         tbody = tbody_match.group(1)
         rows = re.findall(r'<tr[^>]*>(.*?)</tr>', tbody, re.DOTALL | re.IGNORECASE)
 
+        td_re = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
+        tag_re = re.compile(r'<[^>]+>')
         for row in rows:
             # Extract cell text content, stripping any inner tags
-            cells_raw = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
-            cells = [html_unescape(re.sub(r'<[^>]+>', '', c)).strip() for c in cells_raw]
+            cells_raw = td_re.findall(row)
+            cells = [html_unescape(tag_re.sub('', c)).strip() for c in cells_raw]
             if len(cells) < 6:
                 continue
             entries.append({
@@ -595,28 +597,22 @@ class MsdSession:
             return entries
 
         rows = re.findall(r"<tr[^>]*>(.*?)</tr>", tbody_match.group(1), re.DOTALL | re.IGNORECASE)
+
+        id_pattern1 = re.compile(rf'class=["\'][^"\']*{re.escape(row_class)}[^"\']*["\'][^>]*value=["\']([^"\']+)["\']', re.IGNORECASE)
+        id_pattern2 = re.compile(rf'value=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*{re.escape(row_class)}[^"\']*["\']', re.IGNORECASE)
+        name_pattern = re.compile(r'<td[^>]*class=["\'][^"\']*col_name[^"\']*["\'][^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
+        strip_tags_pattern = re.compile(r"<[^>]+>")
+
         for row in rows:
-            id_match = re.search(
-                rf'class=["\'][^"\']*{re.escape(row_class)}[^"\']*["\'][^>]*value=["\']([^"\']+)["\']',
-                row,
-                re.IGNORECASE,
-            )
+            id_match = id_pattern1.search(row)
             if not id_match:
-                id_match = re.search(
-                    rf'value=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*{re.escape(row_class)}[^"\']*["\']',
-                    row,
-                    re.IGNORECASE,
-                )
-            name_match = re.search(
-                r'<td[^>]*class=["\'][^"\']*col_name[^"\']*["\'][^>]*>(.*?)</td>',
-                row,
-                re.DOTALL | re.IGNORECASE,
-            )
+                id_match = id_pattern2.search(row)
+            name_match = name_pattern.search(row)
             if not id_match or not name_match:
                 continue
 
             entry_id = html_unescape(id_match.group(1)).strip()
-            name_raw = re.sub(r"<[^>]+>", "", name_match.group(1))
+            name_raw = strip_tags_pattern.sub("", name_match.group(1))
             name = html_unescape(name_raw).strip()
             if not entry_id:
                 continue

@@ -101,6 +101,80 @@ class TestAggregates(unittest.TestCase):
 
         self.assertEqual(first_snapshot, second_snapshot)
 
+    def test_recompute_windows_replaces_empty_window_buckets(self):
+        upsert_events_and_checkpoint(
+            self.connection,
+            [self._event("evt-1", "2026-03-21T08:10:00Z")],
+            self._checkpoint(),
+        )
+
+        recompute_aggregate_windows(
+            self.connection,
+            [
+                {
+                    "sourceType": "webfilter",
+                    "windowStart": "2026-03-21T08:00:00Z",
+                    "windowEnd": "2026-03-21T08:59:59Z",
+                    "annotation": "ingested",
+                }
+            ],
+        )
+        self.connection.execute("DELETE FROM canonical_events WHERE event_id = ?", ("evt-1",))
+        self.connection.commit()
+
+        recompute_aggregate_windows(
+            self.connection,
+            [
+                {
+                    "sourceType": "webfilter",
+                    "windowStart": "2026-03-21T08:00:00Z",
+                    "windowEnd": "2026-03-21T08:59:59Z",
+                    "annotation": "corrected",
+                }
+            ],
+        )
+
+        rows = self.connection.execute(
+            "SELECT bucket_grain, bucket_start, event_count FROM trend_aggregate ORDER BY bucket_grain, bucket_start"
+        ).fetchall()
+        self.assertEqual(rows, [])
+
+    def test_recompute_windows_counts_full_bucket_for_overlapping_windows(self):
+        upsert_events_and_checkpoint(
+            self.connection,
+            [self._event("evt-1", "2026-03-21T08:10:00Z")],
+            self._checkpoint(),
+        )
+
+        summary = recompute_aggregate_windows(
+            self.connection,
+            [
+                {
+                    "sourceType": "webfilter",
+                    "windowStart": "2026-03-21T08:00:00Z",
+                    "windowEnd": "2026-03-21T08:59:59Z",
+                    "annotation": "ingested",
+                },
+                {
+                    "sourceType": "webfilter",
+                    "windowStart": "2026-03-21T08:59:00Z",
+                    "windowEnd": "2026-03-21T08:59:59Z",
+                    "annotation": "corrected",
+                },
+            ],
+        )
+
+        self.assertEqual(summary["windowsProcessed"], 2)
+        rows = self.connection.execute(
+            "SELECT bucket_grain, bucket_start, event_count FROM trend_aggregate ORDER BY bucket_grain, bucket_start"
+        ).fetchall()
+        self.assertEqual(
+            rows,
+            [
+                ("coarse", "2026-03-21T00:00:00Z", 1),
+                ("fine", "2026-03-21T08:00:00Z", 1),
+            ],
+        )
 
 if __name__ == "__main__":
     unittest.main()

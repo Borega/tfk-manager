@@ -4,7 +4,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 import requests

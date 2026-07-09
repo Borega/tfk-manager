@@ -108,17 +108,23 @@ function unwrapFreshnessPayload(payload: unknown): ServerFreshnessResponse | nul
   return objectPayload as ServerFreshnessResponse;
 }
 
-export function createServerAnalysisClient({
-  baseUrl,
-  session,
-  fetchImpl = fetch,
-  refreshSession = refreshServerSession,
-  onSessionUpdated,
-}: CreateServerAnalysisClientArgs) {
-  const base = normalizeBaseUrl(baseUrl);
+class ServerAnalysisClient {
+  private base: string;
+  private session: ServerSession;
+  private fetchImpl: typeof fetch;
+  private refreshSession: (args: RefreshServerSessionArgs) => Promise<RefreshServerSessionResult>;
+  private onSessionUpdated?: (tokens: ServerSessionTokens) => void;
 
-  const callJson = async <T>(options: RequestOptions, allowRefresh: boolean): Promise<ServerClientResult<T>> => {
-    const accessToken = session.getAccessToken();
+  constructor(args: CreateServerAnalysisClientArgs) {
+    this.base = normalizeBaseUrl(args.baseUrl);
+    this.session = args.session;
+    this.fetchImpl = args.fetchImpl ?? fetch;
+    this.refreshSession = args.refreshSession ?? refreshServerSession;
+    this.onSessionUpdated = args.onSessionUpdated;
+  }
+
+  private callJson = async <T>(options: RequestOptions, allowRefresh: boolean): Promise<ServerClientResult<T>> => {
+    const accessToken = this.session.getAccessToken();
     if (!accessToken) {
       return {
         ok: false,
@@ -133,7 +139,7 @@ export function createServerAnalysisClient({
       };
     }
 
-    const endpoints = endpointCandidates(base, options.path);
+    const endpoints = endpointCandidates(this.base, options.path);
 
     let response: Response | null = null;
     let lastError: unknown = null;
@@ -147,7 +153,7 @@ export function createServerAnalysisClient({
       }, SERVER_ANALYSIS_REQUEST_TIMEOUT_MS);
 
       try {
-        response = await fetchImpl(endpoint, {
+        response = await this.fetchImpl(endpoint, {
           method: options.method,
           headers: {
             Authorization: `Bearer ${accessToken}`,
@@ -184,12 +190,12 @@ export function createServerAnalysisClient({
     const payload = await safeJson(response);
 
     if (response.status === 401 && allowRefresh) {
-      const refreshed = await refreshSession({ baseUrl: base, session, fetchImpl });
+      const refreshed = await this.refreshSession({ baseUrl: this.base, session: this.session, fetchImpl: this.fetchImpl });
       if (!refreshed.ok) {
         return { ok: false, status: refreshed.error.status, error: refreshed.error };
       }
-      onSessionUpdated?.(refreshed.tokens);
-      return callJson<T>(options, false);
+      this.onSessionUpdated?.(refreshed.tokens);
+      return this.callJson<T>(options, false);
     }
 
     if (!response.ok) {
@@ -207,7 +213,7 @@ export function createServerAnalysisClient({
     };
   };
 
-  const getEvents = (query: ServerEventsQuery): Promise<ServerClientResult<ServerEventsResponse>> => {
+  public getEvents = (query: ServerEventsQuery): Promise<ServerClientResult<ServerEventsResponse>> => {
     const params = toQueryString({
       startAt: query.startAt,
       endAt: query.endAt,
@@ -216,13 +222,13 @@ export function createServerAnalysisClient({
       limit: query.limit,
     });
 
-    return callJson<ServerEventsResponse>({
+    return this.callJson<ServerEventsResponse>({
       method: "GET",
       path: `/api/history/events${params}`,
     }, true);
   };
 
-  const getTrends = (query: ServerTrendsQuery): Promise<ServerClientResult<ServerTrendsResponse>> => {
+  public getTrends = (query: ServerTrendsQuery): Promise<ServerClientResult<ServerTrendsResponse>> => {
     const params = toQueryString({
       startAt: query.startAt,
       endAt: query.endAt,
@@ -230,14 +236,14 @@ export function createServerAnalysisClient({
       bucketGrain: query.bucketGrain,
     });
 
-    return callJson<ServerTrendsResponse>({
+    return this.callJson<ServerTrendsResponse>({
       method: "GET",
       path: `/api/history/trends${params}`,
     }, true);
   };
 
-  const getFreshness = async (): Promise<ServerClientResult<ServerFreshnessResponse>> => {
-    const response = await callJson<unknown>({
+  public getFreshness = async (): Promise<ServerClientResult<ServerFreshnessResponse>> => {
+    const response = await this.callJson<unknown>({
       method: "GET",
       path: "/api/status/freshness",
     }, true);
@@ -268,23 +274,20 @@ export function createServerAnalysisClient({
     };
   };
 
-  const getAnalysisDashboard = (query: ServerAnalysisDashboardQuery): Promise<ServerClientResult<ServerAnalysisDashboardResponse>> => {
+  public getAnalysisDashboard = (query: ServerAnalysisDashboardQuery): Promise<ServerClientResult<ServerAnalysisDashboardResponse>> => {
     const params = toQueryString({
       startAt: query.startAt,
       endAt: query.endAt,
       bucketGrain: query.bucketGrain,
     });
 
-    return callJson<ServerAnalysisDashboardResponse>({
+    return this.callJson<ServerAnalysisDashboardResponse>({
       method: "GET",
       path: `/api/analysis/dashboard${params}`,
     }, true);
   };
+}
 
-  return {
-    getEvents,
-    getTrends,
-    getFreshness,
-    getAnalysisDashboard,
-  };
+export function createServerAnalysisClient(args: CreateServerAnalysisClientArgs) {
+  return new ServerAnalysisClient(args);
 }

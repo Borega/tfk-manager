@@ -219,7 +219,7 @@ def refresh_session(
     _ensure_auth_schema(connection)
 
     try:
-        refresh_claims = decode_token(refresh_token, secret)
+        refresh_claims = decode_token(refresh_token, secret, verify_expiration=False)
     except TokenDecodeError as exc:
         raise TokenRefreshError("invalid_refresh_token") from exc
 
