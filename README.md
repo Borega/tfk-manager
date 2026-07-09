@@ -61,11 +61,16 @@ The repository now includes a containerized server API for server-first analysis
 
 - `server/Dockerfile` - source Dockerfile used by GitHub Actions to publish the server image
 - `docker-compose.yml` - local runtime stack
+- `.env.server.example` - copyable environment template; keep the copied `.env.server` file local
 - `server/requirements.txt` - Python dependencies for the server container
 
 ### 1. User setup (`.env.server`)
 
-Create a `.env.server` file in the repository root:
+Copy the checked-in example, then replace every placeholder secret and credential before starting the container:
+
+```powershell
+Copy-Item .env.server.example .env.server
+```
 
 ```env
 TFK_SERVER_PORT=8080
@@ -102,6 +107,7 @@ TFK_SERVER_ALLOWED_PROXY_IPS=127.0.0.1/32
 
 Notes:
 
+- `docker compose` now fails fast when `TFK_SERVER_JWT_SECRET`, `TFK_SERVER_BOOTSTRAP_PASSWORD`, or `TFK_PROXY_HMAC_SHARED_SECRET` are missing; do not use the example placeholder values outside disposable local testing.
 - `TFK_SERVER_BOOTSTRAP_USERNAME` and `TFK_SERVER_BOOTSTRAP_PASSWORD` are used to create the initial login user if it does not exist yet.
 - Supported roles from current authz policy are `admin` and `analyst`.
 - If the bootstrap user already exists, startup will keep the existing account.

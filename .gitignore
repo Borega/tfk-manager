@@ -78,6 +78,7 @@ scripts/sfp4*.js
 # Local secret/env files
 .env
 .env.*
+!.env.server.example
 *.pem
 *.key
 
