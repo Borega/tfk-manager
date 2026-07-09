@@ -104,8 +104,13 @@ def recompute_aggregate_windows(connection: Any, windows: list[dict[str, Any]]) 
                     key = (_bucket_start(parsed, grain), grain, row_source_type)
                     counts[key] = counts.get(key, 0) + 1
 
-            for (bucket_start, bucket_grain, row_source_type), event_count in sorted(counts.items()):
-                cursor.execute(
+            insert_params = [
+                (bucket_start, bucket_grain, row_source_type, event_count, updated_at)
+                for (bucket_start, bucket_grain, row_source_type), event_count in sorted(counts.items())
+            ]
+
+            if insert_params:
+                cursor.executemany(
                     """
                     INSERT INTO trend_aggregate (
                         bucket_start,
@@ -119,9 +124,9 @@ def recompute_aggregate_windows(connection: Any, windows: list[dict[str, Any]]) 
                         event_count = excluded.event_count,
                         updated_at = excluded.updated_at
                     """,
-                    (bucket_start, bucket_grain, row_source_type, event_count, updated_at),
+                    insert_params,
                 )
-                rows_written += 1
+                rows_written += len(insert_params)
 
         connection.commit()
     except Exception:
