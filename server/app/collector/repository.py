@@ -108,55 +108,57 @@ def upsert_events_and_checkpoint(
     cursor = connection.cursor()
     try:
         cursor.execute("BEGIN")
+        records = []
         for event in events:
             record = _event_record(event)
             if fail_on_event_id and record["event_id"] == fail_on_event_id:
                 raise RuntimeError("simulated write failure")
+            records.append((
+                record["event_id"],
+                record["source_type"],
+                record["source_entity_id"],
+                record["source_identifiers_json"],
+                record["occurred_at"],
+                record["observed_at"],
+                record["collector_version"],
+                record["ingest_timestamp"],
+                record["payload_hash"],
+                record["lineage_version"],
+                record["confidence_state"],
+                record["raw_payload_json"],
+            ))
 
-            cursor.execute(
-                """
-                INSERT INTO canonical_events (
-                    event_id,
-                    source_type,
-                    source_entity_id,
-                    source_identifiers_json,
-                    occurred_at,
-                    observed_at,
-                    collector_version,
-                    ingest_timestamp,
-                    payload_hash,
-                    lineage_version,
-                    confidence_state,
-                    raw_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(event_id) DO UPDATE SET
-                    source_type=excluded.source_type,
-                    source_entity_id=excluded.source_entity_id,
-                    source_identifiers_json=excluded.source_identifiers_json,
-                    occurred_at=excluded.occurred_at,
-                    observed_at=excluded.observed_at,
-                    collector_version=excluded.collector_version,
-                    ingest_timestamp=excluded.ingest_timestamp,
-                    payload_hash=excluded.payload_hash,
-                    lineage_version=excluded.lineage_version,
-                    confidence_state=excluded.confidence_state,
-                    raw_payload_json=excluded.raw_payload_json
-                """,
-                (
-                    record["event_id"],
-                    record["source_type"],
-                    record["source_entity_id"],
-                    record["source_identifiers_json"],
-                    record["occurred_at"],
-                    record["observed_at"],
-                    record["collector_version"],
-                    record["ingest_timestamp"],
-                    record["payload_hash"],
-                    record["lineage_version"],
-                    record["confidence_state"],
-                    record["raw_payload_json"],
-                ),
-            )
+        cursor.executemany(
+            """
+            INSERT INTO canonical_events (
+                event_id,
+                source_type,
+                source_entity_id,
+                source_identifiers_json,
+                occurred_at,
+                observed_at,
+                collector_version,
+                ingest_timestamp,
+                payload_hash,
+                lineage_version,
+                confidence_state,
+                raw_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                source_type=excluded.source_type,
+                source_entity_id=excluded.source_entity_id,
+                source_identifiers_json=excluded.source_identifiers_json,
+                occurred_at=excluded.occurred_at,
+                observed_at=excluded.observed_at,
+                collector_version=excluded.collector_version,
+                ingest_timestamp=excluded.ingest_timestamp,
+                payload_hash=excluded.payload_hash,
+                lineage_version=excluded.lineage_version,
+                confidence_state=excluded.confidence_state,
+                raw_payload_json=excluded.raw_payload_json
+            """,
+            records,
+        )
 
         cursor.execute(
             """
